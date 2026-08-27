@@ -11,6 +11,7 @@ import { WebToolsButton, WebToolsDialog } from './search-section'
 import { Server } from './server'
 import { styles } from './styles'
 import { ToastContainer } from './toast'
+import { VisionRouting } from './vision-routing'
 
 function Layout({ webviewJs, codiconUri }: { webviewJs: string, codiconUri?: string }) {
   const codiconCss = codiconUri
@@ -48,6 +49,9 @@ function Layout({ webviewJs, codiconUri }: { webviewJs: string, codiconUri?: str
           </span>
         </h3>
         <Providers />
+
+        <h3>Vision Routing</h3>
+        <VisionRouting />
 
         <WebToolsDialog />
 
