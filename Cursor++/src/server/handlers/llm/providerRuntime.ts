@@ -71,7 +71,8 @@ export interface ProviderRuntime {
 /**
  * Provider SDK 实例缓存 — 按 ProviderEntry.id 维度复用 client。
  * 同一个 entry 的多次解析共享一个 client; 编辑 providers.json 后通过
- * resetProviderInstanceCache() 重置 (目前仅在测试用,生产期可加 watch 自动重置)。
+ * resetProviderInstanceCache() 重置。providers.json 的文件监听和侧边栏 Save
+ * 都会调用它，避免沿用旧的 baseUrl / apiKey。
  */
 const providerInstances = new Map<string, LLMProvider>();
 
