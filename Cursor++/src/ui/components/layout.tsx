@@ -41,6 +41,9 @@ function Layout({ webviewJs, codiconUri }: { webviewJs: string, codiconUri?: str
         </h3>
         <Server />
 
+        <h3>Vision Routing (Image Fallback)</h3>
+        <VisionRouting />
+
         <h3>
           <span>Providers</span>
           <span class="h3-actions">
@@ -49,9 +52,6 @@ function Layout({ webviewJs, codiconUri }: { webviewJs: string, codiconUri?: str
           </span>
         </h3>
         <Providers />
-
-        <h3>Vision Routing</h3>
-        <VisionRouting />
 
         <WebToolsDialog />
 
