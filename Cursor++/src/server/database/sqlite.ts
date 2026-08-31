@@ -324,6 +324,25 @@ async function initializeSchema(database: AsyncDatabase): Promise<void> {
 
     CREATE INDEX IF NOT EXISTS idx_conversation_summaries_lookup
       ON conversation_summaries(conversation_id, kind, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS model_usage_stats (
+      day TEXT NOT NULL,
+      hour INTEGER NOT NULL,
+      provider_id TEXT NOT NULL,
+      provider_name TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      api_model TEXT NOT NULL,
+      request_count INTEGER NOT NULL DEFAULT 0,
+      input_tokens INTEGER NOT NULL DEFAULT 0,
+      output_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+      cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+      last_used_at INTEGER NOT NULL,
+      PRIMARY KEY (day, hour, provider_id, model_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_model_usage_stats_day
+      ON model_usage_stats(day);
   `)
 
   // ── Schema 迁移: conversation_checkpoints 新增 kind 列 ──
