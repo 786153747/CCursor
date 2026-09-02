@@ -472,8 +472,12 @@ export async function activate(context: vscode.ExtensionContext) {
   // 用量后缀挂在 BYOK 状态栏项上 (今日费用, 点击项仍是 BYOK 开关)
   initUsageStatusBar(renderStatusBar)
 
-  // 状态变化 → 刷新状态栏
-  context.subscriptions.push(onStateChange(() => renderStatusBar()))
+  // 状态变化 → 刷新状态栏; server 就绪时同步刷新今日费用后缀
+  context.subscriptions.push(onStateChange(() => {
+    renderStatusBar()
+    if (getState().server === 'local')
+      refreshUsageStatusBar()
+  }))
 
   // 侧边栏面板
   const panelProvider = new PanelProvider(context)
