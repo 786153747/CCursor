@@ -13,9 +13,21 @@ import { queryTodaySummary } from '../server/usage/store'
 
 let usageBarItem: StatusBarItem | null = null
 
+function currencySymbol(currency: 'CNY' | 'USD'): string {
+  return currency === 'CNY' ? '\u00A5' : '$'
+}
+
 function formatBarCost(micros: bigint, currency: 'CNY' | 'USD'): string {
-  const symbol = currency === 'CNY' ? '\u00A5' : '$'
-  return `${symbol}${(Number(micros) / 1e6).toFixed(4)}`
+  return `${currencySymbol(currency)}${Math.round(Number(micros) / 1e6)}`
+}
+
+function defaultBarText(): string {
+  try {
+    return `${formatBarCost(0n, loadUsageSettings().currency)} · 0 req`
+  }
+  catch {
+    return '\u00A50 · 0 req'
+  }
 }
 
 async function renderUsageBar() {
@@ -29,7 +41,9 @@ async function renderUsageBar() {
     usageBarItem.show()
   }
   catch {
-    // agent DB not ready yet (e.g. server not started) — keep previous text
+    // agent DB not ready yet — show the placeholder instead of staying hidden
+    usageBarItem.text = defaultBarText()
+    usageBarItem.show()
   }
 }
 
@@ -37,6 +51,7 @@ export function registerUsageStatusBar(context: ExtensionContext): void {
   usageBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99)
   usageBarItem.name = 'Cursor++: Usage'
   usageBarItem.command = 'cursor2plus.openUsage'
+  usageBarItem.text = defaultBarText()
   usageBarItem.show()
   context.subscriptions.push(usageBarItem)
   const disposeUsageListener = onUsageRecorded(() => {
