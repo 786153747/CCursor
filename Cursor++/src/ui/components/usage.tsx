@@ -3,8 +3,11 @@ export function Usage() {
   return (
     <div class="usage-panel" x-show="$store.app.usageOpen">
       <div class="usage-hero">
-        <div class="usage-today" x-text="$store.app.usage?.todayCostFormatted || '¥0.000000'"></div>
-        <div class="usage-today-label">Today (selected)</div>
+        <div class="usage-today" x-text="$store.app.usage ? $store.app.formatUsageCost($store.app.usage?.summary?.totalCostFormatted) : '—'"></div>
+        <div class="usage-today-label">
+          <span x-text="$store.app.usageRangeLabel"></span>
+          <span x-show="$store.app.usageRange !== 'today'" x-text="' · today ' + $store.app.formatUsageCost($store.app.usage?.todayCostFormatted || '')"></span>
+        </div>
       </div>
 
       <div class="usage-toolbar">
@@ -24,7 +27,7 @@ export function Usage() {
       <div class="usage-metrics" x-show="$store.app.usage">
         <div class="usage-metric">
           <span class="usage-metric-label">Cost</span>
-          <span class="usage-metric-value" x-text="$store.app.usage?.summary?.totalCostFormatted || '—'"></span>
+          <span class="usage-metric-value" x-text="$store.app.usage ? $store.app.formatUsageCost($store.app.usage?.summary?.totalCostFormatted) : '—'"></span>
         </div>
         <div class="usage-metric">
           <span class="usage-metric-label">Requests</span>
@@ -65,6 +68,10 @@ export function Usage() {
       <div class="usage-unpriced" x-show="$store.app.usage?.summary?.unpricedCount > 0">
         <span x-text="$store.app.usage?.summary?.unpricedCount"></span>
         {' unpriced requests — fill prices on model cards'}
+      </div>
+
+      <div class="usage-hint" x-show="$store.app.usage && ($store.app.usage?.summary?.requestCount === 0)">
+        No records for this currency and range. Bills are stored with the currency used at request time — try the other currency.
       </div>
 
       <div class="usage-section-title">Providers</div>

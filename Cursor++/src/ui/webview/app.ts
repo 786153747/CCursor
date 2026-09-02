@@ -275,6 +275,16 @@ export function initApp(Alpine: AlpineType) {
       return `${Math.round(percent * 10) / 10}%`
     },
 
+    get usageRangeLabel(): string {
+      const labels: Record<string, string> = {
+        'today': 'Today',
+        '7d': 'Last 7 days',
+        '14d': 'Last 14 days',
+        '30d': 'Last 30 days',
+      }
+      return labels[this.usageRange] || 'Today'
+    },
+
     /** Per-day cost bars: precomputed heights + tooltip text for the template. */
     get usageDailyBars(): any[] {
       const daily = this.usage?.daily || []
@@ -290,7 +300,7 @@ export function initApp(Alpine: AlpineType) {
         return {
           date: day.date,
           heightPercent: Math.max(day.requestCount > 0 && heightPercent === 0 ? 4 : heightPercent, 0),
-          title: `${day.date} · ${day.requestCount} req · ${day.totalCostFormatted}`,
+          title: `${day.date} · ${day.requestCount} req · ${this.formatUsageCost(day.totalCostFormatted)}`,
         }
       })
     },
