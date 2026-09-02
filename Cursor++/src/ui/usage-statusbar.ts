@@ -35,6 +35,7 @@ async function renderUsageBar() {
 
 export function registerUsageStatusBar(context: ExtensionContext): void {
   usageBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99)
+  usageBarItem.name = 'Cursor++: Usage'
   usageBarItem.command = 'cursor2plus.openUsage'
   usageBarItem.show()
   context.subscriptions.push(usageBarItem)

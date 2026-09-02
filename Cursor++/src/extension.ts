@@ -463,6 +463,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // 状态栏 (BYOK Mode 切换按钮)
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100)
+  statusBarItem.name = 'Cursor++: BYOK'
   statusBarItem.command = 'cursor2plus.toggleByok'
   statusBarItem.show()
   context.subscriptions.push(statusBarItem)
