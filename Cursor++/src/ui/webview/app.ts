@@ -1062,6 +1062,8 @@ export function initApp(Alpine: AlpineType) {
     }
     else if (msg?.type === 'usage') {
       s.usage = msg.usage
+      if (msg.reveal)
+        s.usageOpen = true
       if (msg.usage?.settings) {
         s.usageRange = msg.usage.settings.range || 'today'
         s.usageCurrency = msg.usage.settings.currency || 'CNY'

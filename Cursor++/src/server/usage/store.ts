@@ -303,6 +303,26 @@ function sumMicros(rows: UsageLogRow[]): bigint {
   return rows.reduce((sum, row) => sum + BigInt(row.total_cost_micros || '0'), 0n)
 }
 
+/** Lightweight today-only aggregate for the status bar (single SQL, no rows pulled). */
+export async function queryTodaySummary(currency: UsageCurrency): Promise<{ requestCount: number, okCount: number, totalCostMicros: bigint, totalCostFormatted: string }> {
+  const start = startOfLocalDay()
+  const rows = await getAgentDatabase().all<{ n: number, ok: number, cost: string | null }>(
+    `SELECT COUNT(*) AS n,
+            SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok,
+            SUM(CAST(total_cost_micros AS INTEGER)) AS cost
+     FROM usage_logs WHERE created_at >= ? AND currency = ?`,
+    [start, currency],
+  )
+  const row = rows[0]
+  const totalCostMicros = BigInt(row?.cost ?? 0)
+  return {
+    requestCount: row?.n ?? 0,
+    okCount: row?.ok ?? 0,
+    totalCostMicros,
+    totalCostFormatted: formatCost(totalCostMicros, currency),
+  }
+}
+
 export function serializeUsageDashboard(dashboard: UsageDashboard) {
   return {
     settings: dashboard.settings,

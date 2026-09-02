@@ -13,6 +13,7 @@ import { getRoutesFilePath } from './server/routes'
 import { ensureUsageSettingsFile, onUsageSettingsChange, startUsageSettingsWatcher, stopUsageSettingsWatcher } from './server/usage/settings'
 import { PanelProvider } from './ui/panel-provider'
 import { getState, onStateChange, probeByokServer, refreshState, setFileLogState } from './ui/state'
+import { refreshUsageStatusBar, registerUsageStatusBar } from './ui/usage-statusbar'
 import { startUpdateCheck, stopUpdateCheck } from './update-check'
 
 let outputChannel: vscode.LogOutputChannel
@@ -466,6 +467,9 @@ export async function activate(context: vscode.ExtensionContext) {
   statusBarItem.show()
   context.subscriptions.push(statusBarItem)
 
+  // 用量状态栏 (今日费用 · 请求数), 点击打开 Usage 面板
+  registerUsageStatusBar(context)
+
   // 状态变化 → 刷新状态栏
   context.subscriptions.push(onStateChange(() => renderStatusBar()))
 
@@ -502,6 +506,10 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('cursor2plus.openSettings', () => {
       vscode.commands.executeCommand('cursor2plus.panel.focus')
     }),
+    vscode.commands.registerCommand('cursor2plus.openUsage', () => {
+      void vscode.commands.executeCommand('cursor2plus.panel.focus')
+      panelProvider.revealUsage()
+    }),
     vscode.commands.registerCommand('cursor2plus.toggleFileLog', () => toggleFileLog(context)),
     vscode.commands.registerCommand('cursor2plus.openLogFile', () => openLogFile()),
   )
@@ -527,6 +535,7 @@ export async function activate(context: vscode.ExtensionContext) {
   })
   const disposeUsageWatch = onUsageSettingsChange(async () => {
     await refreshState()
+    refreshUsageStatusBar()
   })
   context.subscriptions.push({ dispose: disposeRoutesWatch }, { dispose: disposeProvidersWatch }, { dispose: disposeUsageWatch })
 

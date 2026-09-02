@@ -259,6 +259,14 @@ export class PanelProvider implements vscode.WebviewViewProvider {
     })
   }
 
+  private revealNext = false
+
+  /** Status-bar entry point: refresh usage and ask the webview to expand the panel. */
+  revealUsage() {
+    this.revealNext = true
+    void this.postUsage()
+  }
+
   private postState() {
     if (!this.view)
       return
@@ -270,6 +278,8 @@ export class PanelProvider implements vscode.WebviewViewProvider {
   private async postUsage() {
     if (!this.view)
       return
+    const reveal = this.revealNext
+    this.revealNext = false
     try {
       const { isAgentDatabaseReady } = await import('../server/database/sqlite')
       const { loadUsageSettings } = await import('../server/usage/settings')
@@ -280,6 +290,7 @@ export class PanelProvider implements vscode.WebviewViewProvider {
         const zeroCost = formatCost(0n, settings.currency)
         this.view.webview.postMessage({
           type: 'usage',
+          reveal,
           usage: {
             settings,
             todayCostFormatted: zeroCost,
@@ -292,7 +303,7 @@ export class PanelProvider implements vscode.WebviewViewProvider {
         return
       }
       const dashboard = await queryUsageDashboard(loadUsageSettings())
-      this.view.webview.postMessage({ type: 'usage', usage: serializeUsageDashboard(dashboard) })
+      this.view.webview.postMessage({ type: 'usage', reveal, usage: serializeUsageDashboard(dashboard) })
     }
     catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err)

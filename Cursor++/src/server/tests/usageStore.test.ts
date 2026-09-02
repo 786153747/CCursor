@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
-import { queryUsageDashboard, recordUsageLog } from '../usage/store'
+import { queryTodaySummary, queryUsageDashboard, recordUsageLog } from '../usage/store'
 
 let tmpDbPath = ''
 
@@ -254,5 +254,21 @@ describe('usage store', () => {
     expect(dashboard.daily).toHaveLength(1)
     expect(dashboard.daily[0].requestCount).toBe(1)
     expect(dashboard.daily[0].totalCostMicros).toBe(10_000n)
+  })
+
+  it('summarizes today for the status bar per currency', async () => {
+    const now = Date.now()
+    await recordUsageLog(log({ requestId: 'a', totalCostMicros: 10_000n, createdAt: now }))
+    await recordUsageLog(log({ requestId: 'b', status: 'error', totalCostMicros: 2_500n, createdAt: now }))
+
+    const summary = await queryTodaySummary('CNY')
+    expect(summary.requestCount).toBe(2)
+    expect(summary.okCount).toBe(1)
+    expect(summary.totalCostMicros).toBe(12_500n)
+    expect(summary.totalCostFormatted).toBe('¥0.012500')
+
+    const usd = await queryTodaySummary('USD')
+    expect(usd.requestCount).toBe(0)
+    expect(usd.totalCostMicros).toBe(0n)
   })
 })
