@@ -323,6 +323,20 @@ export async function queryTodaySummary(currency: UsageCurrency): Promise<{ requ
   }
 }
 
+/**
+ * Delete usage logs older than the retention window (called once per
+ * activation) so the table stays small no matter how long the extension runs.
+ */
+export async function pruneOldUsageLogs(maxAgeDays = 90): Promise<void> {
+  const cutoff = Date.now() - maxAgeDays * 24 * 60 * 60 * 1000
+  try {
+    await getAgentDatabase().run('DELETE FROM usage_logs WHERE created_at < ?', [cutoff])
+  }
+  catch (error) {
+    logger.warn({ error: (error as Error).message }, '[USAGE] prune failed')
+  }
+}
+
 export function serializeUsageDashboard(dashboard: UsageDashboard) {
   return {
     settings: dashboard.settings,

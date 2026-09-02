@@ -11,9 +11,10 @@ import { resetProviderInstanceCache } from './server/handlers/llm/providerRuntim
 import { initLogger } from './server/logger'
 import { getRoutesFilePath } from './server/routes'
 import { ensureUsageSettingsFile, onUsageSettingsChange, startUsageSettingsWatcher, stopUsageSettingsWatcher } from './server/usage/settings'
+import { pruneOldUsageLogs } from './server/usage/store'
 import { PanelProvider } from './ui/panel-provider'
 import { getState, onStateChange, probeByokServer, refreshState, setFileLogState } from './ui/state'
-import { refreshUsageStatusBar, registerUsageStatusBar } from './ui/usage-statusbar'
+import { getUsageSuffix, getUsageTooltipLine, initUsageStatusBar, refreshUsageStatusBar } from './ui/usage-statusbar'
 import { startUpdateCheck, stopUpdateCheck } from './update-check'
 
 let outputChannel: vscode.LogOutputChannel
@@ -358,8 +359,8 @@ function renderStatusBar() {
     ? 'BYOK ON — using local providers.json'
     : 'BYOK OFF — passing through to official Cursor'
 
-  statusBarItem.text = `${serverIcon} BYOK ${byokGlyph}`
-  statusBarItem.tooltip = `${serverTip}\n${byokTip}\n\nClick: toggle BYOK Mode`
+  statusBarItem.text = `${serverIcon} BYOK ${byokGlyph}${getUsageSuffix()}`
+  statusBarItem.tooltip = `${serverTip}\n${byokTip}${getUsageTooltipLine() ? `\n${getUsageTooltipLine()}` : ''}\n\nClick: toggle BYOK Mode`
   statusBarItem.backgroundColor = s.byokMode
     ? undefined
     : new vscode.ThemeColor('statusBarItem.warningBackground')
@@ -468,8 +469,8 @@ export async function activate(context: vscode.ExtensionContext) {
   statusBarItem.show()
   context.subscriptions.push(statusBarItem)
 
-  // 用量状态栏 (今日费用 · 请求数), 点击打开 Usage 面板
-  registerUsageStatusBar(context)
+  // 用量后缀挂在 BYOK 状态栏项上 (今日费用, 点击项仍是 BYOK 开关)
+  initUsageStatusBar(renderStatusBar)
 
   // 状态变化 → 刷新状态栏
   context.subscriptions.push(onStateChange(() => renderStatusBar()))
@@ -519,6 +520,8 @@ export async function activate(context: vscode.ExtensionContext) {
   await ensureRoutesFile()
   await ensureProvidersFile()
   ensureUsageSettingsFile()
+  // 清理超过保留期的用量明细, 防止 usage_logs 无限膨胀
+  void pruneOldUsageLogs()
 
   // 文件监听: 其他实例修改配置时自动同步状态 + UI
   startRoutesWatcher()

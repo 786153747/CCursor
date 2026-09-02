@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
-import { queryTodaySummary, queryUsageDashboard, recordUsageLog } from '../usage/store'
+import { pruneOldUsageLogs, queryTodaySummary, queryUsageDashboard, recordUsageLog } from '../usage/store'
 
 let tmpDbPath = ''
 
@@ -270,5 +270,23 @@ describe('usage store', () => {
     const usd = await queryTodaySummary('USD')
     expect(usd.requestCount).toBe(0)
     expect(usd.totalCostMicros).toBe(0n)
+  })
+
+  it('prunes usage logs older than the retention window', async () => {
+    const now = Date.now()
+    await recordUsageLog(log({ requestId: 'old', totalCostMicros: 1_000n, createdAt: now - 91 * 24 * 60 * 60 * 1000 }))
+    await recordUsageLog(log({ requestId: 'new', totalCostMicros: 2_000n, createdAt: now }))
+
+    await pruneOldUsageLogs(90)
+
+    const dashboard = await queryUsageDashboard({
+      $schemaVersion: 1,
+      currency: 'CNY',
+      range: '30d',
+      selectedProviderIds: [],
+      selectedModelKeys: [],
+    })
+    expect(dashboard.summary.requestCount).toBe(1)
+    expect(dashboard.recent[0].requestId).toBe('new')
   })
 })

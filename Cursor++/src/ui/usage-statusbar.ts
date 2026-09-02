@@ -1,66 +1,59 @@
 /**
- * Usage status-bar item — today cost / request count at a glance.
+ * Usage status-bar suffix — today cost appended to the BYOK item.
  *
- * Separate item from the BYOK toggle so users can hide it independently
- * via the status-bar context menu. Refreshed on every usage record and
- * on currency change; data comes from a single SQL aggregate.
+ * Lives inside the existing BYOK status-bar item (no separate entry):
+ *   `✓ BYOK ◉ ¥4`
+ * The precise cost stays available via the item tooltip. Refreshed on
+ * every usage record and on currency change; data comes from a single
+ * SQL aggregate.
  */
-import type { ExtensionContext, StatusBarItem } from 'vscode'
-import * as vscode from 'vscode'
 import { onUsageRecorded } from '../server/usage/events'
 import { loadUsageSettings } from '../server/usage/settings'
 import { queryTodaySummary } from '../server/usage/store'
 
-let usageBarItem: StatusBarItem | null = null
+let rerenderBar: () => void = () => {}
+let usageSuffix = ''
+let usageTooltipLine = ''
 
 function currencySymbol(currency: 'CNY' | 'USD'): string {
   return currency === 'CNY' ? '\u00A5' : '$'
 }
 
-function formatBarCost(micros: bigint, currency: 'CNY' | 'USD'): string {
-  return `${currencySymbol(currency)}${Math.round(Number(micros) / 1e6)}`
-}
-
-function defaultBarText(): string {
-  try {
-    return `${formatBarCost(0n, loadUsageSettings().currency)} · 0 req`
-  }
-  catch {
-    return '\u00A50 · 0 req'
-  }
-}
-
-async function renderUsageBar() {
-  if (!usageBarItem)
-    return
+async function recompute() {
   try {
     const settings = loadUsageSettings()
     const summary = await queryTodaySummary(settings.currency)
-    usageBarItem.text = `${formatBarCost(summary.totalCostMicros, settings.currency)} · ${summary.requestCount} req`
-    usageBarItem.tooltip = `Cursor++ Usage — today (${settings.currency})\nCost ${summary.totalCostFormatted} · ${summary.requestCount} requests · ${summary.okCount} ok\n\nClick: open usage panel`
-    usageBarItem.show()
+    usageSuffix = ` ${currencySymbol(settings.currency)}${Math.round(Number(summary.totalCostMicros) / 1e6)}`
+    usageTooltipLine = `Today: ${summary.totalCostFormatted} · ${summary.requestCount} requests · ${summary.okCount} ok (${settings.currency})`
   }
   catch {
-    // agent DB not ready yet — show the placeholder instead of staying hidden
-    usageBarItem.text = defaultBarText()
-    usageBarItem.show()
+    // agent DB not ready yet — show no suffix instead of blocking the bar
+    usageSuffix = ''
+    usageTooltipLine = ''
   }
+  rerenderBar()
 }
 
-export function registerUsageStatusBar(context: ExtensionContext): void {
-  usageBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99)
-  usageBarItem.name = 'Cursor++: Usage'
-  usageBarItem.command = 'cursor2plus.openUsage'
-  usageBarItem.text = defaultBarText()
-  usageBarItem.show()
-  context.subscriptions.push(usageBarItem)
-  const disposeUsageListener = onUsageRecorded(() => {
-    void renderUsageBar()
+/** Attach today-cost suffix updates to the BYOK status-bar rerender cycle. */
+export function initUsageStatusBar(rerender: () => void): void {
+  rerenderBar = rerender
+  onUsageRecorded(() => {
+    void recompute()
   })
-  context.subscriptions.push({ dispose: disposeUsageListener })
-  void renderUsageBar()
+  void recompute()
 }
 
+/** Suffix for statusBarItem.text, e.g. ` ¥4`. Empty while data is unavailable. */
+export function getUsageSuffix(): string {
+  return usageSuffix
+}
+
+/** One-line today summary for the status-bar tooltip. Empty while unavailable. */
+export function getUsageTooltipLine(): string {
+  return usageTooltipLine
+}
+
+/** Recompute suffix (e.g. after a currency switch) and refresh the bar. */
 export function refreshUsageStatusBar(): void {
-  void renderUsageBar()
+  void recompute()
 }
