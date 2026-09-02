@@ -10,6 +10,7 @@ import { isLikelyWindowsMsvcMissing, preflightSupermarkdown, setSupermarkdownNat
 import { resetProviderInstanceCache } from './server/handlers/llm/providerRuntime'
 import { initLogger } from './server/logger'
 import { getRoutesFilePath } from './server/routes'
+import { ensureUsageSettingsFile, onUsageSettingsChange, startUsageSettingsWatcher, stopUsageSettingsWatcher } from './server/usage/settings'
 import { PanelProvider } from './ui/panel-provider'
 import { getState, onStateChange, probeByokServer, refreshState, setFileLogState } from './ui/state'
 import { startUpdateCheck, stopUpdateCheck } from './update-check'
@@ -508,10 +509,12 @@ export async function activate(context: vscode.ExtensionContext) {
   // 确保配置文件存在 —— 即使 server 未启动,面板也能读写
   await ensureRoutesFile()
   await ensureProvidersFile()
+  ensureUsageSettingsFile()
 
   // 文件监听: 其他实例修改配置时自动同步状态 + UI
   startRoutesWatcher()
   startProvidersWatcher()
+  startUsageSettingsWatcher()
   const disposeRoutesWatch = onRoutesChange(async () => {
     await refreshState()
     renderStatusBar()
@@ -522,7 +525,10 @@ export async function activate(context: vscode.ExtensionContext) {
     await refreshState()
     bumpRefreshSignal()
   })
-  context.subscriptions.push({ dispose: disposeRoutesWatch }, { dispose: disposeProvidersWatch })
+  const disposeUsageWatch = onUsageSettingsChange(async () => {
+    await refreshState()
+  })
+  context.subscriptions.push({ dispose: disposeRoutesWatch }, { dispose: disposeProvidersWatch }, { dispose: disposeUsageWatch })
 
   // 初始化状态
   await refreshState()
@@ -568,6 +574,7 @@ export async function deactivate() {
   closeLogFileStream()
   stopRoutesWatcher()
   stopProvidersWatcher()
+  stopUsageSettingsWatcher()
   await stopServer()
   if (outputChannel)
     outputChannel.dispose()
