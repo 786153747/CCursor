@@ -1,10 +1,10 @@
-import type { UsageLogRecord } from '../usage/types'
+import type { UsageBarScope, UsageLogRecord } from '../usage/types'
 import { unlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
-import { pruneOldUsageLogs, queryTodaySummary, queryUsageDashboard, recordUsageLog } from '../usage/store'
+import { pruneOldUsageLogs, queryUsageDashboard, queryUsageSummary, recordUsageLog } from '../usage/store'
 
 let tmpDbPath = ''
 
@@ -256,18 +256,24 @@ describe('usage store', () => {
     expect(dashboard.daily[0].totalCostMicros).toBe(10_000n)
   })
 
-  it('summarizes today for the status bar per currency', async () => {
+  it('summarizes per scope (today/month) and currency for the status bar', async () => {
     const now = Date.now()
+    const lastMonth = now - 45 * 24 * 60 * 60 * 1000
     await recordUsageLog(log({ requestId: 'a', totalCostMicros: 10_000n, createdAt: now }))
     await recordUsageLog(log({ requestId: 'b', status: 'error', totalCostMicros: 2_500n, createdAt: now }))
+    await recordUsageLog(log({ requestId: 'old', totalCostMicros: 99_000n, createdAt: lastMonth }))
 
-    const summary = await queryTodaySummary('CNY')
-    expect(summary.requestCount).toBe(2)
-    expect(summary.okCount).toBe(1)
-    expect(summary.totalCostMicros).toBe(12_500n)
-    expect(summary.totalCostFormatted).toBe('¥0.012500')
+    const today = await queryUsageSummary('today' as UsageBarScope, 'CNY')
+    expect(today.requestCount).toBe(2)
+    expect(today.okCount).toBe(1)
+    expect(today.totalCostMicros).toBe(12_500n)
+    expect(today.totalCostFormatted).toBe('¥0.012500')
 
-    const usd = await queryTodaySummary('USD')
+    const month = await queryUsageSummary('month' as UsageBarScope, 'CNY')
+    expect(month.requestCount).toBe(2)
+    expect(month.totalCostMicros).toBe(12_500n)
+
+    const usd = await queryUsageSummary('today' as UsageBarScope, 'USD')
     expect(usd.requestCount).toBe(0)
     expect(usd.totalCostMicros).toBe(0n)
   })

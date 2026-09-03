@@ -14,13 +14,15 @@ let cache: UsageSettings | null = null
 
 function withFallback(loaded: Partial<UsageSettingsConfig> | null): UsageSettings {
   const currency: UsageCurrency = loaded?.currency === 'USD' ? 'USD' : 'CNY'
-  const range: UsageRangePreset = loaded?.range === '7d' || loaded?.range === '14d' || loaded?.range === '30d'
+  const range: UsageRangePreset = loaded?.range === '7d' || loaded?.range === '14d' || loaded?.range === '30d' || loaded?.range === 'month'
     ? loaded.range
     : 'today'
+  const statusBarScope: 'today' | 'month' = loaded?.statusBarScope === 'today' ? 'today' : 'month'
   return {
     $schemaVersion: 1,
     currency,
     range,
+    statusBarScope,
     filterCustomized: loaded?.filterCustomized === true,
     selectedProviderIds: Array.isArray(loaded?.selectedProviderIds) ? loaded.selectedProviderIds.filter(id => typeof id === 'string') : [],
     selectedModelKeys: Array.isArray(loaded?.selectedModelKeys) ? loaded.selectedModelKeys.filter(id => typeof id === 'string') : [],

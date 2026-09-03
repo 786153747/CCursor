@@ -3,7 +3,10 @@ import type { LLMUsage } from '../handlers/llm/types'
 
 export type UsageCurrency = 'CNY' | 'USD'
 
-export type UsageRangePreset = 'today' | '7d' | '14d' | '30d'
+export type UsageRangePreset = 'today' | '7d' | '14d' | '30d' | 'month'
+
+/** Statistics window of the status-bar suffix: resets daily or monthly. */
+export type UsageBarScope = 'today' | 'month'
 
 export type UsageStatus = 'ok' | 'error'
 
@@ -45,6 +48,8 @@ export interface UsageSettings {
   selectedProviderIds: string[]
   /** Keys are `${providerId}::${modelId}`. */
   selectedModelKeys: string[]
+  /** Status-bar statistics window: resets daily or on the 1st of each month. */
+  statusBarScope?: UsageBarScope
 }
 
 export interface UsageLogRecord {

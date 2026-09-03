@@ -1,16 +1,19 @@
 /**
- * Usage status-bar suffix — today cost appended to the BYOK item.
+ * Usage status-bar suffix — period cost appended to the BYOK item.
  *
  * Lives inside the existing BYOK status-bar item (no separate entry):
- *   `✓ BYOK ◉ ¥4`
- * The precise cost stays available via the item tooltip. Refreshed on
- * every usage record and on currency change; data comes from a single
- * SQL aggregate. A failed first query (agent DB not initialized yet)
- * schedules retries so the suffix appears without waiting for a request.
+ *   `✓ BYOK ◉ ¥14`
+ * The statistics window follows `usage-settings.json` `statusBarScope`
+ * ('month' by default — resets on the 1st, or 'today' — resets at midnight).
+ * The precise cost stays available via the item tooltip. Refreshed on every
+ * usage record and on currency/scope change; data comes from a single SQL
+ * aggregate. A failed query (agent DB not initialized yet) schedules retries
+ * so the suffix appears without waiting for a request.
  */
+import type { UsageBarScope } from '../server/usage/types'
 import { onUsageRecorded } from '../server/usage/events'
 import { loadUsageSettings } from '../server/usage/settings'
-import { queryTodaySummary } from '../server/usage/store'
+import { queryUsageSummary } from '../server/usage/store'
 
 const RETRY_DELAY_MS = 10_000
 const RETRY_MAX = 6
@@ -38,9 +41,11 @@ function scheduleRetry() {
 async function recompute() {
   try {
     const settings = loadUsageSettings()
-    const summary = await queryTodaySummary(settings.currency)
+    const scope: UsageBarScope = settings.statusBarScope === 'today' ? 'today' : 'month'
+    const summary = await queryUsageSummary(scope, settings.currency)
     usageSuffix = ` ${currencySymbol(settings.currency)}${Math.round(Number(summary.totalCostMicros) / 1e6)}`
-    usageTooltipLine = `Today: ${summary.totalCostFormatted} · ${summary.requestCount} requests · ${summary.okCount} ok (${settings.currency})`
+    const scopeLabel = scope === 'month' ? 'This month' : 'Today'
+    usageTooltipLine = `${scopeLabel}: ${summary.totalCostFormatted} · ${summary.requestCount} requests · ${summary.okCount} ok (${settings.currency})`
     retryCount = 0
   }
   catch {
@@ -53,7 +58,7 @@ async function recompute() {
   rerenderBar()
 }
 
-/** Attach today-cost suffix updates to the BYOK status-bar rerender cycle. */
+/** Attach period-cost suffix updates to the BYOK status-bar rerender cycle. */
 export function initUsageStatusBar(rerender: () => void): void {
   rerenderBar = rerender
   onUsageRecorded(() => {
@@ -62,17 +67,17 @@ export function initUsageStatusBar(rerender: () => void): void {
   void recompute()
 }
 
-/** Suffix for statusBarItem.text, e.g. ` ¥4`. Empty while data is unavailable. */
+/** Suffix for statusBarItem.text, e.g. ` ¥14`. Empty while data is unavailable. */
 export function getUsageSuffix(): string {
   return usageSuffix
 }
 
-/** One-line today summary for the status-bar tooltip. Empty while unavailable. */
+/** One-line period summary for the status-bar tooltip. Empty while unavailable. */
 export function getUsageTooltipLine(): string {
   return usageTooltipLine
 }
 
-/** Recompute suffix (e.g. after a currency switch or server start) and refresh the bar. */
+/** Recompute suffix (e.g. after a scope/currency switch) and refresh the bar. */
 export function refreshUsageStatusBar(): void {
   retryCount = 0
   void recompute()

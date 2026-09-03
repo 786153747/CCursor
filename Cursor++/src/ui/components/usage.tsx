@@ -16,11 +16,19 @@ export function Usage() {
           <option value="7d">7 days</option>
           <option value="14d">14 days</option>
           <option value="30d">30 days</option>
+          <option value="month">This month</option>
         </select>
         <select x-model="$store.app.usageCurrency" x-on:change="$store.app.saveUsageSettings()">
           <option value="CNY">CNY ¥</option>
           <option value="USD">USD $</option>
         </select>
+        <button
+          class="tiny secondary"
+          title="Status bar statistics window (resets daily or monthly)"
+          x-on:click="$store.app.toggleUsageBarScope()"
+          x-text="$store.app.usageBarScopeLabel"
+        >
+        </button>
         <button class="tiny secondary" x-on:click="$store.app.loadUsage()">Refresh</button>
       </div>
 

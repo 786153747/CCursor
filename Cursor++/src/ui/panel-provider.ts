@@ -167,8 +167,10 @@ export class PanelProvider implements vscode.WebviewViewProvider {
             await updateUsageSettings((draft) => {
               if (msg.currency === 'USD' || msg.currency === 'CNY')
                 draft.currency = msg.currency
-              if (msg.range === 'today' || msg.range === '7d' || msg.range === '14d' || msg.range === '30d')
+              if (msg.range === 'today' || msg.range === '7d' || msg.range === '14d' || msg.range === '30d' || msg.range === 'month')
                 draft.range = msg.range
+              if (msg.statusBarScope === 'today' || msg.statusBarScope === 'month')
+                draft.statusBarScope = msg.statusBarScope
               if (typeof msg.filterCustomized === 'boolean')
                 draft.filterCustomized = msg.filterCustomized
               if (Array.isArray(msg.selectedProviderIds))

@@ -280,10 +280,11 @@ export const DEFAULT_PROVIDERS: ProvidersConfig = {
 export interface UsageSettingsConfig {
   $schemaVersion: number
   currency: 'CNY' | 'USD'
-  range: 'today' | '7d' | '14d' | '30d'
+  range: 'today' | '7d' | '14d' | '30d' | 'month'
   filterCustomized?: boolean
   selectedProviderIds: string[]
   selectedModelKeys: string[]
+  statusBarScope?: 'today' | 'month'
 }
 
 export const DEFAULT_USAGE_SETTINGS: UsageSettingsConfig = {
@@ -293,6 +294,7 @@ export const DEFAULT_USAGE_SETTINGS: UsageSettingsConfig = {
   filterCustomized: false,
   selectedProviderIds: [],
   selectedModelKeys: [],
+  statusBarScope: 'month',
 }
 
 export const MODELS_CATALOG_FILE_NAME = 'models-catalog.json'

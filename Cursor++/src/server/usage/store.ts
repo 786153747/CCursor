@@ -1,4 +1,5 @@
 import type {
+  UsageBarScope,
   UsageCurrency,
   UsageDailyStat,
   UsageDashboard,
@@ -23,9 +24,18 @@ function startOfLocalDay(now = Date.now()): number {
   return date.getTime()
 }
 
+function startOfLocalMonth(now = Date.now()): number {
+  const date = new Date(now)
+  date.setDate(1)
+  date.setHours(0, 0, 0, 0)
+  return date.getTime()
+}
+
 function rangeStart(range: UsageRangePreset, now = Date.now()): number {
   if (range === 'today')
     return startOfLocalDay(now)
+  if (range === 'month')
+    return startOfLocalMonth(now)
   // Anchor on local midnight so "7 days" covers exactly 7 full calendar days
   // and the daily trend buckets stay one-per-day with no partial first day.
   const days = range === '7d' ? 7 : range === '14d' ? 14 : 30
@@ -303,9 +313,9 @@ function sumMicros(rows: UsageLogRow[]): bigint {
   return rows.reduce((sum, row) => sum + BigInt(row.total_cost_micros || '0'), 0n)
 }
 
-/** Lightweight today-only aggregate for the status bar (single SQL, no rows pulled). */
-export async function queryTodaySummary(currency: UsageCurrency): Promise<{ requestCount: number, okCount: number, totalCostMicros: bigint, totalCostFormatted: string }> {
-  const start = startOfLocalDay()
+/** Lightweight aggregate for the status bar over the scope window (single SQL, no rows pulled). */
+export async function queryUsageSummary(scope: UsageBarScope, currency: UsageCurrency): Promise<{ requestCount: number, okCount: number, totalCostMicros: bigint, totalCostFormatted: string }> {
+  const start = scope === 'month' ? startOfLocalMonth() : startOfLocalDay()
   const rows = await getAgentDatabase().all<{ n: number, ok: number, cost: string | null }>(
     `SELECT COUNT(*) AS n,
             SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok,

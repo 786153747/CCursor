@@ -198,10 +198,30 @@ export function initApp(Alpine: AlpineType) {
       this.post('saveUsageSettings', {
         currency: this.usageCurrency,
         range: this.usageRange,
+        statusBarScope: this.usage?.settings?.statusBarScope === 'today' ? 'today' : 'month',
         filterCustomized: options?.customizeFilter ? true : this.usage?.settings?.filterCustomized,
         selectedProviderIds,
         selectedModelKeys,
       })
+    },
+
+    toggleUsageBarScope() {
+      const current = this.usage?.settings?.statusBarScope === 'today' ? 'today' : 'month'
+      const next = current === 'month' ? 'today' : 'month'
+      if (this.usage?.settings)
+        this.usage.settings.statusBarScope = next
+      this.post('saveUsageSettings', {
+        currency: this.usageCurrency,
+        range: this.usageRange,
+        statusBarScope: next,
+        filterCustomized: this.usage?.settings?.filterCustomized,
+        selectedProviderIds: (this.usage?.providers || []).filter((p: any) => p.selected).map((p: any) => p.id),
+        selectedModelKeys: (this.usage?.models || []).filter((m: any) => m.selected).map((m: any) => m.key),
+      })
+    },
+
+    get usageBarScopeLabel(): string {
+      return this.usage?.settings?.statusBarScope === 'today' ? 'Bar: Today' : 'Bar: Month'
     },
 
     toggleUsageProvider(id: string, checked: boolean) {
