@@ -9,9 +9,12 @@ import {
   ThinkingMessageSchema,
   UserMessageSchema,
 } from '../../gen/agent_v1_pb'
+import type { AgentServerMessage } from '../../gen/agent_v1_pb'
 import type { ParsedRunRequest } from './protocol/types'
-import { encodeBinaryBlob } from './blob'
-import { getCachedBlob } from './blobStore'
+import type { AgentSession } from './session'
+import { binaryBlobDataFromClientBytes, blobIdToBytes, encodeBinaryBlob } from './blob'
+import { cacheBlob, getCachedBlob } from './blobStore'
+import { fetchBlobsFromClient } from './clientBlobFetch'
 import { logger } from '../../logger'
 
 function resolveAgentMode(mode: string): AgentMode {
@@ -154,6 +157,22 @@ export function createCurrentTurnUserMessageBlob(params: {
 
   const blob = encodeBinaryBlob(toBinary(UserMessageSchema, create(UserMessageSchema, init as any)))
   return { blob, messageId }
+}
+
+/**
+ * resume 前确保 turn blob 在内存里: 未命中 (进程重启) 就向客户端取。
+ * turn blob 以 raw protobuf 发给客户端 (kvMessage 的 blobDataRaw 分支), 取回时按二进制归一。
+ */
+export async function* ensureTurnBlobCached(
+  turnBlobId: string,
+  session: AgentSession | null,
+  allocateBlobId: () => number,
+): AsyncGenerator<AgentServerMessage, void, void> {
+  if (getCachedBlob(turnBlobId) !== undefined)
+    return
+  const [bytes] = yield* fetchBlobsFromClient({ session, blobIds: [blobIdToBytes(turnBlobId)], allocateBlobId })
+  if (bytes)
+    cacheBlob(turnBlobId, binaryBlobDataFromClientBytes(bytes))
 }
 
 export function readTurnBaseline(turnBlobId: string): TurnBaseline | null {

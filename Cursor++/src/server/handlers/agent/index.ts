@@ -9,5 +9,5 @@ export {
 } from './stream';
 export { getOrCreateSession, waitForMessage, waitForMessageMatching, appendMessage, closeSession } from './session';
 export { rebuildMessagesFromBlobs, blobToMessage, messageToBlob } from './conversation';
-export { cacheBlob, getCachedBlob, getCachedBlobsAsMessages } from './blobStore';
+export { cacheBlob, getCachedBlob } from './blobStore';
 export { mapToolName, mapToolToExecArgs, buildExecArgs } from './tools';

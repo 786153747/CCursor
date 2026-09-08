@@ -1,10 +1,11 @@
 import type { AgentServerMessage } from '../../gen/agent_v1_pb'
 import type { LLMContentBlock, LLMMessage } from '../llm/types'
 import { logger } from '../../logger'
-import { decodeBlob, encodeBlob } from './blob'
+import { blobIdToBytes, decodeBlob, encodeBlob, jsonBlobDataFromClientBytes } from './blob'
 import { cacheBlob, getCachedBlob } from './blobStore'
-import { fetchMissingHistoryBlobs } from './historyBlobFetch'
+import { fetchBlobsFromClient } from './clientBlobFetch'
 import type { AgentSession } from './session'
+import { kvMessage } from './stream'
 import { normalizeBlobMessage, restoreBlobMessageToLLMMessage } from './transcript'
 import { createRepairDiagnostics, hasRepairMutations, repairConversationHistory, type RepairDiagnostics } from '../llm/transformMessages'
 
@@ -258,54 +259,86 @@ export function repairHistoryEntries(entries: HistoryEntry[]): HistoryEntry[] {
   return materializeHistoryEntries(repaired)
 }
 
-/** 本地缓存 (内存 Map, 已由 agentOrchestrator 用 SQLite 预热过) 未命中的历史 blobId。 */
+export interface HistoryBlobLoadParams {
+  historyBlobIds: string[]
+  /** 本 run 的客户端会话; null (测试 / 特殊路径) 时只查内存, 缺失静默跳过 */
+  session: AgentSession | null
+  /** kvServerMessage.getBlobArgs 的 id 分配器 (agentOrchestrator 全 run 共用一个计数器) */
+  allocateBlobId: () => number
+}
+
 function collectUncachedBlobIds(blobIds: string[]): string[] {
-  return blobIds.filter(blobId => getCachedBlob(blobId) === undefined)
+  return [...new Set(blobIds.filter(blobId => getCachedBlob(blobId) === undefined))]
 }
 
 /**
- * 历史 blob 解析 (阶段 1 回源接线):
- *   1. 先算本地缓存未命中的 blobId —— 必须在 agentOrchestrator 的 warmupBlobsAsync
- *      之后 (本函数由 handleConversationRun 调用, 天然满足), 否则会向客户端要本地明明有的 blob;
- *   2. 有缺失且有 session → yield* fetchMissingHistoryBlobs 经 getBlobArgs 向客户端取回,
- *      取回的 blob 经 cacheBlob 落内存 + SQLite;
- *   3. 再 hydrateHistoryEntries —— 此时命中的就包括刚取回的。
+ * 装载对话历史: 内存未命中的 blob 经 getBlobArgs 向客户端取回, 再 hydrate。
+ * 客户端是 blob 的唯一持久持有方, 这是历史 blob 进入服务端的唯一途径。
  *
- * `history blobs from cache` 日志字段是用户验证阶段 1 的唯一依据, 字段名保持稳定:
- *   requestedBlobs / cachedBlobs / fetchedFromClient / stillMissing (+ resolvedBlobs)
- *   四者按请求列表逐项计数, 恒有 cachedBlobs + fetchedFromClient + stillMissing === requestedBlobs。
+ * `history blobs from cache` 日志字段是用户核验的依据, 字段名保持稳定:
+ *   requestedBlobs / cachedBlobs / fetchedFromClient / stillMissing / resolvedBlobs
+ *   恒有 cachedBlobs + fetchedFromClient + stillMissing === requestedBlobs。
  */
-async function* resolveHistoryEntries(params: {
-  historyBlobIds: string[]
-  prependUserMessages: number
-  session: AgentSession | null
-  allocateBlobId: () => number
-}): AsyncGenerator<AgentServerMessage, HistoryEntry[], void> {
-  const missingBeforeFetch = collectUncachedBlobIds(params.historyBlobIds)
-  const cachedBlobs = params.historyBlobIds.length - missingBeforeFetch.length
-
-  let fetchOutcome: { fetched: number, failed: number } | undefined
-  if (missingBeforeFetch.length > 0 && params.session) {
-    fetchOutcome = yield* fetchMissingHistoryBlobs({
+export async function* loadHistoryEntries(params: HistoryBlobLoadParams): AsyncGenerator<AgentServerMessage, HistoryEntry[], void> {
+  const missingBlobIds = collectUncachedBlobIds(params.historyBlobIds)
+  if (missingBlobIds.length > 0) {
+    const fetchedBytes = yield* fetchBlobsFromClient({
       session: params.session,
-      missingBlobIds: missingBeforeFetch,
+      blobIds: missingBlobIds.map(blobIdToBytes),
       allocateBlobId: params.allocateBlobId,
+    })
+    fetchedBytes.forEach((bytes, index) => {
+      const blobData = bytes ? jsonBlobDataFromClientBytes(bytes) : null
+      if (blobData)
+        cacheBlob(missingBlobIds[index]!, blobData)
+      else if (bytes)
+        logger.warn({ blobId: missingBlobIds[index] }, '[SESSION] history blob from client is not a decodable message blob')
     })
   }
 
-  const stillMissingAfterFetch = collectUncachedBlobIds(params.historyBlobIds)
+  const stillMissing = params.historyBlobIds.filter(blobId => getCachedBlob(blobId) === undefined).length
   const historyEntries = hydrateHistoryEntries(params.historyBlobIds)
+  const cachedBlobs = params.historyBlobIds.length - missingBlobIds.length
   logger.info({
     requestedBlobs: params.historyBlobIds.length,
     cachedBlobs,
-    fetchedFromClient: missingBeforeFetch.length - stillMissingAfterFetch.length,
-    stillMissing: stillMissingAfterFetch.length,
+    fetchedFromClient: params.historyBlobIds.length - cachedBlobs - stillMissing,
+    stillMissing,
     resolvedBlobs: historyEntries.length,
-    prependUserMessages: params.prependUserMessages,
-    ...(fetchOutcome ? { clientFetch: fetchOutcome } : {}),
-    ...(missingBeforeFetch.length > 0 && !params.session ? { clientFetch: 'skipped_no_session' } : {}),
   }, '[SESSION] history blobs from cache')
   return historyEntries
+}
+
+/**
+ * 压缩产物里客户端尚未持有的 root blob 必须经 setBlobArgs 送达。
+ *
+ * createCompactionArtifacts 的 nextRootBlobIds 含 repair 重编码的条目、占位 / 锚点副本,
+ * 这些 blobId 是服务端本轮新造的, 客户端从未收到过; 若只发 checkpoint 不发 blob, 客户端
+ * checkpoint 就引用了它没有的 blob —— 服务端不落盘, 重启后即成历史空洞。
+ * 返回实际补发数; 起始 kv id 由调用方给出 (与摘要 / 归档 blob 的 id 连续)。
+ */
+export function* sendRootBlobsUnknownToClient(
+  nextRootBlobIds: string[],
+  clientKnownBlobIds: Iterable<string>,
+  firstKvMessageId: number,
+): Generator<AgentServerMessage, number, void> {
+  const known = new Set(clientKnownBlobIds)
+  let sent = 0
+  for (const blobId of nextRootBlobIds) {
+    if (known.has(blobId))
+      continue
+    known.add(blobId)
+    const blobData = getCachedBlob(blobId)
+    if (!blobData) {
+      logger.warn({ blobId }, '[SESSION] compacted root blob missing from cache; client checkpoint will reference it anyway')
+      continue
+    }
+    yield kvMessage(firstKvMessageId + sent, blobId, blobData)
+    sent++
+  }
+  if (sent > 0)
+    logger.info({ sent, rootBlobs: nextRootBlobIds.length }, '[SESSION] sent compacted root blobs unknown to client')
+  return sent
 }
 
 export async function* rebuildConversationHistory(params: {
@@ -318,22 +351,12 @@ export async function* rebuildConversationHistory(params: {
   preambleUserContent: string
   sendSystemScaffoldBlob: (data: { role: string, content: unknown, toolCallId?: string, toolName?: string, isError?: boolean }) => Generator<AgentServerMessage, void, void>
   sendOrderedBlob: (data: { role: string, content: unknown, toolCallId?: string, toolName?: string, isError?: boolean }) => Generator<AgentServerMessage, void, void>
-  /** 本 run 的客户端会话; null 时跳过回源, 行为与接线前一致 (只查本地缓存) */
-  session: AgentSession | null
-  /** kvServerMessage.getBlobArgs 的 id 分配器 —— 与 agentOrchestrator 的四类 Part 取回共用同一计数器 */
-  allocateBlobId: () => number
-}): AsyncGenerator<AgentServerMessage, { messages: LLMMessage[], insertedPrependUserTexts: string[] }, void> {
+} & HistoryBlobLoadParams): AsyncGenerator<AgentServerMessage, { messages: LLMMessage[], insertedPrependUserTexts: string[] }, void> {
   let messages: LLMMessage[] = []
   let insertedPrependUserTexts: string[] = []
 
   if (params.historyBlobIds.length > 0) {
-    const historyEntries = yield* resolveHistoryEntries({
-      historyBlobIds: params.historyBlobIds,
-      prependUserMessages: params.prependUserMessages.length,
-      session: params.session,
-      allocateBlobId: params.allocateBlobId,
-    })
-
+    const historyEntries = yield* loadHistoryEntries(params)
     messages = historyEntries.map(entry => entry.message)
 
     const scaffoldSynced = syncConversationScaffold(messages, params.systemMessage, params.preambleUserMessage)

@@ -24,12 +24,11 @@
  *   LLM 只剩内置的 ListMcpResources / FetchMcpResource / CallMcpTool,
  *   动态 MCP 工具(decompile / list_funcs …)全部消失。
  *
- * 本模块负责: 严格串行取回四个引用并分别解码为 Rules / Skills /
- * Subagents / Mcps Part，再合回同一个 ParsedRunRequest。dual/legacy 模式
- * 不暴露引用，因此不会重复拉取或影响旧客户端。
+ * 本模块负责: 把取回的四个 Part 字节 (取回走 clientBlobFetch, 与历史 blob 同一原语)
+ * 分别解码为 Rules / Skills / Subagents / Mcps Part，再合回同一个 ParsedRunRequest。
+ * dual/legacy 模式不暴露引用，因此不会重复拉取或影响旧客户端。
  */
 import { fromBinary } from '@bufbuild/protobuf'
-import type { AgentServerMessage } from '../../gen/agent_v1_pb'
 import {
   RequestContextMcpsPartSchema,
   RequestContextRulesPartSchema,
@@ -44,30 +43,14 @@ import {
   parseMcpMetaToolOptions,
   resolveMcpServerIdentifier,
 } from './protocol/parseRunRequest'
-import type { AgentSession } from './session'
 import {
   applyRuleContext,
   mergeAgentSkills,
   normalizeAgentSkill,
   normalizeCustomSubagent,
 } from './contextCatalog'
-// getBlobResult 解包 (含 3.13+ error 字段处理) 抽到 kvBlobResult, 与历史 blob 回源共用。
-import { extractBlobData } from './kvBlobResult'
-import { kvGetBlob } from './stream'
-import { waitForMessageMatchingWithHeartbeat } from './wait'
 
-/** 取 blob 的等待上限 — 客户端本地内存命中,正常是毫秒级 */
-const BLOB_FETCH_TIMEOUT_MS = 10_000
-
-function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length)
-    return false
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i])
-      return false
-  }
-  return true
-}
+export type RequestContextPartName = 'rules' | 'skills' | 'subagents' | 'mcps'
 
 export interface FetchedRulesPart {
   rules: Array<Record<string, unknown>>
@@ -91,50 +74,7 @@ export interface FetchedMcpsPart {
   mcpMetaToolOptions?: Record<string, unknown>
 }
 
-type FetchPartParams = {
-  session: AgentSession | null
-  blobId: Uint8Array
-  allocateBlobId: () => number
-}
-
-/** 四类 Part 共用同一个严格串行 KV fetch，避免无 response id 的旧客户端串包。 */
-async function* fetchPartBytes(
-  params: FetchPartParams,
-  partName: 'rules' | 'skills' | 'subagents' | 'mcps',
-): AsyncGenerator<AgentServerMessage, Uint8Array | null, void> {
-  if (!params.session) {
-    logger.warn({ partName }, '[PROTOCOL] cannot fetch request-context blob without a session')
-    return null
-  }
-
-  const requestId = params.allocateBlobId()
-  yield kvGetBlob(requestId, params.blobId)
-  const msg = yield* waitForMessageMatchingWithHeartbeat(
-    params.session,
-    (message) => {
-      const kv = message.kvClientMessage as Record<string, unknown> | undefined
-      if (!kv?.getBlobResult)
-        return false
-      const id = kv.id
-      return id === undefined || id === requestId
-    },
-    BLOB_FETCH_TIMEOUT_MS,
-  )
-  if (!msg) {
-    logger.warn({ requestId, partName }, '[PROTOCOL] request-context blob fetch timed out')
-    return null
-  }
-  const blobData = extractBlobData(msg)
-  if (!blobData) {
-    logger.warn({ requestId, partName }, '[PROTOCOL] request-context blob fetch returned no data')
-    return null
-  }
-  return blobData
-}
-
-export async function* fetchRulesPart(params: FetchPartParams): AsyncGenerator<AgentServerMessage, FetchedRulesPart | null, void> {
-  const blobData = yield* fetchPartBytes(params, 'rules')
-  if (!blobData) return null
+export function decodeRulesPart(blobData: Uint8Array): FetchedRulesPart | null {
   try {
     const part = fromBinary(RequestContextRulesPartSchema, blobData)
     const result = {
@@ -152,9 +92,7 @@ export async function* fetchRulesPart(params: FetchPartParams): AsyncGenerator<A
   }
 }
 
-export async function* fetchSkillsPart(params: FetchPartParams): AsyncGenerator<AgentServerMessage, FetchedSkillsPart | null, void> {
-  const blobData = yield* fetchPartBytes(params, 'skills')
-  if (!blobData) return null
+export function decodeSkillsPart(blobData: Uint8Array): FetchedSkillsPart | null {
   try {
     const part = fromBinary(RequestContextSkillsPartSchema, blobData)
     const result = {
@@ -171,9 +109,7 @@ export async function* fetchSkillsPart(params: FetchPartParams): AsyncGenerator<
   }
 }
 
-export async function* fetchSubagentsPart(params: FetchPartParams): AsyncGenerator<AgentServerMessage, FetchedSubagentsPart | null, void> {
-  const blobData = yield* fetchPartBytes(params, 'subagents')
-  if (!blobData) return null
+export function decodeSubagentsPart(blobData: Uint8Array): FetchedSubagentsPart | null {
   try {
     const part = fromBinary(RequestContextSubagentsPartSchema, blobData)
     const result = { customSubagents: part.customSubagents as unknown as Array<Record<string, unknown>> }
@@ -186,9 +122,7 @@ export async function* fetchSubagentsPart(params: FetchPartParams): AsyncGenerat
   }
 }
 
-export async function* fetchMcpsPart(params: FetchPartParams): AsyncGenerator<AgentServerMessage, FetchedMcpsPart | null, void> {
-  const blobData = yield* fetchPartBytes(params, 'mcps')
-  if (!blobData) return null
+export function decodeMcpsPart(blobData: Uint8Array): FetchedMcpsPart | null {
   try {
     const part = fromBinary(RequestContextMcpsPartSchema, blobData)
     const tools = part.tools as unknown as Array<Record<string, unknown>>
@@ -342,4 +276,35 @@ export function applyMcpsPart(parsed: ParsedRunRequest, part: FetchedMcpsPart): 
   }, '[PROTOCOL] MCP context restored from mcps blob')
 }
 
-export { bytesEqual }
+/** 解码一个取回的 Part 并合入 parsed; blobData 为 null (取回失败) 时只告警。 */
+export function applyRequestContextPart(parsed: ParsedRunRequest, partName: RequestContextPartName, blobData: Uint8Array | null): void {
+  if (!blobData) {
+    logger.warn({ partName }, '[PROTOCOL] request-context part blob unavailable from client; keeping inline context')
+    return
+  }
+  switch (partName) {
+    case 'rules': {
+      const part = decodeRulesPart(blobData)
+      if (part)
+        applyRulesPart(parsed, part)
+      return
+    }
+    case 'skills': {
+      const part = decodeSkillsPart(blobData)
+      if (part)
+        applySkillsPart(parsed, part)
+      return
+    }
+    case 'subagents': {
+      const part = decodeSubagentsPart(blobData)
+      if (part)
+        applySubagentsPart(parsed, part)
+      return
+    }
+    case 'mcps': {
+      const part = decodeMcpsPart(blobData)
+      if (part)
+        applyMcpsPart(parsed, part)
+    }
+  }
+}

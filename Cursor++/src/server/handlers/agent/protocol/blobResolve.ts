@@ -1,9 +1,9 @@
 /**
  * Blob 形态字段的二次解包
  *
- * parseRunRequest 是同步函数,只记录 blob 引用。实际从 blobStore 取回数据
- * 依赖 warmup + 同步 get,因此放到 parseRunRequest 之后、进入 hot path 之前
- * 的一次专门 resolve 阶段。
+ * parseRunRequest 是同步函数,只记录 blob 引用。实际从 blobStore (进程内热缓存,
+ * 由 UploadConversationBlobs 或 getBlobArgs 回取填充) 取回数据放到 parseRunRequest
+ * 之后、进入 hot path 之前的一次专门 resolve 阶段。
  */
 import type { ParsedRunRequest } from './types'
 import { getCachedBlob } from '../blobStore'
@@ -18,7 +18,7 @@ export function collectExtraContextBlobIds(parsed: ParsedRunRequest): string[] {
 
 /**
  * 从 blobStore 里取回 extraContextEntries 的 blob 内容,就地替换 blobId → data。
- * 必须在调用方已经 warmupBlobsAsync 之后调用,否则会 miss。
+ * 可重复调用: 调用方在向客户端回取未命中的 blob 之后再 resolve 一次。
  *
  * blobStore 里的数据以 base64 存,这里解码为 UTF-8 文本(extra context 本质是
  * 长文本片段,不做 JSON.parse 避免遇到纯文本时失败)。

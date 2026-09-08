@@ -3,11 +3,10 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { persistBlob } from '../database/blobs'
 import { persistConversationCheckpoint } from '../database/checkpoints'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
 import { encodeBlob } from '../handlers/agent/blob'
-import { resetBlobCacheForTests, warmupBlobsAsync } from '../handlers/agent/blobStore'
+import { cacheBlob, resetBlobCacheForTests } from '../handlers/agent/blobStore'
 import { rebuildConversationHistory } from '../handlers/agent/historyManager'
 import { assertValidAnthropicToolUseContract } from '../handlers/llm/anthropicContract'
 import { encodeAnthropicRequestMessages } from '../handlers/llm/conversationCodec'
@@ -93,10 +92,6 @@ describe('agent orchestrator / history rebuild integration', () => {
   it('trusts empty client conversationState and does not restore sqlite checkpoint history', async () => {
     await withTempAgentDatabase(async () => {
       const { system, preamble, assistant, legacyUserToolResults } = buildLegacyAnthropicHistoryBlobs()
-      for (const blob of [system, preamble, assistant, legacyUserToolResults]) {
-        await persistBlob(blob.blobId, blob.blobData)
-      }
-
       await persistConversationCheckpoint({
         kind: 'committed',
         conversationId: 'conv-switch',
@@ -136,11 +131,8 @@ describe('agent orchestrator / history rebuild integration', () => {
       const oldSystem = encodeBlob({ role: 'system', content: 'OpenAI system prompt mentions ApplyPatch and ReadFile' })
       const oldPreamble = encodeBlob({ role: 'user', content: '<user_info>old provider preamble with ReadFile</user_info>' })
       const historyUser = encodeBlob({ role: 'user', content: 'history user' })
-      for (const blob of [oldSystem, oldPreamble, historyUser]) {
-        await persistBlob(blob.blobId, blob.blobData)
-      }
-
-      await warmupBlobsAsync([oldSystem.blobId, oldPreamble.blobId, historyUser.blobId])
+      for (const blob of [oldSystem, oldPreamble, historyUser])
+        cacheBlob(blob.blobId, blob.blobData)
 
       const iterator = rebuildConversationHistory({
         historyBlobIds: [oldSystem.blobId, oldPreamble.blobId, historyUser.blobId],
@@ -175,11 +167,8 @@ describe('agent orchestrator / history rebuild integration', () => {
   it('rebuilt legacy anthropic history is repaired to canonical form and can continue across anthropic/openai/gemini', async () => {
     await withTempAgentDatabase(async () => {
       const { system, preamble, assistant, legacyUserToolResults } = buildLegacyAnthropicHistoryBlobs()
-      for (const blob of [system, preamble, assistant, legacyUserToolResults]) {
-        await persistBlob(blob.blobId, blob.blobData)
-      }
-
-      await warmupBlobsAsync([system.blobId, preamble.blobId, assistant.blobId, legacyUserToolResults.blobId])
+      for (const blob of [system, preamble, assistant, legacyUserToolResults])
+        cacheBlob(blob.blobId, blob.blobData)
 
       const iterator = rebuildConversationHistory({
         historyBlobIds: [system.blobId, preamble.blobId, assistant.blobId, legacyUserToolResults.blobId],

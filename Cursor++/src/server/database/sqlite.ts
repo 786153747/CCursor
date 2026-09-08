@@ -10,7 +10,7 @@
  * - getAgentDatabase() 保持同步返回已打开的实例
  * - initDatabase() 为异步，必须在 startServer() 时先调用
  */
-import { existsSync, mkdirSync } from 'node:fs'
+import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { homedir, platform } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -283,13 +283,6 @@ async function initializeSchema(database: AsyncDatabase): Promise<void> {
   await database.exec('PRAGMA busy_timeout = 5000')
 
   await database.exec(`
-    CREATE TABLE IF NOT EXISTS agent_blobs (
-      blob_id TEXT PRIMARY KEY,
-      blob_data TEXT NOT NULL,
-      created_at INTEGER NOT NULL,
-      last_accessed_at INTEGER NOT NULL
-    );
-
     CREATE TABLE IF NOT EXISTS conversation_checkpoints (
       conversation_id TEXT NOT NULL,
       kind TEXT NOT NULL DEFAULT 'committed',
@@ -302,9 +295,6 @@ async function initializeSchema(database: AsyncDatabase): Promise<void> {
       updated_at INTEGER NOT NULL,
       PRIMARY KEY (conversation_id, kind)
     );
-
-    CREATE INDEX IF NOT EXISTS idx_agent_blobs_last_accessed_at
-      ON agent_blobs(last_accessed_at);
 
     CREATE INDEX IF NOT EXISTS idx_conversation_checkpoints_updated_at
       ON conversation_checkpoints(updated_at);
@@ -388,6 +378,39 @@ async function initializeSchema(database: AsyncDatabase): Promise<void> {
 }
 
 /**
+ * ── 一次性迁移: 删除旧版的对话 blob 副本表 ──
+ *
+ * 对话 blob 的唯一持久持有方是 Cursor 客户端 (agentKv:blob:*), 服务端按需经 getBlobArgs
+ * 取回, 不再落盘。旧版 agent_blobs 表 (实测 3 GB / 37 万行, 且与客户端逐字节一致) 整表
+ * 删除后 VACUUM 收回磁盘。实测 3.25 GB 库: DROP ~6s + VACUUM ~0.2s (只复制存活的 ~12 MB),
+ * 只在升级后的第一次启动发生。失败仅告警, 不阻塞启动。
+ *
+ * WAL 模式下 VACUUM 重建的页先落在 WAL 里, 主文件要到 checkpoint 才真正截断 ——
+ * 因此紧跟一次 wal_checkpoint(TRUNCATE), 让磁盘立刻收回而不是等下次自动 checkpoint。
+ */
+async function dropLegacyBlobTable(database: AsyncDatabase, databaseFilePath: string): Promise<void> {
+  const legacyTable = await database.get(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'agent_blobs'`)
+  if (!legacyTable)
+    return
+  const startedAt = Date.now()
+  const bytesBefore = statSync(databaseFilePath).size
+  logger.info({ bytesBefore }, '[DB] dropping legacy agent_blobs table (conversation blobs now live only on the client)')
+  try {
+    await database.exec('DROP TABLE agent_blobs')
+    await database.exec('VACUUM')
+    await database.exec('PRAGMA wal_checkpoint(TRUNCATE)')
+    logger.info({
+      bytesBefore,
+      bytesAfter: statSync(databaseFilePath).size,
+      durationMs: Date.now() - startedAt,
+    }, '[DB] legacy agent_blobs table dropped and database vacuumed')
+  }
+  catch (error) {
+    logger.warn({ error: (error as Error).message }, '[DB] failed to drop legacy agent_blobs table (will retry on next start)')
+  }
+}
+
+/**
  * 异步初始化 DB。必须在 getAgentDatabase() 首次使用前调用。
  * 在 startServer() 中调用。
  */
@@ -415,6 +438,7 @@ export async function initDatabase(): Promise<void> {
   db = wrapDatabase(rawDb)
   dbPath = nextPath
   await initializeSchema(db)
+  await dropLegacyBlobTable(db, nextPath)
   logger.info({ agentDbPath: nextPath }, '[DB] agent sqlite persistence ready')
 }
 

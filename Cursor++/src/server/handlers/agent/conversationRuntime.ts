@@ -13,13 +13,14 @@ import { emitFinalCheckpoint, emitRollingCheckpoint } from './checkpointManager'
 import { ContextTokenTracker } from './tokenCounter'
 import { buildSummarySource, createCompactionArtifacts, estimateMessagesTokens, measureMessagesTokens, planCompaction, streamSummaryWithFallback } from './compactionStrategy'
 import { getCompactionContentionCount, isCompactionLockHeld, releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock'
-import { extractPlainTextContent, flushMessageBlobs, hydrateHistoryEntries, rebuildConversationHistory, repairHistoryEntries, sendAndCacheBlob } from './historyManager'
+import { extractPlainTextContent, flushMessageBlobs, hydrateHistoryEntries, rebuildConversationHistory, repairHistoryEntries, sendAndCacheBlob, sendRootBlobsUnknownToClient } from './historyManager'
 import { buildMessages, workspaceUris } from './protocol'
 import { checkpoint, editToolCallStreamDelta, heartbeat, kvMessage, partialToolCall, summary, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
 import { finalizeTaskResult, launchTaskTool, runToolCall, type TaskLaunchContext } from './toolRuntime'
 import { awaitExecResultAndClose, waitForPromiseWithHeartbeat } from './wait'
 import { restoreBlobMessageToLLMMessage } from './transcript'
-import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline } from './turnTracker'
+import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, ensureTurnBlobCached, readTurnBaseline } from './turnTracker'
+import type { BlobRequestIdAllocator } from './agentOrchestrator'
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
 import { contextualizeSubagentTools } from './subagentCatalog'
 import { addUsage, AUTOCOMPACT_NET_GROWTH_MIN_TOKENS, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, isContextLengthLimitError, shouldTriggerCompaction } from './usage'
@@ -726,6 +727,12 @@ async function* performInlineAutoSummarizeLocked(params: {
   for (const [index, archiveBlob] of artifacts.archiveBlobs.entries()) {
     yield kvMessage(2 + index, archiveBlob.blobId, archiveBlob.blobData, archiveBlob.blobDataRaw)
   }
+  // repair 重编码 / 占位 / 锚点副本等本轮新造的 root blob, 客户端还没有 → 补发
+  yield* sendRootBlobsUnknownToClient(
+    artifacts.nextRootBlobIds,
+    [...allBlobIds, artifacts.summaryBlobId],
+    2 + artifacts.archiveBlobs.length,
+  )
 
   // o200k 实测重置 (替代 chars/4): 重置精度直接决定 provider usage 反弹差大小
   const compactedTokenDetails = clampTokenDetails(
@@ -818,19 +825,10 @@ async function* performInlineAutoSummarizeLocked(params: {
   }
 }
 
-export interface ConversationRunOptions {
-  /**
-   * kvServerMessage.getBlobArgs 的请求 id 分配器, 由 agentOrchestrator 传入 ——
-   * 与四类 requestContext Part 取回共用同一计数器 (900_000 起), 避开 setBlobArgs
-   * 的 blobCounter (0 起) 取值区间, 防止客户端回包 id 撞号。
-   */
-  allocateBlobId: () => number
-}
-
 export async function* handleConversationRun(
   parsed: ParsedRunRequest,
   session: AgentSession | null,
-  options: ConversationRunOptions,
+  options: BlobRequestIdAllocator,
 ): AsyncIterable<AgentServerMessage> {
   const route = resolveProviderRuntime(parsed.modelId)
   const requestedContextTokenLimit = parsed.contextTokenLimit
@@ -866,6 +864,12 @@ export async function* handleConversationRun(
   if (!parsed.readLintsEnabled)
     disabledToolsForRun.add('ReadLints')
 
+  // 最近一个 turn blob 是本 run 唯一要读的 turn 结构 (dynamicToolCount 基线 + resume 基线);
+  // 进程重启后内存没有, 向客户端取一次。更早的 turn 只在最近一个缺 dynamicToolCount
+  // 字段 (旧版写入) 时才会被扫到, 不值得为此整批回取。
+  const latestTurnBlobId = parsed.historyTurnBlobIds.at(-1)
+  if (latestTurnBlobId !== undefined)
+    yield* ensureTurnBlobCached(latestTurnBlobId, session, options.allocateBlobId)
   const previousDynamicToolCount = [...parsed.historyTurnBlobIds]
     .reverse()
     .map(turnBlobId => readTurnBaseline(turnBlobId)?.dynamicToolCount)
@@ -1101,8 +1105,7 @@ export async function* handleConversationRun(
     yield cacheAndBuildKvBlob(++blobCounter, blob)
   }
 
-  // 历史 blob: 本地缓存 (已由 agentOrchestrator 用 SQLite 预热) 未命中的部分经
-  // getBlobArgs 向客户端回源 —— session 为 null 时跳过回源, 与接线前行为一致。
+  // 历史 blob: 内存未命中的经 getBlobArgs 向客户端取 (客户端是唯一持久持有方)
   const rebuiltHistory = yield* rebuildConversationHistory({
     historyBlobIds: parsed.historyBlobIds,
     prependUserMessages: parsed.prependUserMessages,

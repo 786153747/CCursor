@@ -5,7 +5,8 @@ import type { AgentSession } from './session';
 import { heartbeat, checkpoint, kvMessage, summary, summaryCompleted, summaryStarted } from './stream';
 import { clampTokenDetails, computeContextUsagePercent } from './usage';
 import { resolveProviderRuntime } from '../llm';
-import { hydrateHistoryEntries, repairHistoryEntries } from './historyManager';
+import type { BlobRequestIdAllocator } from './agentOrchestrator';
+import { loadHistoryEntries, repairHistoryEntries, sendRootBlobsUnknownToClient } from './historyManager';
 import { buildSummarySource, createCompactionArtifacts, measureMessagesTokens, planCompaction, streamSummaryWithFallback } from './compactionStrategy';
 import { releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock';
 import { HEARTBEAT_TICK, pumpWithTimedHeartbeats } from './conversationRuntime';
@@ -16,6 +17,7 @@ import { logger } from '../../logger';
 export async function* handleSummarizeAction(
     parsed: ParsedRunRequest,
     session: AgentSession | null,
+    options: BlobRequestIdAllocator,
 ): AsyncIterable<AgentServerMessage> {
     const route = resolveProviderRuntime(parsed.modelId);
     // 并发互斥 (设计文档 §7#7): 等待 inline 压缩释放后再重新评估是否仍需压缩
@@ -23,7 +25,7 @@ export async function* handleSummarizeAction(
     if (!tryAcquireCompactionLock(parsed.conversationId))
         logger.warn({ conversationId: parsed.conversationId }, '[AUTOCOMPACT] summarizeAction lock contention — proceeding after wait');
     try {
-        yield* handleSummarizeActionLocked(parsed, session, route);
+        yield* handleSummarizeActionLocked(parsed, session, route, options);
     }
     finally {
         releaseCompactionLock(parsed.conversationId);
@@ -34,8 +36,14 @@ async function* handleSummarizeActionLocked(
     parsed: ParsedRunRequest,
     session: AgentSession | null,
     route: ReturnType<typeof resolveProviderRuntime>,
+    options: BlobRequestIdAllocator,
 ): AsyncIterable<AgentServerMessage> {
-    const hydratedHistoryEntries = hydrateHistoryEntries(parsed.historyBlobIds);
+    // 历史 blob 与对话路径同源: 内存未命中的经 getBlobArgs 向客户端取
+    const hydratedHistoryEntries = yield* loadHistoryEntries({
+        historyBlobIds: parsed.historyBlobIds,
+        session,
+        allocateBlobId: options.allocateBlobId,
+    });
     const missingHistoryBlobs = Math.max(0, parsed.historyBlobIds.length - hydratedHistoryEntries.length);
     const historyEntries = repairHistoryEntries(hydratedHistoryEntries);
     const contextTokenLimit = parsed.historyTokenDetails?.maxTokens ?? parsed.contextTokenLimit ?? route.contextTokenLimit;
@@ -226,6 +234,12 @@ async function* handleSummarizeActionLocked(
     for (const [index, archiveBlob] of artifacts.archiveBlobs.entries()) {
         yield kvMessage(2 + index, archiveBlob.blobId, archiveBlob.blobData, archiveBlob.blobDataRaw);
     }
+    // repair 重编码 / 占位 / 锚点副本等本轮新造的 root blob, 客户端还没有 → 补发
+    yield* sendRootBlobsUnknownToClient(
+        artifacts.nextRootBlobIds,
+        [...parsed.historyBlobIds, artifacts.summaryBlobId],
+        2 + artifacts.archiveBlobs.length,
+    );
 
     const compactedUsedTokens = clampTokenDetails(
         // o200k 实测重置 (与 inline 路径同口径, 两路行为一致由单一实现保证)

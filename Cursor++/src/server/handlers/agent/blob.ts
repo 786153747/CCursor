@@ -36,6 +36,47 @@ export function decodeBlob(blobData: string): unknown {
     return JSON.parse(json);
 }
 
+/**
+ * ── 与客户端 KV 存储之间的字节互转 ──
+ *
+ * 客户端是 blob 的唯一持久持有方, 服务端只在需要时经 getBlobArgs 取回。
+ * 线上字节形态由 stream.kvMessage 发 setBlobArgs 时决定, 两类 blob 不对称:
+ *   - JSON blob (encodeBlob):      发 TextEncoder.encode(base64 文本) → 客户端存 base64 文本的 UTF-8 字节
+ *   - 二进制 blob (encodeBinaryBlob): 发 raw bytes → 客户端存原始 protobuf 字节
+ *   - blobId:                      始终是 base64(sha256) 文本的 UTF-8 字节
+ * 取回时按 blob 种类做对应的逆运算, 得到 blobStore 约定的 base64 文本。
+ */
+
+/** blobId 文本 → getBlobArgs.blobId 字节 (与 kvMessage 的 setBlobArgs 编码一致) */
+export function blobIdToBytes(blobId: string): Uint8Array {
+    return new TextEncoder().encode(blobId);
+}
+
+/**
+ * 客户端回传的 JSON blob 字节 → blobStore 值 (base64 文本)。
+ *
+ * 实测客户端存的就是 base64 文本的 UTF-8 字节 (与旧 agent_blobs.blob_data 逐字节一致),
+ * 直接 UTF-8 解码即可 —— 再做一次 base64 会双重编码。兜底: 裸 JSON 字节 (非本服务端
+ * 写入的对话) 才 base64 编码。返回前用 decodeBlob 校验, 解不出 JSON 对象的返回 null。
+ */
+export function jsonBlobDataFromClientBytes(bytes: Uint8Array): string | null {
+    if (bytes.length === 0) return null;
+    const text = Buffer.from(bytes).toString('utf-8');
+    const looksLikeRawJson = /^[\s]*[{[]/.test(text);
+    const blobData = looksLikeRawJson ? Buffer.from(bytes).toString('base64') : text;
+    try {
+        const decoded = decodeBlob(blobData);
+        return decoded !== null && typeof decoded === 'object' ? blobData : null;
+    } catch {
+        return null;
+    }
+}
+
+/** 客户端回传的二进制 blob 字节 (turn / archive 等 protobuf) → blobStore 值 (base64 文本) */
+export function binaryBlobDataFromClientBytes(bytes: Uint8Array): string {
+    return Buffer.from(bytes).toString('base64');
+}
+
 /** 构造 system prompt blob */
 export function buildSystemPromptBlob(modelId: string): { blobId: string; blobData: string } {
     return encodeBlob({

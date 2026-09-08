@@ -3,29 +3,28 @@ import { collectExtraContextBlobIds, parseRunRequest, resolveExtraContextBlobs }
 import type { AgentSession } from './session';
 import { handleSummarizeAction } from './summarizeRuntime';
 import { handleConversationRun } from './conversationRuntime';
-import { clearPersistedConversationCheckpoint, getPersistedConversationCheckpoint } from '../../database/checkpoints';
-import { warmupBlobsAsync } from './blobStore';
+import { getPersistedConversationCheckpoint } from '../../database/checkpoints';
+import { binaryBlobDataFromClientBytes, blobIdToBytes } from './blob';
+import { cacheBlob } from './blobStore';
+import { fetchBlobsFromClient } from './clientBlobFetch';
 import { logger } from '../../logger';
 import { isAgentRunAbortedError } from './wait';
-import {
-    applyMcpsPart,
-    applyRulesPart,
-    applySkillsPart,
-    applySubagentsPart,
-    fetchMcpsPart,
-    fetchRulesPart,
-    fetchSkillsPart,
-    fetchSubagentsPart,
-} from './requestContextParts';
+import { applyRequestContextPart, type RequestContextPartName } from './requestContextParts';
+
+/**
+ * 客户端是所有 blob 的唯一持久持有方; 服务端只有进程内热缓存, 未命中一律经
+ * kvServerMessage.getBlobArgs 向客户端取。全 run 的 getBlobArgs 请求 id 共用这一个
+ * 计数器: 高位起始值避开 setBlobArgs 的 blobCounter (从 0 递增) 取值区间, 防止回包 id 撞号。
+ */
+export interface BlobRequestIdAllocator {
+    allocateBlobId: () => number
+}
 
 export async function* handleRunRequest(
     msg: Record<string, unknown>,
     session: AgentSession | null = null,
 ): AsyncIterable<AgentServerMessage> {
     const parsed = parseRunRequest(msg);
-    // kvGetBlob 请求 id — 与 conversationRuntime 的 blobCounter 相互独立。
-    // 用高位起始值避开后者(从 0 递增)的取值区间,防止 id 撞号。
-    // 四类 requestContext Part 取回与历史 blob 回源 (handleConversationRun) 共用这一个计数器。
     let nextBlobRequestId = 900_000;
     const allocateBlobId = (): number => nextBlobRequestId++;
 
@@ -58,64 +57,48 @@ export async function* handleRunRequest(
             }
         }
 
-        // 预热: 将历史 blobs 从 DB 加载到内存缓存, 确保后续 generator 中 getCachedBlob 同步命中。
-        // 合并 historyBlobIds + extraContextEntries 的 blob 引用, 一次 warmup 避免多轮磁盘 IO。
-        const extraContextBlobIds = collectExtraContextBlobIds(parsed);
-        const blobsToWarmup = parsed.historyBlobIds.length > 0 || parsed.historyTurnBlobIds.length > 0 || extraContextBlobIds.length > 0
-            ? [...parsed.historyBlobIds, ...parsed.historyTurnBlobIds, ...extraContextBlobIds]
-            : [];
-        if (blobsToWarmup.length > 0) {
-            await warmupBlobsAsync(blobsToWarmup);
-        }
-
-        // Warmup 后做一次同步 resolve, 把 extraContextEntries 的 blobId → data 就地替换。
-        // 未命中的条目会保留 blobId, 后续 preamble 用 <extra_context_pending> 占位透出。
-        if (extraContextBlobIds.length > 0) {
+        // extraContextEntries 的 blob 通常由客户端在本 run 之前经 UploadConversationBlobs
+        // 上传、已在内存; 未命中的再向客户端取一次 (客户端本地没有 → 保留 blobId,
+        // 下游 preamble 用 <extra_context_pending> 占位透出)。
+        if (collectExtraContextBlobIds(parsed).length > 0) {
             resolveExtraContextBlobs(parsed);
+            const unresolvedBlobIds = collectExtraContextBlobIds(parsed);
+            if (unresolvedBlobIds.length > 0) {
+                const fetchedBytes = yield* fetchBlobsFromClient({
+                    session,
+                    blobIds: unresolvedBlobIds.map(blobIdToBytes),
+                    allocateBlobId,
+                });
+                fetchedBytes.forEach((bytes, index) => {
+                    if (bytes)
+                        cacheBlob(unresolvedBlobIds[index]!, binaryBlobDataFromClientBytes(bytes));
+                });
+                resolveExtraContextBlobs(parsed);
+            }
         }
 
-        // Cursor 3.13+ ref_only: 四类稳定上下文分别位于客户端 transient blob。
-        // 严格串行取回可兼容旧客户端不回 getBlobResult.id 的行为；dual 模式在
-        // parseRunRequest 中不暴露这些引用，因此不会重复 fetch。
-        if (parsed.rulesBlobId) {
-            const rulesPart = yield* fetchRulesPart({
+        // Cursor 3.13+ ref_only: rules / skills / subagents / mcps 四类稳定上下文位于客户端
+        // transient blob, 一批取回后分别解码合入。dual 模式在 parseRunRequest 中不暴露这些
+        // 引用, 因此不会重复 fetch。
+        const partReferences: Array<{ partName: RequestContextPartName, blobId: Uint8Array }> = [
+            { partName: 'rules', blobId: parsed.rulesBlobId },
+            { partName: 'skills', blobId: parsed.skillsBlobId },
+            { partName: 'subagents', blobId: parsed.subagentsBlobId },
+            { partName: 'mcps', blobId: parsed.mcpsBlobId },
+        ].filter((reference): reference is { partName: RequestContextPartName, blobId: Uint8Array } => reference.blobId !== undefined);
+        if (partReferences.length > 0) {
+            const partBytes = yield* fetchBlobsFromClient({
                 session,
-                blobId: parsed.rulesBlobId,
-                allocateBlobId: () => nextBlobRequestId++,
+                blobIds: partReferences.map(reference => reference.blobId),
+                allocateBlobId,
             });
-            if (rulesPart)
-                applyRulesPart(parsed, rulesPart);
-        }
-        if (parsed.skillsBlobId) {
-            const skillsPart = yield* fetchSkillsPart({
-                session,
-                blobId: parsed.skillsBlobId,
-                allocateBlobId: () => nextBlobRequestId++,
+            partReferences.forEach((reference, index) => {
+                applyRequestContextPart(parsed, reference.partName, partBytes[index] ?? null);
             });
-            if (skillsPart)
-                applySkillsPart(parsed, skillsPart);
-        }
-        if (parsed.subagentsBlobId) {
-            const subagentsPart = yield* fetchSubagentsPart({
-                session,
-                blobId: parsed.subagentsBlobId,
-                allocateBlobId: () => nextBlobRequestId++,
-            });
-            if (subagentsPart)
-                applySubagentsPart(parsed, subagentsPart);
-        }
-        if (parsed.mcpsBlobId) {
-            const mcpsPart = yield* fetchMcpsPart({
-                session,
-                blobId: parsed.mcpsBlobId,
-                allocateBlobId: () => nextBlobRequestId++,
-            });
-            if (mcpsPart)
-                applyMcpsPart(parsed, mcpsPart);
         }
 
         if (parsed.isSummarize) {
-            yield* handleSummarizeAction(parsed, session);
+            yield* handleSummarizeAction(parsed, session, { allocateBlobId });
             return;
         }
 
