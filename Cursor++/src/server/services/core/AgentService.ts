@@ -24,14 +24,14 @@
 import type { ConnectRouter } from '@connectrpc/connect'
 import { toJson } from '@bufbuild/protobuf'
 import { ConnectError } from '@connectrpc/connect'
-import { AgentClientMessageSchema, AgentService } from '../../gen/agent_v1_pb'
+import { type AgentClientMessage, AgentClientMessageSchema, AgentService } from '../../gen/agent_v1_pb'
 import { handleRunRequest } from '../../handlers/agent/agentOrchestrator'
 import { cacheBlob } from '../../handlers/agent/blobStore'
 import { registerCloneLineage } from '../../handlers/agent/cloneRegistry'
 import { ModelNotFoundError } from '../../handlers/models/mapper'
 import { makeByokConnectError, makeModelNotFoundError, makeProviderError } from '../../handlers/errors'
 import { ErrorDetails_Error } from '../../gen/aiserver_v1_shared_pb'
-import { closeSession, createEphemeralSession, getOrCreateSession, markSessionClosed, pushSessionMessage, waitForMessage } from '../../handlers/agent/session'
+import { type AgentSession, closeSession, createEphemeralSession, getOrCreateSession, markSessionClosed, pushSessionMessage, waitForMessage } from '../../handlers/agent/session'
 import { logger } from '../../logger'
 
 /**
@@ -58,6 +58,40 @@ function isStreamDestroyedError(error: unknown): boolean {
     || error.message.includes('ERR_STREAM_DESTROYED')
 }
 
+/**
+ * Bidi (HTTP/2) 上行泵: 首条 runRequest 之后, 把客户端流上的每一帧推入 session 队列,
+ * 供 waitForMessageMatching 消费; 流结束时关闭 session。
+ *
+ * 只有 clientHeartbeat 被丢弃 —— 它纯粹是保活, 没有任何等待方。
+ *
+ * kvClientMessage **必须入队**: getBlobArgs 的回包 (kvClientMessage.getBlobResult)
+ * 正是经这条路到达 requestContextParts / 历史 blob 回源的 waitForMessageMatching。
+ * 此前这里把 kvClientMessage 与 clientHeartbeat 一并 continue 掉, 结果 bidi 模式下
+ * 每次 getBlobArgs 都等到 BLOB_FETCH_TIMEOUT_MS 超时才放弃; SSE 降级路径
+ * (BidiAppend → appendMessage) 从未做过这种过滤, 所以只有 bidi 受影响。
+ * 与 SSE 路径对齐后, setBlobResult ACK 同样会入队 —— 它们体积极小且无人等待,
+ * 留在队列里直到 run 结束, 与 SSE 路径的既有行为一致。
+ */
+export async function pumpBidiClientMessages(
+  iterator: AsyncIterator<AgentClientMessage>,
+  session: AgentSession,
+): Promise<void> {
+  try {
+    while (true) {
+      const next = await iterator.next()
+      if (next.done)
+        break
+      const msg = toJson(AgentClientMessageSchema, next.value) as Record<string, unknown>
+      if ('clientHeartbeat' in msg)
+        continue
+      pushSessionMessage(session, msg)
+    }
+  }
+  finally {
+    markSessionClosed(session)
+  }
+}
+
 export default (router: ConnectRouter) => {
   router.service(AgentService, {
     /** Bidi streaming (HTTP/2) */
@@ -73,6 +107,8 @@ export default (router: ConnectRouter) => {
         if (next.done)
           return
         const msg = toJson(AgentClientMessageSchema, next.value) as Record<string, unknown>
+        // 首条 runRequest 之前尚未建立 session, kvClientMessage 无处可推 —— 此阶段
+        // 服务端也还没发出任何 getBlobArgs, 这里的 kv 帧只可能是无人等待的 ACK, 丢弃即可。
         if ('clientHeartbeat' in msg || 'kvClientMessage' in msg)
           continue
         if ('conversationAction' in msg && !bidiQueuedUserText) {
@@ -102,22 +138,7 @@ export default (router: ConnectRouter) => {
       }
 
       const session = createEphemeralSession(`bidi-${Date.now()}`)
-      const pump = (async () => {
-        try {
-          while (true) {
-            const next = await iterator.next()
-            if (next.done)
-              break
-            const msg = toJson(AgentClientMessageSchema, next.value) as Record<string, unknown>
-            if ('clientHeartbeat' in msg || 'kvClientMessage' in msg)
-              continue
-            pushSessionMessage(session, msg)
-          }
-        }
-        finally {
-          markSessionClosed(session)
-        }
-      })()
+      const pump = pumpBidiClientMessages(iterator, session)
 
       try {
         for await (const frame of handleRunRequest(firstMsg, session)) {
