@@ -152,11 +152,13 @@ describe('agent orchestrator / history rebuild integration', () => {
         preambleUserContent: '<user_info>new provider preamble with Read</user_info>',
         sendSystemScaffoldBlob: noopFrames(),
         sendOrderedBlob: noopFrames(),
+        session: null,
+        allocateBlobId: () => 900_000,
       })
 
       let result: { messages: LLMMessage[], insertedPrependUserTexts: string[] } | undefined
       for (;;) {
-        const next = iterator.next()
+        const next = await iterator.next()
         if (next.done) {
           result = next.value
           break
@@ -189,11 +191,13 @@ describe('agent orchestrator / history rebuild integration', () => {
         preambleUserContent: '<user_info>env</user_info>',
         sendSystemScaffoldBlob: noopFrames(),
         sendOrderedBlob: noopFrames(),
+        session: null,
+        allocateBlobId: () => 900_000,
       })
 
       let result: { messages: LLMMessage[], insertedPrependUserTexts: string[] } | undefined
       for (;;) {
-        const next = iterator.next()
+        const next = await iterator.next()
         if (next.done) {
           result = next.value
           break

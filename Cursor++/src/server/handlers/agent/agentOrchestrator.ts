@@ -25,7 +25,9 @@ export async function* handleRunRequest(
     const parsed = parseRunRequest(msg);
     // kvGetBlob 请求 id — 与 conversationRuntime 的 blobCounter 相互独立。
     // 用高位起始值避开后者(从 0 递增)的取值区间,防止 id 撞号。
+    // 四类 requestContext Part 取回与历史 blob 回源 (handleConversationRun) 共用这一个计数器。
     let nextBlobRequestId = 900_000;
+    const allocateBlobId = (): number => nextBlobRequestId++;
 
     try {
         const persistedCheckpoint = await getPersistedConversationCheckpoint(parsed.conversationId);
@@ -123,7 +125,7 @@ export async function* handleRunRequest(
             return;
         }
 
-        yield* handleConversationRun(parsed, session);
+        yield* handleConversationRun(parsed, session, { allocateBlobId });
     } catch (error) {
         if (isAgentRunAbortedError(error)) {
             logger.info({

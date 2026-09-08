@@ -44,7 +44,6 @@ import {
   parseMcpMetaToolOptions,
   resolveMcpServerIdentifier,
 } from './protocol/parseRunRequest'
-import { toBytes } from './protocol/shared'
 import type { AgentSession } from './session'
 import {
   applyRuleContext,
@@ -52,6 +51,8 @@ import {
   normalizeAgentSkill,
   normalizeCustomSubagent,
 } from './contextCatalog'
+// getBlobResult 解包 (含 3.13+ error 字段处理) 抽到 kvBlobResult, 与历史 blob 回源共用。
+import { extractBlobData } from './kvBlobResult'
 import { kvGetBlob } from './stream'
 import { waitForMessageMatchingWithHeartbeat } from './wait'
 
@@ -66,25 +67,6 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
       return false
   }
   return true
-}
-
-/**
- * 从 kvClientMessage.getBlobResult 中取出 blob 内容。
- *
- * proto: GetBlobResult { bytes blob_data = 1; Error error = 2 }
- * 3.13 起新增 error 字段,失败时该字段有值、blob_data 为空。
- */
-function extractBlobData(msg: Record<string, unknown>): Uint8Array | null {
-  const kv = msg.kvClientMessage as Record<string, unknown> | undefined
-  const result = kv?.getBlobResult as Record<string, unknown> | undefined
-  if (!result)
-    return null
-  if (result.error) {
-    logger.warn({ error: result.error }, '[PROTOCOL] getBlobResult returned error')
-    return null
-  }
-  // JSON transport 会把 proto bytes 编成 base64 string;统一归一后再解码 protobuf。
-  return toBytes(result.blobData) ?? null
 }
 
 export interface FetchedRulesPart {

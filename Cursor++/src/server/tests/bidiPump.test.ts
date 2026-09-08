@@ -104,7 +104,7 @@ it('bidi pump keeps unrelated kv frames queued without blocking a later matching
   expect(session.messages).toHaveLength(2)
   const matched = await waitForMessageMatching(
     session,
-    (message) => Number((message.kvClientMessage as Record<string, unknown> | undefined)?.id) === wantedRequestId,
+    message => Number((message.kvClientMessage as Record<string, unknown> | undefined)?.id) === wantedRequestId,
     100,
   )
   expect(matched).toBeTruthy()

@@ -3,6 +3,8 @@ import type { LLMContentBlock, LLMMessage } from '../llm/types'
 import { logger } from '../../logger'
 import { decodeBlob, encodeBlob } from './blob'
 import { cacheBlob, getCachedBlob } from './blobStore'
+import { fetchMissingHistoryBlobs } from './historyBlobFetch'
+import type { AgentSession } from './session'
 import { normalizeBlobMessage, restoreBlobMessageToLLMMessage } from './transcript'
 import { createRepairDiagnostics, hasRepairMutations, repairConversationHistory, type RepairDiagnostics } from '../llm/transformMessages'
 
@@ -256,7 +258,57 @@ export function repairHistoryEntries(entries: HistoryEntry[]): HistoryEntry[] {
   return materializeHistoryEntries(repaired)
 }
 
-export function* rebuildConversationHistory(params: {
+/** 本地缓存 (内存 Map, 已由 agentOrchestrator 用 SQLite 预热过) 未命中的历史 blobId。 */
+function collectUncachedBlobIds(blobIds: string[]): string[] {
+  return blobIds.filter(blobId => getCachedBlob(blobId) === undefined)
+}
+
+/**
+ * 历史 blob 解析 (阶段 1 回源接线):
+ *   1. 先算本地缓存未命中的 blobId —— 必须在 agentOrchestrator 的 warmupBlobsAsync
+ *      之后 (本函数由 handleConversationRun 调用, 天然满足), 否则会向客户端要本地明明有的 blob;
+ *   2. 有缺失且有 session → yield* fetchMissingHistoryBlobs 经 getBlobArgs 向客户端取回,
+ *      取回的 blob 经 cacheBlob 落内存 + SQLite;
+ *   3. 再 hydrateHistoryEntries —— 此时命中的就包括刚取回的。
+ *
+ * `history blobs from cache` 日志字段是用户验证阶段 1 的唯一依据, 字段名保持稳定:
+ *   requestedBlobs / cachedBlobs / fetchedFromClient / stillMissing (+ resolvedBlobs)
+ *   四者按请求列表逐项计数, 恒有 cachedBlobs + fetchedFromClient + stillMissing === requestedBlobs。
+ */
+async function* resolveHistoryEntries(params: {
+  historyBlobIds: string[]
+  prependUserMessages: number
+  session: AgentSession | null
+  allocateBlobId: () => number
+}): AsyncGenerator<AgentServerMessage, HistoryEntry[], void> {
+  const missingBeforeFetch = collectUncachedBlobIds(params.historyBlobIds)
+  const cachedBlobs = params.historyBlobIds.length - missingBeforeFetch.length
+
+  let fetchOutcome: { fetched: number, failed: number } | undefined
+  if (missingBeforeFetch.length > 0 && params.session) {
+    fetchOutcome = yield* fetchMissingHistoryBlobs({
+      session: params.session,
+      missingBlobIds: missingBeforeFetch,
+      allocateBlobId: params.allocateBlobId,
+    })
+  }
+
+  const stillMissingAfterFetch = collectUncachedBlobIds(params.historyBlobIds)
+  const historyEntries = hydrateHistoryEntries(params.historyBlobIds)
+  logger.info({
+    requestedBlobs: params.historyBlobIds.length,
+    cachedBlobs,
+    fetchedFromClient: missingBeforeFetch.length - stillMissingAfterFetch.length,
+    stillMissing: stillMissingAfterFetch.length,
+    resolvedBlobs: historyEntries.length,
+    prependUserMessages: params.prependUserMessages,
+    ...(fetchOutcome ? { clientFetch: fetchOutcome } : {}),
+    ...(missingBeforeFetch.length > 0 && !params.session ? { clientFetch: 'skipped_no_session' } : {}),
+  }, '[SESSION] history blobs from cache')
+  return historyEntries
+}
+
+export async function* rebuildConversationHistory(params: {
   historyBlobIds: string[]
   prependUserMessages: Array<{ text: string, messageId?: string }>
   systemMessage: LLMMessage
@@ -266,17 +318,21 @@ export function* rebuildConversationHistory(params: {
   preambleUserContent: string
   sendSystemScaffoldBlob: (data: { role: string, content: unknown, toolCallId?: string, toolName?: string, isError?: boolean }) => Generator<AgentServerMessage, void, void>
   sendOrderedBlob: (data: { role: string, content: unknown, toolCallId?: string, toolName?: string, isError?: boolean }) => Generator<AgentServerMessage, void, void>
-}): Generator<AgentServerMessage, { messages: LLMMessage[], insertedPrependUserTexts: string[] }, void> {
+  /** 本 run 的客户端会话; null 时跳过回源, 行为与接线前一致 (只查本地缓存) */
+  session: AgentSession | null
+  /** kvServerMessage.getBlobArgs 的 id 分配器 —— 与 agentOrchestrator 的四类 Part 取回共用同一计数器 */
+  allocateBlobId: () => number
+}): AsyncGenerator<AgentServerMessage, { messages: LLMMessage[], insertedPrependUserTexts: string[] }, void> {
   let messages: LLMMessage[] = []
   let insertedPrependUserTexts: string[] = []
 
   if (params.historyBlobIds.length > 0) {
-    const historyEntries = hydrateHistoryEntries(params.historyBlobIds)
-    logger.info({
-      requestedBlobs: params.historyBlobIds.length,
-      resolvedBlobs: historyEntries.length,
+    const historyEntries = yield* resolveHistoryEntries({
+      historyBlobIds: params.historyBlobIds,
       prependUserMessages: params.prependUserMessages.length,
-    }, '[SESSION] history blobs from cache')
+      session: params.session,
+      allocateBlobId: params.allocateBlobId,
+    })
 
     messages = historyEntries.map(entry => entry.message)
 

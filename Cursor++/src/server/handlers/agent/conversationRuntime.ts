@@ -818,9 +818,19 @@ async function* performInlineAutoSummarizeLocked(params: {
   }
 }
 
+export interface ConversationRunOptions {
+  /**
+   * kvServerMessage.getBlobArgs 的请求 id 分配器, 由 agentOrchestrator 传入 ——
+   * 与四类 requestContext Part 取回共用同一计数器 (900_000 起), 避开 setBlobArgs
+   * 的 blobCounter (0 起) 取值区间, 防止客户端回包 id 撞号。
+   */
+  allocateBlobId: () => number
+}
+
 export async function* handleConversationRun(
   parsed: ParsedRunRequest,
   session: AgentSession | null,
+  options: ConversationRunOptions,
 ): AsyncIterable<AgentServerMessage> {
   const route = resolveProviderRuntime(parsed.modelId)
   const requestedContextTokenLimit = parsed.contextTokenLimit
@@ -1091,6 +1101,8 @@ export async function* handleConversationRun(
     yield cacheAndBuildKvBlob(++blobCounter, blob)
   }
 
+  // 历史 blob: 本地缓存 (已由 agentOrchestrator 用 SQLite 预热) 未命中的部分经
+  // getBlobArgs 向客户端回源 —— session 为 null 时跳过回源, 与接线前行为一致。
   const rebuiltHistory = yield* rebuildConversationHistory({
     historyBlobIds: parsed.historyBlobIds,
     prependUserMessages: parsed.prependUserMessages,
@@ -1101,6 +1113,8 @@ export async function* handleConversationRun(
     preambleUserContent,
     sendSystemScaffoldBlob,
     sendOrderedBlob,
+    session,
+    allocateBlobId: options.allocateBlobId,
   })
   messages = rebuiltHistory.messages
 
