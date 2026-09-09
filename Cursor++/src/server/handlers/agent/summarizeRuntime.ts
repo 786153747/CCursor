@@ -122,7 +122,7 @@ async function* handleSummarizeActionLocked(
             tokenDetails: currentTokenDetails,
             mode: parsed.mode,
             updatedAt: Date.now(),
-        }, run.signal);
+        }, run.signal, run.requireCheckpointWriteScope());
 
         throwIfBlobRunInactive(run);
         yield summaryCompleted(hookMessage ?? (compactionPlan.mode === 'disabled'
@@ -163,12 +163,13 @@ async function* handleSummarizeActionLocked(
     // 三级兜底 (流式, 与 inline 路径同一实现 — 两路行为一致)。
     // 心跳定时驱动 (与 inline 路径同修): 思考模型零事件期若心跳饿死,
     // 客户端 ~93s stall 判死会弃 run 作废在飞行摘要。
-    for await (const summaryEvent of pumpWithTimedHeartbeats(streamSummaryWithFallback({
+    for await (const summaryEvent of pumpWithTimedHeartbeats(signal => streamSummaryWithFallback({
         provider: route.provider,
+        signal,
         model: route.model,
         sourceText: summarySourceText,
         contextTokenLimit,
-    }))) {
+    }), undefined, run.signal)) {
         throwIfBlobRunInactive(run);
         if (summaryEvent === HEARTBEAT_TICK) {
             yield heartbeat();
@@ -231,7 +232,7 @@ async function* handleSummarizeActionLocked(
         tokenDetails: compactedUsedTokens,
         mode: parsed.mode,
         updatedAt: Date.now(),
-    }, run.signal);
+    }, run.signal, run.requireCheckpointWriteScope());
 
     throwIfBlobRunInactive(run);
     yield checkpoint(

@@ -79,7 +79,7 @@ export async function* emitRollingCheckpoint(params: {
         tokenDetails: rollingTokenDetails,
         mode: params.mode,
         updatedAt: Date.now(),
-    }, params.run.signal);
+    }, params.run.signal, params.run.requireCheckpointWriteScope());
 
     throwIfBlobRunInactive(params.run);
     yield checkpoint(
@@ -154,7 +154,7 @@ export async function* emitFinalCheckpoint(params: {
         tokenDetails,
         mode: params.mode,
         updatedAt: Date.now(),
-    }, params.run.signal);
+    }, params.run.signal, params.run.requireCheckpointWriteScope());
 
     throwIfBlobRunInactive(params.run);
     yield checkpoint(

@@ -4,7 +4,7 @@ import type { ParsedRunRequest } from './protocol'
 import type { AgentSession } from './session'
 import type { ToolCallInfo } from './tools'
 import { resolveExecutionToolName } from './tools'
-import { persistConversationCheckpoint } from '../../database/checkpoints'
+import { CheckpointConflictError, persistConversationCheckpoint } from '../../database/checkpoints'
 import { logger } from '../../logger'
 import { resolveProviderRuntime } from '../llm'
 import { emitFinalCheckpoint, emitRollingCheckpoint, throwIfBlobRunInactive } from './checkpointManager'
@@ -18,7 +18,8 @@ import { buildMessages, workspaceUris } from './protocol'
 import { checkpoint, editToolCallStreamDelta, heartbeat, partialToolCall, summary, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
 import { finalizeTaskResult, launchTaskTool, runToolCall, type TaskLaunchContext } from './toolRuntime'
 import { awaitExecResultAndClose, waitForPromiseWithHeartbeat } from './wait'
-import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, ensureTurnBlobCached, readTurnBaseline, type EncodedBlob } from './turnTracker'
+import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, ensureTurnBlobCached, probeTurnDynamicToolCount, readTurnBaseline, type EncodedBlob } from './turnTracker'
+import { restoreRequiredBlobGraph } from './requiredBlobGraph'
 import type { BlobRunContext } from './runContext'
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
 import { contextualizeSubagentTools } from './subagentCatalog'
@@ -28,6 +29,7 @@ import { isAgentRunAbortedError } from './wait'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
 import { createRepairDiagnostics, hasRepairMutations, repairConversationHistory } from '../llm/transformMessages'
+import { withProviderRequestLifecycle } from '../llm/requestLifecycle'
 
 const LEADING_DASH_RE = /^-\s*/
 
@@ -59,9 +61,20 @@ export async function* waitForRunCompactionLockRelease(
  * 包装摘要事件流: 源流静默超过 AGENT_HEARTBEAT_INTERVAL_MS 时产出
  * HEARTBEAT_TICK, 消费方转发为 SSE heartbeat, 与源流事件无关地维持连接活性。
  */
-export async function* pumpWithTimedHeartbeats<TEvent>(
-  sourceStream: AsyncIterable<TEvent>,
+export function pumpWithTimedHeartbeats<TEvent>(
+  source: AsyncIterable<TEvent> | ((signal: AbortSignal) => AsyncIterable<TEvent>),
   heartbeatIntervalMs: number = AGENT_HEARTBEAT_INTERVAL_MS,
+  signal?: AbortSignal,
+): AsyncGenerator<TEvent | typeof HEARTBEAT_TICK, void, unknown> {
+  return withProviderRequestLifecycle(lifecycle => pumpHeartbeatEvents(
+    typeof source === 'function' ? source(lifecycle.signal) : source,
+    heartbeatIntervalMs,
+  ), signal)
+}
+
+async function* pumpHeartbeatEvents<TEvent>(
+  sourceStream: AsyncIterable<TEvent>,
+  heartbeatIntervalMs: number,
 ): AsyncGenerator<TEvent | typeof HEARTBEAT_TICK, void, void> {
   const sourceIterator = sourceStream[Symbol.asyncIterator]()
   let pendingStep: Promise<IteratorResult<TEvent>> | null = null
@@ -509,8 +522,8 @@ function recordAssistantBlocksIntoTurn(turn: ActiveTurnTracker | null, blocks: L
   return emitted
 }
 
-function isBlobRuntimeError(error: unknown): boolean {
-  return error instanceof BlobIntegrityError || (error instanceof Error && (
+function isRunStateError(error: unknown): boolean {
+  return error instanceof CheckpointConflictError || error instanceof BlobIntegrityError || (error instanceof Error && (
     error.name === 'BlobIntegrityError'
     || error.name === 'BlobTransferError'
     || error.name === 'BlobResourceLimitError'
@@ -718,12 +731,13 @@ async function* performInlineAutoSummarizeLocked(params: {
   // 会饿死 → SSE 静默 ~93s → 客户端 stall 判死弃 run 重发 → 摘要成果作废 +
   // 并发 run 续涨上下文 → 背靠背二次压缩 (三次实测 92.5/92.7/95.0s 一致实锤)。
   let summaryText = ''
-  for await (const summaryEvent of pumpWithTimedHeartbeats(streamSummaryWithFallback({
+  for await (const summaryEvent of pumpWithTimedHeartbeats(signal => streamSummaryWithFallback({
     provider: route.provider,
+    signal,
     model: route.model,
     sourceText: summarySourceText,
     contextTokenLimit,
-  }))) {
+  }), undefined, run.signal)) {
     throwIfBlobRunInactive(run)
     if (summaryEvent === HEARTBEAT_TICK) {
       yield heartbeat()
@@ -785,7 +799,7 @@ async function* performInlineAutoSummarizeLocked(params: {
     tokenDetails: compactedTokenDetails,
     mode: parsed.mode,
     updatedAt: Date.now(),
-  }, run.signal)
+  }, run.signal, run.requireCheckpointWriteScope())
 
   throwIfBlobRunInactive(run)
   yield checkpoint(
@@ -877,12 +891,16 @@ export async function* handleConversationRun(
   if (!parsed.readLintsEnabled)
     disabledToolsForRun.add('ReadLints')
 
-  // Only the latest turn is required for the dynamic profile and resume baseline.
+  // Resume re-encodes this turn. Ordinary continuation only probes a tool hint.
   const latestTurnBlobId = parsed.historyTurnBlobIds.at(-1)
-  if (latestTurnBlobId !== undefined)
+  if (parsed.isResume && latestTurnBlobId !== undefined) {
     yield* ensureTurnBlobCached(latestTurnBlobId, run)
+    yield* restoreRequiredBlobGraph(run, [{ blobId: latestTurnBlobId, kind: 'turn' }])
+  }
   const previousDynamicToolCount = latestTurnBlobId !== undefined
-    ? readTurnBaseline(latestTurnBlobId, run.blobs).dynamicToolCount
+    ? parsed.isResume
+      ? readTurnBaseline(latestTurnBlobId, run.blobs).dynamicToolCount
+      : yield* probeTurnDynamicToolCount(latestTurnBlobId, run)
     : undefined
   // 官方 dynamicToolProfile 缺省 all-static；显式 capability、meta-MCP 或同一
   // 会话已经启用过 dynamic profile 时继续 final。后两者覆盖不带 context 的
@@ -1233,9 +1251,7 @@ export async function* handleConversationRun(
       }, '[AGENT] prepared provider conversation')
 
       throwIfBlobRunInactive(run)
-      const llmStream = route.provider.stream(preparedRequest.request)
-
-      const translatedFrames = translateStream(llmStream, String(++stepCounter), (event) => {
+      const translatedFrames = translateStream(signal => route.provider.stream({ ...preparedRequest.request, signal }), String(++stepCounter), (event) => {
         switch (event.type) {
           case 'thinking_delta':
             currentThinking += event.text
@@ -1379,7 +1395,7 @@ export async function* handleConversationRun(
       }, undefined, (event) => {
         if (event.type === 'tool_use_start')
           return `${parsed.conversationId}-${round}-${event.id.slice(-4)}`
-      })
+      }, run.signal)
 
       for await (const frame of translatedFrames) {
         // LLM 流是一轮里最长的一段停留,中断多半落在这里。逐帧检查把中断
@@ -1391,6 +1407,8 @@ export async function* handleConversationRun(
       }
     }
     catch (e) {
+      if (run.signal.aborted && e instanceof Error && e.name === 'AbortError')
+        throw e
       // 客户端主动中断不是错误 —— 必须先于 makeProviderError 拦下,
       // 否则会被包成 ErrorDetails,在客户端渲染出一条 retry banner:
       // 用户只是发了新消息抢占当前生成,却看到"上一条失败了"。
@@ -1402,7 +1420,7 @@ export async function* handleConversationRun(
         }, '[CANCEL] LLM stream aborted by client')
         return
       }
-      if (isBlobRuntimeError(e))
+      if (isRunStateError(e))
         throw e
 
       // 错误驱动压缩重试 (设计文档 §4 运行时层, 官方 CC-001/017):
@@ -1786,6 +1804,8 @@ export async function* handleConversationRun(
       }
     }
     catch (e) {
+      if (run.signal.aborted && e instanceof Error && e.name === 'AbortError')
+        throw e
       if (isAgentRunAbortedError(e)) {
         logger.info({
           conversationId: parsed.conversationId,
@@ -1801,7 +1821,7 @@ export async function* handleConversationRun(
       // 半构造的 tool_use block, 我们让它和 error 一起丢弃, 保证客户端点 retry
       // 后从干净状态重发最后一条 human bubble。
       logger.error({ error: (e as Error).message, stack: (e as Error).stack }, '[AGENT] tool call processing error')
-      if (isBlobRuntimeError(e))
+      if (isRunStateError(e))
         throw e
       throw makeToolError(e)
     }

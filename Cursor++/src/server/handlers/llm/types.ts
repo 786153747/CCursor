@@ -59,6 +59,8 @@ export interface LLMUsage {
 export interface LLMStreamRequest {
   model: string
   messages: LLMMessage[]
+  /** Cancellation for this run or request attempt, not the shared SDK client. */
+  signal?: AbortSignal
   tools?: LLMTool[]
   maxTokens?: number
   thinking?: boolean

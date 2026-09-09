@@ -11,6 +11,7 @@
  */
 import type { LLMProvider, LLMStreamEvent, LLMStreamRequest } from './types';
 import { recordModelUsage } from '../../database/usageStats';
+import { withProviderRequestLifecycle } from './requestLifecycle';
 
 export interface UsageRecordingMeta {
     providerId: string;
@@ -24,14 +25,18 @@ export interface UsageRecordingMeta {
 export function withUsageRecording(inner: LLMProvider, meta: UsageRecordingMeta): LLMProvider {
     return {
         name: inner.name,
-        async *stream(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
-            for await (const event of inner.stream(request)) {
-                if (event.type === 'done') {
-                    // fire-and-forget: 不 await、不抛错 — 用量统计绝不阻塞/干扰 LLM 流
-                    void recordModelUsage({ ...meta, usage: event.usage }).catch(() => {});
+        stream(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
+            async function* recordEvents(signal: AbortSignal): AsyncIterable<LLMStreamEvent> {
+                for await (const event of inner.stream({ ...request, signal })) {
+                    if (event.type === 'done') {
+                        // fire-and-forget: 不 await、不抛错 — 用量统计绝不阻塞/干扰 LLM 流
+                        void recordModelUsage({ ...meta, usage: event.usage }).catch(() => {});
+                    }
+                    yield event;
                 }
-                yield event;
             }
+            // Keep creation lazy, but abort before a pending generator queues return/throw.
+            return withProviderRequestLifecycle(lifecycle => recordEvents(lifecycle.signal), request.signal);
         },
     };
 }

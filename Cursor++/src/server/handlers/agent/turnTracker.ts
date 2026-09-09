@@ -16,6 +16,8 @@ import { binaryBlobDataFromClientBytes, blobIdFromBytes, blobIdToBytes, encodeBi
 import type { RunBlobStore } from './blobStore'
 import { fetchBlobsFromClient, type ClientBlobResult } from './clientBlobFetch'
 import { BlobIntegrityError } from './blobErrors'
+import { logger } from '../../logger'
+import { AgentRunAbortedError } from './wait'
 
 function resolveAgentMode(mode: string): AgentMode {
   const normalized = mode.replace('AGENT_MODE_', '').toLowerCase()
@@ -164,9 +166,7 @@ export async function* ensureTurnBlobCached(
   run: BlobRunContext,
 ): AsyncGenerator<AgentServerMessage, void, void> {
   if (run.blobs.getCachedBlob(turnBlobId) !== undefined) {
-    const baseline = readTurnBaseline(turnBlobId, run.blobs)
-    if (run.blobs.isClientSaved(turnBlobId))
-      run.blobs.addInheritedReferences([baseline.userMessageBlobId, ...baseline.stepBlobIds])
+    readTurnBaseline(turnBlobId, run.blobs)
     return
   }
   const [result] = yield* fetchBlobsFromClient({ run, blobIds: [blobIdToBytes(turnBlobId)] })
@@ -182,8 +182,37 @@ export async function* ensureTurnBlobCached(
   const dependencies = [baseline.userMessageBlobId, ...baseline.stepBlobIds]
   run.blobs.cacheBlob(turnBlobId, blobData, result.bytes, dependencies)
   run.blobs.markClientSaved(turnBlobId)
-  run.blobs.addInheritedReferences(dependencies)
   run.blobs.turnBaselines.set(turnBlobId, baseline)
+}
+
+/** A dynamic-tools hint is not prompt history or a request to resume this turn. */
+export async function* probeTurnDynamicToolCount(
+  turnBlobId: string,
+  run: BlobRunContext,
+): AsyncGenerator<AgentServerMessage, number | undefined, void> {
+  let blobData = run.blobs.getCachedBlob(turnBlobId)
+  if (blobData === undefined) {
+    const [result] = yield* fetchBlobsFromClient({ run, blobIds: [blobIdToBytes(turnBlobId)] })
+    if (run.signal.aborted)
+      throw new AgentRunAbortedError('Turn metadata probe was cancelled')
+    if (result?.status !== 'ok') {
+      logger.warn({ turnBlobId, status: result?.status }, '[AGENT] optional previous-turn tool-profile hint unavailable')
+      return undefined
+    }
+    blobData = binaryBlobDataFromClientBytes(result.bytes)
+  }
+  try {
+    const turn = fromBinary(ConversationTurnStructureSchema, Buffer.from(blobData, 'base64')).turn
+    if (turn.case === 'shellConversationTurn')
+      return undefined
+    if (turn.case !== 'agentConversationTurn')
+      throw new Error('No supported turn metadata')
+    return turn.value.dynamicToolCount
+  }
+  catch (error) {
+    logger.warn({ turnBlobId, error: (error as Error).message }, '[AGENT] optional previous-turn tool-profile hint could not be decoded')
+    return undefined
+  }
 }
 
 type TurnBlobReadStatus = Exclude<ClientBlobResult['status'], 'ok'>

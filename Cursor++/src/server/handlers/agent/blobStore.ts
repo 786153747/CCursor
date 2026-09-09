@@ -49,13 +49,15 @@ export class RunBlobStore {
     private readonly recordedBlobIds = new Set<string>()
     private readonly maxBytes: number
     private readonly maxRecords: number
+    private readonly onRetainedBytes?: (bytes: number) => void
     private retainedBytes = 0
     private clientResultBytes = 0
     private disposed = false
 
-    constructor(options: { maxBytes?: number, maxRecords?: number } = {}) {
+    constructor(options: { maxBytes?: number, maxRecords?: number, onRetainedBytes?: (bytes: number) => void } = {}) {
         this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
         this.maxRecords = options.maxRecords ?? DEFAULT_MAX_RECORDS
+        this.onRetainedBytes = options.onRetainedBytes
         if (!Number.isSafeInteger(this.maxBytes) || this.maxBytes < 0)
             throw new BlobResourceLimitError(`Invalid run blob retention limit: ${this.maxBytes}`)
         if (!Number.isSafeInteger(this.maxRecords) || this.maxRecords < 0)
@@ -79,11 +81,13 @@ export class RunBlobStore {
             : 0
         this.assertWithinLimit(this.retainedBytes - previousBytes + nextBytes + this.clientResultBytes, blobId)
         this.reserveBlobRecords([blobId, ...(dependencies ?? [])])
+        this.onRetainedBytes?.(this.retainedBytes - previousBytes + nextBytes + this.clientResultBytes)
 
         this.retainedBlobs.set(blobId, {
             blobId,
             blobData,
-            blobDataRaw: rawBytes ? new Uint8Array(rawBytes) : undefined,
+            // Re-encoding a turn can revisit this entry; do not copy identical bytes again.
+            blobDataRaw: previous?.blobDataRaw ?? (rawBytes ? new Uint8Array(rawBytes) : undefined),
             dependencies: [...new Set([...(previous?.dependencies ?? []), ...(dependencies ?? [])])],
         })
         this.retainedBytes += nextBytes - previousBytes
@@ -122,20 +126,23 @@ export class RunBlobStore {
         this.assertActive()
         // Also validate unsummarized originals: all pending data must be sent, even
         // when reachable only through a newly generated summary/archive blob.
-        const remaining = [...blobIds, ...this.retainedBlobs.keys()].map(blobId => ({ blobId, owner: 'checkpoint' }))
+        const remaining: Array<{ blobId: string, owner?: string }> = [...blobIds, ...this.retainedBlobs.keys()].map(blobId => ({ blobId }))
         const checked = new Set<string>()
         const failures: BlobFailure[] = []
         while (remaining.length > 0) {
             const reference = remaining.pop()!
-            if (checked.has(reference.blobId))
+            const checkIdentity = `${reference.owner === undefined ? 'inherited' : 'required'}:${reference.blobId}`
+            if (checked.has(checkIdentity))
                 continue
-            checked.add(reference.blobId)
+            checked.add(checkIdentity)
             const blob = this.retainedBlobs.get(reference.blobId)
-            if (!blob && !this.inheritedReferences.has(reference.blobId)) {
+            // Inheritance permits only untouched checkpoint edges, never dependencies
+            // of content this run has restored, re-encoded or accepted for upload.
+            if (!blob && (reference.owner !== undefined || !this.inheritedReferences.has(reference.blobId))) {
                 failures.push({
                     blobId: reference.blobId,
-                    status: reference.owner === 'checkpoint' ? 'missing-reference' : 'missing-dependency',
-                    message: `Checkpoint references unavailable blob ${reference.blobId} (referenced by ${reference.owner})`,
+                    status: reference.owner === undefined ? 'missing-reference' : 'missing-dependency',
+                    message: `Checkpoint references unavailable blob ${reference.blobId} (referenced by ${reference.owner ?? 'checkpoint'})`,
                 })
             }
             for (const dependency of blob?.dependencies ?? [])
@@ -155,6 +162,7 @@ export class RunBlobStore {
     retainClientResultBytes(byteLength: number, wireKey: string): void {
         this.assertActive()
         this.assertWithinLimit(this.retainedBytes + this.clientResultBytes + byteLength, `wire key ${wireKey}`)
+        this.onRetainedBytes?.(this.retainedBytes + this.clientResultBytes + byteLength)
         this.clientResultBytes += byteLength
     }
 

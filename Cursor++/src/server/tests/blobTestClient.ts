@@ -14,6 +14,8 @@ import {
   ConversationSummaryArchiveSchema,
   ConversationTurnStructureSchema,
   NotifyConversationCloneRequestSchema,
+  ShellCommandSchema,
+  ShellOutputSchema,
   UploadConversationBlobsRequestSchema,
   UserMessageSchema,
 } from '../gen/agent_v1_pb'
@@ -282,12 +284,16 @@ export class BlobTestClient {
   /** Validate roots plus protobuf turn/archive edges using only confirmed bytes. */
   assertCheckpointResolvable(checkpoint: ConversationStateStructure) {
     const rootMessages = checkpoint.rootPromptMessagesJson.map(blobId => this.readMessage(blobId))
-    const turns = checkpoint.turns.map((blobId) => {
+    const turnStructures = checkpoint.turns.map((blobId) => {
       const decoded = fromBinary(ConversationTurnStructureSchema, this.read(blobId))
-      expect(decoded.turn.case).toBe('agentConversationTurn')
-      if (decoded.turn.case !== 'agentConversationTurn')
-        throw new Error('Expected an agent turn in the checkpoint')
-      const turn = decoded.turn.value
+      expect(['agentConversationTurn', 'shellConversationTurn']).toContain(decoded.turn.case)
+      return decoded.turn
+    })
+    const shellTurns = turnStructures.filter(turn => turn.case === 'shellConversationTurn').map(({ value }) => ({
+      command: fromBinary(ShellCommandSchema, this.read(value.shellCommand)),
+      output: fromBinary(ShellOutputSchema, this.read(value.shellOutput)),
+    }))
+    const turns = turnStructures.filter(turn => turn.case === 'agentConversationTurn').map(({ value: turn }) => {
       const user = fromBinary(UserMessageSchema, this.read(turn.userMessage))
       const steps = turn.steps.map((stepBlobId) => {
         const step = fromBinary(ConversationStepSchema, this.read(stepBlobId))
@@ -305,7 +311,7 @@ export class BlobTestClient {
         this.readMessage(dependency)
       return archive
     })
-    return { rootMessages, turns, archives }
+    return { rootMessages, turns, archives, shellTurns }
   }
 
   private async consume(stream: AsyncIterable<AgentServerMessage>): Promise<RuntimeOutcome> {

@@ -117,7 +117,7 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
   const backgroundTaskCompletions = parseBackgroundTaskCompletions(action)
   const isBackgroundTaskCompletion = backgroundTaskCompletions.length > 0
   // 子代理判定: subagentTypeName 由客户端在创建 subagent RunSSE 时设置
-  // conversationGroupId 在 toJson() 后被 proto 丢弃 (非 schema field)
+  // conversationGroupId is root-parent correlation, not this child's state identity.
   const subagentTypeName = runRequest.subagentTypeName as string | undefined
   const isSubagent = typeof subagentTypeName === 'string' && subagentTypeName.length > 0
 
@@ -237,11 +237,8 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
   //
   // 两种常见形态:
   //  1. rpmLen > 0: 客户端在 checkpoint roundtrip 里带回了历史, server 直接采用
-  //  2. csKeys=[]:  客户端发空 → 新会话或 revert 后重置信号,
-  //                  后续 agentOrchestrator 会检测 sqlite checkpoint 是否存在:
-  //                    - 存在 → 清空 (revert 信号)
-  //                    - 不存在 → 首次新会话, 维持空状态重建
-  //  详见 analysis/checkpoint-revert-protocol.md
+  //  2. csKeys=[]: new conversation, reset, or delayed initial request.
+  // No client epoch is transmitted; never infer deletion or recover SQL history.
   const csKeys = conversationState ? Object.keys(conversationState) : []
   const rpmLen = (conversationState?.rootPromptMessagesJson as unknown[])?.length ?? 0
   const csMode = conversationState?.mode as string | undefined
@@ -253,7 +250,7 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
     csEmpty: csKeys.length === 0,
   }, rpmLen > 0
     ? '[SESSION] <<< CS RECV: client sent history (checkpoint roundtrip OK)'
-    : '[SESSION] <<< CS RECV: empty (new session or revert; sqlite will be cleared if stale)',
+    : '[SESSION] <<< CS RECV: empty (new session or unverified reset; no automatic history restore/delete)',
   )
 
   // 提取用户消息附带的图片
@@ -770,6 +767,8 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
         : baseUserText,
     modelId: (requestedModel?.modelId as string) || (modelDetails?.modelId as string) || '',
     conversationId: (runRequest.conversationId as string) ?? '',
+    runId: typeof runRequest.runId === 'string' && runRequest.runId ? runRequest.runId : undefined,
+    conversationGroupId: typeof runRequest.conversationGroupId === 'string' && runRequest.conversationGroupId ? runRequest.conversationGroupId : undefined,
     requestContextTransport: requestContextParts
       ? (inlineRequestContext ? 'dual' : 'ref_only')
       : 'legacy',

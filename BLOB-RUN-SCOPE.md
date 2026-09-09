@@ -1,5 +1,9 @@
 # Blob ownership and checkpoint publication
 
+This is the historical implementation/verification note for the blob-run-scope
+work. Runtime validity, cancellation, resource and required-reference policies
+are superseded by [BLOB-RUNTIME-BOUNDARIES.md](BLOB-RUNTIME-BOUNDARIES.md).
+
 ## Scope and invariants
 
 A run is one `handleRunRequest` invocation, including model rounds, tool calls,

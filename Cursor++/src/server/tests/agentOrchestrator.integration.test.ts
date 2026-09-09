@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { persistConversationCheckpoint } from '../database/checkpoints'
+import { getPersistedConversationCheckpoint, persistConversationCheckpoint } from '../database/checkpoints'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
 import { encodeBlob } from '../handlers/agent/blob'
 import { rebuildConversationHistory } from '../handlers/agent/historyManager'
@@ -93,7 +93,7 @@ describe('agent orchestrator / history rebuild integration', () => {
     activeRuns.length = 0
   })
 
-  it('trusts empty client conversationState and does not restore sqlite checkpoint history', async () => {
+  it('rejects an ambiguous empty baseline without restoring or replacing checkpoint history', async () => {
     await withTempAgentDatabase(async () => {
       const { system, preamble, assistant, legacyUserToolResults } = buildLegacyAnthropicHistoryBlobs()
       await persistConversationCheckpoint({
@@ -109,7 +109,8 @@ describe('agent orchestrator / history rebuild integration', () => {
 
       const handleRunRequest = await loadHandleRunRequest()
       const session = createEphemeralSession('empty-client-history')
-      await exhaust(handleRunRequest({
+      const previous = await getPersistedConversationCheckpoint('conv-switch')
+      await expect(exhaust(handleRunRequest({
         runRequest: {
           conversationId: 'conv-switch',
           action: {
@@ -121,16 +122,12 @@ describe('agent orchestrator / history rebuild integration', () => {
           modelDetails: { modelId: 'gpt-5.4-medium' },
           conversationState: {},
         },
-      }, session))
+      }, session))).rejects.toThrow(/Checkpoint version conflict/)
 
-      expect(capturedParsed).toHaveLength(1)
-      expect(capturedParsed[0]?.historyBlobIds).toEqual([])
-      expect(capturedParsed[0]?.historyTurnBlobIds).toEqual([])
-      expect(capturedParsed[0]?.historySummaryArchiveIds).toEqual([])
-      expect(capturedParsed[0]?.historyTokenDetails).toBeUndefined()
-      expect(capturedRuntimeRuns).toHaveLength(1)
-      expect(capturedRuntimeRuns[0]!.signal.aborted).toBe(true)
-      expect(capturedRuntimeRuns[0]!.blobs.getStats().entries).toBe(0)
+      expect(capturedParsed).toHaveLength(0)
+      expect(capturedRuntimeRuns).toHaveLength(0)
+      expect(await getPersistedConversationCheckpoint('conv-switch')).toEqual(previous)
+      expect(session.listeners.size).toBe(0)
     })
   })
 

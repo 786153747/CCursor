@@ -207,7 +207,7 @@ function isValidHistoryBlock(block: unknown): boolean {
   }
 }
 
-function decodeHistoryEntry(blobId: string, blobData: string): HistoryEntry {
+export function decodeHistoryEntry(blobId: string, blobData: string): HistoryEntry {
   const decoded: unknown = decodeBlob(blobData)
   if (!isRecord(decoded)
     || !['system', 'user', 'assistant', 'tool'].includes(String(decoded.role))

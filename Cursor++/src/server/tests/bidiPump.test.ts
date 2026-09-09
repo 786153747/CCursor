@@ -91,23 +91,41 @@ it('bidi pump keeps unrelated kv frames queued without blocking a later matching
   const wantedRequestId = 900_007
   const otherRequestId = 900_003
 
-  await pumpBidiClientMessages(
-    clientStream([
+  let markInputReady!: () => void
+  let closeInput!: () => void
+  const inputReady = new Promise<void>((resolve) => {
+    markInputReady = resolve
+  })
+  const inputClosed = new Promise<void>((resolve) => {
+    closeInput = resolve
+  })
+  const input = (async function* () {
+    yield* clientStream([
       buildHeartbeatFrame(),
       buildGetBlobResultFrame(otherRequestId, new Uint8Array([1])),
       buildGetBlobResultFrame(wantedRequestId, new Uint8Array([2])),
-    ]),
-    session,
-  )
+    ])
+    markInputReady()
+    await inputClosed
+  })()
+  const pump = pumpBidiClientMessages(input, session)
+  await inputReady
 
-  // 队列里只剩两条 kv 帧 (heartbeat 已丢弃), 且可按 id 精确匹配
-  expect(session.messages).toHaveLength(2)
-  const matched = await waitForMessageMatching(
-    session,
-    message => Number((message.kvClientMessage as Record<string, unknown> | undefined)?.id) === wantedRequestId,
-    100,
-  )
-  expect(matched).toBeTruthy()
-  expect(session.messages).toHaveLength(1)
-  expect(Number((session.messages[0]!.kvClientMessage as Record<string, unknown>).id)).toBe(otherRequestId)
+  try {
+  // While the input is live, unrelated replies remain queued for their owner.
+    expect(session.messages).toHaveLength(2)
+    const matched = await waitForMessageMatching(
+      session,
+      message => Number((message.kvClientMessage as Record<string, unknown> | undefined)?.id) === wantedRequestId,
+      100,
+    )
+    expect(matched).toBeTruthy()
+    expect(session.messages).toHaveLength(1)
+    expect(Number((session.messages[0]!.kvClientMessage as Record<string, unknown>).id)).toBe(otherRequestId)
+  }
+  finally {
+    closeInput()
+    await pump
+  }
+  expect(session.messages).toEqual([])
 })

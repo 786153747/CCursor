@@ -3,7 +3,9 @@ import type { AgentSession } from './session'
 import { setMaxListeners } from 'node:events'
 import { blobIdFromBytes } from './blob'
 import { BlobInactiveError, BlobResourceLimitError, RunBlobStore } from './blobStore'
-import { isSessionCancelled } from './session'
+import { discardSessionMessages, isSessionCancelled } from './session'
+import { RunKvGate, type RunResourceBudget } from './runResources'
+import type { CheckpointWriteScope } from '../../database/checkpoints'
 
 // Initial operational defaults, not protocol guarantees or official client limits.
 export const BLOB_KV_BATCH_SIZE = 32
@@ -11,6 +13,8 @@ export const BLOB_KV_TIMEOUT_MS = 10_000
 export const BLOB_KV_OVERALL_TIMEOUT_MS = 60_000
 
 export interface BlobRunOptions {
+    conversationId?: string
+    resourceBudget?: RunResourceBudget
     inheritedBlobIds?: Iterable<string>
     /** Approximate payload bound; excludes decoded objects and collection overhead. */
     maxBytes?: number
@@ -47,6 +51,10 @@ export class BlobRunContext {
     readonly batchSize: number
     readonly timeoutMs: number
     readonly overallTimeoutMs: number
+    readonly conversationId: string
+    readonly kvGate = new RunKvGate()
+    checkpointWriteScope?: CheckpointWriteScope
+    private readonly resourceLease?: ReturnType<RunResourceBudget['acquire']>
 
     private readonly clientBlobReads = new Map<string, RunClientBlobRead>()
     private readonly activeRequestIds = new Set<number>()
@@ -57,11 +65,23 @@ export class BlobRunContext {
     private disposed = false
 
     constructor(readonly session: AgentSession | null, options: BlobRunOptions = {}) {
-        this.blobs = new RunBlobStore({ maxBytes: options.maxBytes, maxRecords: options.maxRecords })
-        this.blobs.addInheritedReferences(options.inheritedBlobIds ?? [])
         this.batchSize = normalizeBlobBatchSize(options.batchSize ?? BLOB_KV_BATCH_SIZE)
         this.timeoutMs = validateBlobTimeout(options.timeoutMs ?? BLOB_KV_TIMEOUT_MS)
         this.overallTimeoutMs = validateBlobTimeout(options.overallTimeoutMs ?? BLOB_KV_OVERALL_TIMEOUT_MS)
+        this.conversationId = options.conversationId ?? ''
+        this.resourceLease = options.resourceBudget?.acquire()
+        try {
+            this.blobs = new RunBlobStore({
+                maxBytes: options.maxBytes,
+                maxRecords: options.maxRecords,
+                onRetainedBytes: this.resourceLease?.resize,
+            })
+            this.blobs.addInheritedReferences(options.inheritedBlobIds ?? [])
+        }
+        catch (error) {
+            this.resourceLease?.release()
+            throw error
+        }
         // Concurrent operation listeners are scoped to this signal and cleaned up.
         setMaxListeners(0, this.signal)
         this.signal.addEventListener('abort', this.handleAbort, { once: true })
@@ -86,15 +106,21 @@ export class BlobRunContext {
         return requestId
     }
 
+    requireCheckpointWriteScope(): CheckpointWriteScope {
+        if (!this.checkpointWriteScope)
+            throw new Error('Checkpoint write scope must be captured at run admission')
+        return this.checkpointWriteScope
+    }
+
     /** Drop only this request's unmatched/duplicate KV frames, never other consumers. */
     retireBlobRequest(requestId: number): void {
         if (!this.activeRequestIds.delete(requestId))
             return
         this.session?.activeBlobRequestIds?.delete(requestId)
         if (this.session) {
-            this.session.messages = this.session.messages.filter(message => {
+            discardSessionMessages(this.session, message => {
                 const envelope = message.kvClientMessage as Record<string, unknown> | undefined
-                return envelope?.id !== requestId
+                return envelope?.id === requestId
             })
         }
     }
@@ -179,6 +205,7 @@ export class BlobRunContext {
         this.clientBlobReads.clear()
         this.sentGetRequestCount = 0
         this.blobs.dispose()
+        this.resourceLease?.release()
     }
 
     private readonly handleSessionChange = (): void => {

@@ -39,6 +39,7 @@ import type { LLMContentBlock, LLMMessage } from '../llm/types';
 import type { HistoryEntry } from './historyManager';
 import { isPreambleUserMessage, isSummaryBlobMessage } from './historyManager';
 import { normalizeBlobMessage } from './transcript';
+import { createProviderRequestLifecycle, withProviderRequestLifecycle } from '../llm/requestLifecycle';
 
 export type CompactionMode = 'budget' | 'b-mode' | 'disabled';
 
@@ -1116,7 +1117,8 @@ export function computeSummaryHardCapTokens(contextTokenLimit: number): number {
 // ═══════════════════════════════════════════════════════════════════
 
 export interface SummaryGenerationParams {
-    provider: { stream: (request: { model: string, messages: LLMMessage[] }) => AsyncIterable<{ type: string, text?: string }> };
+    provider: { stream: (request: { model: string, messages: LLMMessage[], signal?: AbortSignal }) => AsyncIterable<{ type: string, text?: string }> };
+    signal?: AbortSignal;
     model: string;
     sourceText: string;
     contextTokenLimit: number;
@@ -1148,32 +1150,46 @@ function createCancellableTimeout(timeoutMs: number): { promise: Promise<typeof 
  * 推理模型黑箱思考期零事件属正常, 由宽松 idle 容纳。
  */
 async function streamSummaryAttempt(params: SummaryGenerationParams, sourceForAttempt: string, shorterOutputInstruction: boolean, onDelta: (text: string) => void, idleTimeoutMs: number): Promise<string> {
+    params.signal?.throwIfAborted();
     const { buildSummaryUserMessage, SUMMARY_SYSTEM_PROMPT } = await import('./summaryPrompt');
+    params.signal?.throwIfAborted();
+    const lifecycle = createProviderRequestLifecycle(params.signal);
     const userContent = buildSummaryUserMessage(sourceForAttempt)
         + (shorterOutputInstruction ? '\n\nWrite a shorter summary — keep it dense and under the essentials.' : '');
-    const eventIterator = params.provider.stream({
-        model: params.model,
-        messages: [
-            { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
-            { role: 'user', content: userContent },
-        ],
-    })[Symbol.asyncIterator]();
-
+    let eventIterator: AsyncIterator<{ type: string, text?: string }> | undefined;
     let collected = '';
+    let completed = false;
+    let rejectAborted!: (reason: unknown) => void;
+    const aborted = new Promise<never>((_resolve, reject) => { rejectAborted = reject; });
+    const onAbort = (): void => rejectAborted(lifecycle.signal.reason);
+    lifecycle.signal.addEventListener('abort', onAbort, { once: true });
     try {
+        lifecycle.signal.throwIfAborted();
+        eventIterator = params.provider.stream({
+            model: params.model,
+            signal: lifecycle.signal,
+            messages: [
+                { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
+                { role: 'user', content: userContent },
+            ],
+        })[Symbol.asyncIterator]();
         while (true) {
+            lifecycle.signal.throwIfAborted();
             const timer = createCancellableTimeout(idleTimeoutMs);
             let stepResult: IteratorResult<{ type: string, text?: string }> | typeof SUMMARY_TIMEOUT_SENTINEL;
             try {
-                stepResult = await Promise.race([eventIterator.next(), timer.promise]);
+                stepResult = await Promise.race([eventIterator.next(), timer.promise, aborted]);
             }
             finally {
                 timer.cancel();
             }
             if (stepResult === SUMMARY_TIMEOUT_SENTINEL)
                 throw new Error(`summary stream idle timeout (${idleTimeoutMs}ms without activity)`);
-            if (stepResult.done)
+            lifecycle.signal.throwIfAborted();
+            if (stepResult.done) {
+                completed = true;
                 break;
+            }
             const event = stepResult.value;
             if (event.type === 'text_delta' && event.text) {
                 collected += event.text;
@@ -1182,9 +1198,12 @@ async function streamSummaryAttempt(params: SummaryGenerationParams, sourceForAt
         }
     }
     finally {
-        // 挂死流的兜底放弃: 不 await — generator.return() 会等内部 pending await
-        // 完成才执行 finally, 正是要绕开的挂点; 后台自行了断即可。
-        void Promise.resolve().then(() => eventIterator.return?.()).catch(() => {});
+        lifecycle.signal.removeEventListener('abort', onAbort);
+        if (!completed)
+            lifecycle.abort();
+        lifecycle.dispose();
+        // Abort the underlying request before returning a potentially pending iterator.
+        void Promise.resolve().then(() => eventIterator?.return?.()).catch(() => {});
     }
     return collected.trim();
 }
@@ -1208,6 +1227,7 @@ async function* runSummaryLadder(params: SummaryGenerationParams): AsyncGenerato
     let summaryText = '';
 
     for (let attempt = 1; attempt <= SUMMARY_RETRY_MAX_ATTEMPTS; attempt++) {
+        params.signal?.throwIfAborted();
         let attemptSource = params.sourceText;
         if (attempt >= 2) {
             const divisor = attempt >= 3 ? 3 : 2;
@@ -1233,10 +1253,12 @@ async function* runSummaryLadder(params: SummaryGenerationParams): AsyncGenerato
             }
         }
         catch (error) {
+            params.signal?.throwIfAborted();
             logger.warn({ attempt, elapsedMs: Date.now() - attemptStartTime, error: (error as Error).message }, '[SUMMARIZE] summary attempt failed — escalating fallback ladder');
         }
     }
 
+    params.signal?.throwIfAborted();
     if (!summaryText) {
         logger.warn({ contextTokenLimit: params.contextTokenLimit }, '[SUMMARIZE] LLM summary unavailable — deterministic fallback (no model)');
         summaryText = buildDeterministicFallbackSummary(params.sourceText, params.contextTokenLimit);
@@ -1265,6 +1287,7 @@ async function* runSummaryLadder(params: SummaryGenerationParams): AsyncGenerato
                 summaryText = retryText;
         }
         catch (error) {
+            params.signal?.throwIfAborted();
             logger.warn({ error: (error as Error).message }, '[SUMMARIZE] shorter-output retry failed');
         }
         if (countTokensWithO200k(summaryText) > hardCapTokens) {
@@ -1273,18 +1296,19 @@ async function* runSummaryLadder(params: SummaryGenerationParams): AsyncGenerato
         }
     }
 
+    params.signal?.throwIfAborted();
     yield { type: 'done', text: summaryText };
 }
 
 /** 流式消费: 两路 runtime 逐 delta 转发给客户端 (保持 SSE 活性) */
 export function streamSummaryWithFallback(params: SummaryGenerationParams): AsyncGenerator<{ type: 'delta', text: string } | { type: 'done', text: string }, void, void> {
-    return runSummaryLadder(params);
+    return withProviderRequestLifecycle(lifecycle => runSummaryLadder({ ...params, signal: lifecycle.signal }), params.signal);
 }
 
 /** 非流式消费: 测试与非流式调用取最终文本 */
 export async function generateSummaryWithFallback(params: SummaryGenerationParams): Promise<string> {
     let finalText = '';
-    for await (const event of runSummaryLadder(params)) {
+    for await (const event of streamSummaryWithFallback(params)) {
         if (event.type === 'done')
             finalText = event.text;
     }

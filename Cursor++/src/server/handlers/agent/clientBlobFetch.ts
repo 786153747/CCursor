@@ -275,23 +275,33 @@ export async function* fetchBlobsFromClient(params: ClientBlobFetchParams): Asyn
         cancelOwnedReads()
         break
       }
-      const batch = ownedReads.slice(offset, offset + batchSize)
-      const requests = batch.map((request) => {
-        const requestId = run.allocateBlobId()
-        const pending = prepareKvRequest(run, operation!, 'getBlobResult', requestId, timeoutMs)
-        void pending.reply.then(reply => request.read.complete(reply.status === 'received' ? decodeGetBlobReply(reply.message) : reply))
-        return { ...pending, frame: kvGetBlob(requestId, request.blobId) }
-      })
-      // Every waiter is registered before the first frame of this batch is sent.
-      for (const request of requests) {
-        if (operation.cancelled)
-          break
-        request.start()
-        run.recordGetRequestSent()
-        params.onRequestSent?.()
-        yield request.frame
+      const releaseBatch = yield* waitForPromiseWithHeartbeat(run.kvGate.acquire(operation.signal))
+      if (!releaseBatch) {
+        cancelOwnedReads()
+        break
       }
-      yield* waitForPromiseWithHeartbeat(Promise.all(batch.map(request => request.read.promise)))
+      try {
+        const batch = ownedReads.slice(offset, offset + batchSize)
+        const requests = batch.map((request) => {
+          const requestId = run.allocateBlobId()
+          const pending = prepareKvRequest(run, operation!, 'getBlobResult', requestId, timeoutMs)
+          void pending.reply.then(reply => request.read.complete(reply.status === 'received' ? decodeGetBlobReply(reply.message) : reply))
+          return { ...pending, frame: kvGetBlob(requestId, request.blobId) }
+        })
+        // Every waiter is registered before the first frame of this batch is sent.
+        for (const request of requests) {
+          if (operation.cancelled)
+            break
+          request.start()
+          run.recordGetRequestSent()
+          params.onRequestSent?.()
+          yield request.frame
+        }
+        yield* waitForPromiseWithHeartbeat(Promise.all(batch.map(request => request.read.promise)))
+      }
+      finally {
+        releaseBatch()
+      }
     }
     return yield* waitForPromiseWithHeartbeat(Promise.all(reads.map(request => waitForReadWithinOperation(request.read, operation!))))
   }
@@ -335,52 +345,60 @@ export async function* saveCheckpointBlobs(run: BlobRunContext, referencedBlobId
       throwIfRunCancelled(run)
       if (operation.cancelled)
         throw buildPendingTransferError(run, operation.failure)
-      run.blobs.assertCheckpointReferences(referencedBlobIds)
-      const batch = run.blobs.getPendingBlobs().slice(0, run.batchSize)
-      const requests = batch.map((blob) => {
-        const requestId = run.allocateBlobId()
-        const pending = prepareKvRequest(run, operation, 'setBlobResult', requestId, run.timeoutMs)
-        const result = pending.reply.then((reply) => {
-          const outcome = reply.status === 'received' ? decodeSetBlobReply(reply.message) : reply
-          if (outcome.status === 'ok' && !run.signal.aborted)
-            run.blobs.markClientSaved(blob.blobId)
-          return { requestId, blobId: blob.blobId, outcome }
-        })
-        // A consumer may be paused on an earlier frame when an ACK is processed.
-        void result.catch(() => {})
-        return { ...pending, result, frame: kvMessage(requestId, blob.blobId, blob.blobData, blob.blobDataRaw) }
-      })
-      for (const request of requests) {
-        if (operation.cancelled)
-          break
-        request.start()
-        yield request.frame
-      }
-      const results = yield* waitForPromiseWithHeartbeat(Promise.all(requests.map(request => request.result)))
-      throwIfRunCancelled(run)
-      const failures: BlobTransferFailure[] = []
-      for (const result of results) {
-        if (result.outcome.status !== 'ok') {
-          failures.push({
-            blobId: result.blobId,
-            requestId: result.requestId,
-            status: result.outcome.status,
-            message: result.outcome.message ?? 'No successful client acknowledgement',
+      const releaseBatch = yield* waitForPromiseWithHeartbeat(run.kvGate.acquire(operation.signal))
+      if (!releaseBatch)
+        throw buildPendingTransferError(run, operation.failure)
+      try {
+        run.blobs.assertCheckpointReferences(referencedBlobIds)
+        const batch = run.blobs.getPendingBlobs().slice(0, run.batchSize)
+        const requests = batch.map((blob) => {
+          const requestId = run.allocateBlobId()
+          const pending = prepareKvRequest(run, operation, 'setBlobResult', requestId, run.timeoutMs)
+          const result = pending.reply.then((reply) => {
+            const outcome = reply.status === 'received' ? decodeSetBlobReply(reply.message) : reply
+            if (outcome.status === 'ok' && !run.signal.aborted)
+              run.blobs.markClientSaved(blob.blobId)
+            return { requestId, blobId: blob.blobId, outcome }
           })
+          // A consumer may be paused on an earlier frame when an ACK is processed.
+          void result.catch(() => {})
+          return { ...pending, result, requestId, blob }
+        })
+        for (const request of requests) {
+          if (operation.cancelled)
+            break
+          request.start()
+          yield kvMessage(request.requestId, request.blob.blobId, request.blob.blobData, request.blob.blobDataRaw)
         }
-      }
-      if (failures.length > 0) {
-        if (operation.cancelled) {
-          const batchBlobIds = new Set(batch.map(blob => blob.blobId))
-          for (const blob of run.blobs.getPendingBlobs()) {
-            if (!batchBlobIds.has(blob.blobId))
-              failures.push({ blobId: blob.blobId, status: operation.failure.status, message: operation.failure.message ?? 'Checkpoint blob transfer could not complete' })
+        const results = yield* waitForPromiseWithHeartbeat(Promise.all(requests.map(request => request.result)))
+        throwIfRunCancelled(run)
+        const failures: BlobTransferFailure[] = []
+        for (const result of results) {
+          if (result.outcome.status !== 'ok') {
+            failures.push({
+              blobId: result.blobId,
+              requestId: result.requestId,
+              status: result.outcome.status,
+              message: result.outcome.message ?? 'No successful client acknowledgement',
+            })
           }
         }
-        throw new BlobTransferError(failures)
+        if (failures.length > 0) {
+          if (operation.cancelled) {
+            const batchBlobIds = new Set(batch.map(blob => blob.blobId))
+            for (const blob of run.blobs.getPendingBlobs()) {
+              if (!batchBlobIds.has(blob.blobId))
+                failures.push({ blobId: blob.blobId, status: operation.failure.status, message: operation.failure.message ?? 'Checkpoint blob transfer could not complete' })
+            }
+          }
+          throw new BlobTransferError(failures)
+        }
+        if (operation.cancelled)
+          throw buildPendingTransferError(run, operation.failure)
       }
-      if (operation.cancelled)
-        throw buildPendingTransferError(run, operation.failure)
+      finally {
+        releaseBatch()
+      }
     }
     throwIfRunCancelled(run)
     run.blobs.assertCheckpointReferences(referencedBlobIds)

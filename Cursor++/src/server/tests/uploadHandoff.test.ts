@@ -15,6 +15,23 @@ function upload(handoff: UploadHandoff, conversationId: string, key: Uint8Array,
 }
 
 describe('pre-run upload handoff', () => {
+  it.each(['read', 'sweep'] as const)('bounds empty-value identity storage and releases it through %s expiry', (expiry) => {
+    let clock = 0
+    const handoff = new UploadHandoff({ maxBytes: 0, maxKeyBytes: 6, ttlMs: 10, now: () => clock })
+    upload(handoff, 'one', encodeText('a'), '')
+    upload(handoff, 'one', encodeText('a'), '')
+    expect(() => upload(handoff, 'two', encodeText('b'), '')).toThrow(/identity capacity/)
+    expect(handoff.read('one', encodeText('a'))).toEqual(new Uint8Array())
+    clock = 10
+    if (expiry === 'read')
+      expect(handoff.read('one', encodeText('a'))).toBeUndefined()
+    else
+      handoff.pruneExpired()
+    upload(handoff, 'two', encodeText('b'), '')
+    expect(() => upload(handoff, 'two', encodeText('long-key'), '')).toThrow(/identity capacity/)
+    expect(handoff.getStats()).toEqual({ entries: 1, bytes: 0 })
+  })
+
   it('isolates exact keys by conversation, including fork and concurrent upload batches', () => {
     const handoff = new UploadHandoff()
     const opaqueKey = Uint8Array.from([255, 128, 0, 65])

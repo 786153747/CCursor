@@ -7,11 +7,13 @@ import type { CompactionPlan } from '../handlers/agent/compactionStrategy'
  */
 import type { HistoryEntry } from '../handlers/agent/historyManager'
 import type { LLMContentBlock, LLMMessage } from '../handlers/llm/types'
-import { readFileSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fromBinary } from '@bufbuild/protobuf'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { getSpillDir } from '../config/paths'
-import { resetAgentDatabaseForTests } from '../database/sqlite'
+import { closeAgentDatabase, resetAgentDatabaseForTests } from '../database/sqlite'
 import { ConversationSummaryArchiveSchema } from '../gen/agent_v1_pb'
 import { encodeBlob } from '../handlers/agent/blob'
 import { RunBlobStore } from '../handlers/agent/blobStore'
@@ -119,23 +121,20 @@ export function makeTokenSizedChineseText(tokens: number): string {
 // ─── setup / teardown ───
 
 let tmpDbPath = ''
+let testDatabaseDirectory = ''
 const spillConversationIdsToClean = new Set<string>()
 
 beforeEach(async () => {
-  tmpDbPath = `/tmp/.tmp-compaction-budget-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
+  testDatabaseDirectory = mkdtempSync(join(tmpdir(), 'ccursor-compaction-budget-'))
+  tmpDbPath = join(testDatabaseDirectory, 'cursor.db')
   process.env.BYOK_AGENT_DB_PATH = tmpDbPath
   await resetAgentDatabaseForTests()
 })
 
 afterEach(async () => {
-  await resetAgentDatabaseForTests()
+  await closeAgentDatabase()
   delete process.env.BYOK_AGENT_DB_PATH
-  for (const suffix of ['', '-wal', '-shm']) {
-    try {
-      rmSync(`${tmpDbPath}${suffix}`)
-    }
-    catch {}
-  }
+  rmSync(testDatabaseDirectory, { recursive: true, force: true })
   // 清理测试创建的真实 spill 目录 (只删本测试文件拥有的会话子目录)
   for (const conversationId of spillConversationIdsToClean) {
     try {
@@ -1120,7 +1119,9 @@ describe('#11/#16/#17/#33 摘要源治理与三级兜底 (阶段 4)', () => {
     const capturedRequestKeys: string[][] = []
     const recordingProvider = {
       async* stream(request: Record<string, unknown>) {
-        capturedRequestKeys.push(Object.keys(request))
+        const { signal, ...modelRequest } = request
+        expect(signal).toBeInstanceOf(AbortSignal)
+        capturedRequestKeys.push(Object.keys(modelRequest))
         yield { type: 'text_delta', text: '- summary line' }
       },
     }

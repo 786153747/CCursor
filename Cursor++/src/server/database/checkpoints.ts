@@ -1,7 +1,5 @@
-import type { AsyncDatabase } from './sqlite';
 import { randomUUID } from 'node:crypto';
-import { logger } from '../logger';
-import { getAgentDatabase } from './sqlite';
+import { getCheckpointDatabase } from './sqlite';
 
 export type CheckpointKind = 'committed' | 'draft';
 
@@ -30,109 +28,131 @@ interface CheckpointRow {
 
 interface CheckpointWriteRow extends CheckpointRow {
     write_token: string;
+    is_deleted: number;
 }
 
-// Serialize checkpoint writers only, never transactions on the shared usage DB.
-let checkpointPersistenceTail: Promise<void> = Promise.resolve();
+export type CheckpointReferences = Pick<PersistedConversationCheckpoint, 'rootBlobIds' | 'turnBlobIds' | 'summaryArchiveIds'>;
 
-function parseStringArray(value: string): string[] {
+interface CheckpointVersion {
+    committed: string | null;
+    draft: string | null;
+}
+
+const checkpointVersion = Symbol('checkpointVersion');
+// Provenance for cooperative writers that atomically retire draft on committed writes.
+// This is not authentication: external writers must not forge or reuse these tokens.
+const checkpointWriteTokenPrefix = 'ccursor-cas-v1:';
+
+/** One run owns this scope and sequentially awaits its writes. Both kinds share validity. */
+export interface CheckpointWriteScope {
+    readonly conversationId: string;
+    readonly committedCheckpoint: PersistedConversationCheckpoint | null;
+    readonly draftCheckpoint: PersistedConversationCheckpoint | null;
+    /** Reject before choosing draft ?? committed; legacy divergent pairs cannot be ordered safely. */
+    readonly hasAmbiguousLegacyPair: boolean;
+    /** An explicit conversation reset is not authority for a delayed run to recreate it. */
+    readonly isDeleted: boolean;
+    readonly [checkpointVersion]: CheckpointVersion;
+}
+
+export class CheckpointConflictError extends Error {
+    constructor(readonly conversationId: string) {
+        super(`Checkpoint changed for conversation ${conversationId}; restart from the current checkpoint.`);
+        this.name = 'CheckpointConflictError';
+    }
+}
+
+function parseStringArray(value: string, conversationId: string): string[] {
     try {
         const parsed = JSON.parse(value);
-        return Array.isArray(parsed) ? parsed.filter((entry): entry is string => typeof entry === 'string') : [];
+        if (!Array.isArray(parsed) || !parsed.every(entry => typeof entry === 'string'))
+            throw new Error('Invalid checkpoint reference array');
+        return parsed;
     } catch {
-        return [];
+        // Malformed mirror metadata cannot establish a safe version baseline.
+        throw new CheckpointConflictError(conversationId);
     }
 }
 
-async function restoreCancelledCheckpoint(
-    database: AsyncDatabase,
-    checkpoint: PersistedConversationCheckpoint,
-    writeToken: string,
-    previousRow: CheckpointWriteRow | undefined,
-): Promise<void> {
-    const ownershipParameters = {
-        $conversationId: checkpoint.conversationId,
-        $kind: checkpoint.kind,
-        $cancelledWriteToken: writeToken,
+function parseCheckpointRow(row: CheckpointRow): PersistedConversationCheckpoint {
+    return {
+        conversationId: row.conversation_id,
+        kind: row.kind as CheckpointKind,
+        rootBlobIds: parseStringArray(row.root_blob_ids_json, row.conversation_id),
+        turnBlobIds: parseStringArray(row.turn_blob_ids_json, row.conversation_id),
+        summaryArchiveIds: parseStringArray(row.summary_archive_ids_json, row.conversation_id),
+        tokenDetails: {
+            usedTokens: row.used_tokens,
+            maxTokens: row.max_tokens,
+        },
+        mode: row.mode,
+        updatedAt: row.updated_at,
     };
-
-    // A newer replacement or explicit deletion must not be undone by cancellation.
-    if (!previousRow) {
-        await database.run(`
-            DELETE FROM conversation_checkpoints
-            WHERE conversation_id = $conversationId AND kind = $kind
-              AND write_token = $cancelledWriteToken
-        `, ownershipParameters);
-        return;
-    }
-
-    await database.run(`
-        UPDATE conversation_checkpoints SET
-            root_blob_ids_json = $rootBlobIdsJson,
-            turn_blob_ids_json = $turnBlobIdsJson,
-            summary_archive_ids_json = $summaryArchiveIdsJson,
-            used_tokens = $usedTokens,
-            max_tokens = $maxTokens,
-            mode = $mode,
-            updated_at = $updatedAt,
-            write_token = $previousWriteToken
-        WHERE conversation_id = $conversationId AND kind = $kind
-          AND write_token = $cancelledWriteToken
-    `, {
-        ...ownershipParameters,
-        $rootBlobIdsJson: previousRow.root_blob_ids_json,
-        $turnBlobIdsJson: previousRow.turn_blob_ids_json,
-        $summaryArchiveIdsJson: previousRow.summary_archive_ids_json,
-        $usedTokens: previousRow.used_tokens,
-        $maxTokens: previousRow.max_tokens,
-        $mode: previousRow.mode,
-        $updatedAt: previousRow.updated_at,
-        $previousWriteToken: previousRow.write_token,
-    });
 }
 
-async function writeConversationCheckpoint(
-    checkpoint: PersistedConversationCheckpoint,
+export function hasMatchingCheckpointReferences(actual: CheckpointReferences | null, expected: CheckpointReferences | null): boolean {
+    if (!actual || !expected) return actual === expected;
+    return (['rootBlobIds', 'turnBlobIds', 'summaryArchiveIds'] as const).every(field =>
+        actual[field].length === expected[field].length
+        && actual[field].every((blobId, index) => blobId === expected[field][index]));
+}
+
+/**
+ * Capture before restoring context or starting run work, not immediately before saving.
+ * The optional reference precondition rejects a client based on an older completed checkpoint.
+ * Omit it only when the caller has separately validated the incoming state/reset policy.
+ * Checkpoints exposed on the scope are the run-start snapshot, not a live cache.
+ */
+export async function beginCheckpointWriteScope(
+    conversationId: string,
+    options: { signal?: AbortSignal; expectedCommittedCheckpoint?: CheckpointReferences | null } = {},
+): Promise<CheckpointWriteScope> {
+    options.signal?.throwIfAborted();
+    // One SELECT snapshots both rows (including tombstones) consistently across connections.
+    const rows = await getCheckpointDatabase().all<CheckpointWriteRow>(`
+        SELECT * FROM conversation_checkpoints WHERE conversation_id = ?
+    `, [conversationId]);
+    options.signal?.throwIfAborted();
+    const committedRow = rows.find(row => row.kind === 'committed');
+    const draftRow = rows.find(row => row.kind === 'draft');
+    const committedCheckpoint = committedRow && !committedRow.is_deleted ? parseCheckpointRow(committedRow) : null;
+    const draftCheckpoint = draftRow && !draftRow.is_deleted ? parseCheckpointRow(draftRow) : null;
+    // Never infer legacy ordering from timestamps or rewrite either recovery candidate.
+    const hasAmbiguousLegacyPair = committedCheckpoint !== null && draftCheckpoint !== null
+        && !hasMatchingCheckpointReferences(committedCheckpoint, draftCheckpoint)
+        && !(committedRow?.write_token.startsWith(checkpointWriteTokenPrefix)
+            && draftRow?.write_token.startsWith(checkpointWriteTokenPrefix));
+    if (options.expectedCommittedCheckpoint !== undefined
+        && !hasMatchingCheckpointReferences(committedCheckpoint, options.expectedCommittedCheckpoint)) {
+        throw new CheckpointConflictError(conversationId);
+    }
+    return {
+        conversationId,
+        committedCheckpoint,
+        draftCheckpoint,
+        hasAmbiguousLegacyPair,
+        isDeleted: committedRow?.is_deleted === 1,
+        [checkpointVersion]: {
+            committed: committedRow?.write_token ?? null,
+            draft: draftRow?.write_token ?? null,
+        },
+    };
+}
+
+async function writeCheckpointRows(
+    mutation: { checkpoint: PersistedConversationCheckpoint; deleted?: boolean },
     signal?: AbortSignal,
+    writeScope?: CheckpointWriteScope,
 ): Promise<void> {
     signal?.throwIfAborted();
-    const database = getAgentDatabase();
-    const previousRow = signal
-        ? await database.get<CheckpointWriteRow>(`
-            SELECT conversation_id, kind, root_blob_ids_json, turn_blob_ids_json,
-                   summary_archive_ids_json, used_tokens, max_tokens, mode, updated_at, write_token
-            FROM conversation_checkpoints
-            WHERE conversation_id = ? AND kind = ?
-        `, [checkpoint.conversationId, checkpoint.kind])
-        : undefined;
-    signal?.throwIfAborted();
-
-    const writeToken = randomUUID();
-    await database.run(`
-        INSERT OR REPLACE INTO conversation_checkpoints (
-            conversation_id,
-            kind,
-            root_blob_ids_json,
-            turn_blob_ids_json,
-            summary_archive_ids_json,
-            used_tokens,
-            max_tokens,
-            mode,
-            updated_at,
-            write_token
-        ) VALUES (
-            $conversationId,
-            $kind,
-            $rootBlobIdsJson,
-            $turnBlobIdsJson,
-            $summaryArchiveIdsJson,
-            $usedTokens,
-            $maxTokens,
-            $mode,
-            $updatedAt,
-            $writeToken
-        )
-    `, {
+    const { checkpoint } = mutation;
+    const scope = writeScope ?? await beginCheckpointWriteScope(checkpoint.conversationId, { signal });
+    if (scope.conversationId !== checkpoint.conversationId) {
+        throw new Error('Checkpoint write scope belongs to a different conversation.');
+    }
+    const database = getCheckpointDatabase();
+    const writeToken = `${checkpointWriteTokenPrefix}${randomUUID()}`;
+    const parameters = {
         $conversationId: checkpoint.conversationId,
         $kind: checkpoint.kind,
         $rootBlobIdsJson: JSON.stringify(checkpoint.rootBlobIds),
@@ -143,32 +163,81 @@ async function writeConversationCheckpoint(
         $mode: checkpoint.mode,
         $updatedAt: checkpoint.updatedAt,
         $writeToken: writeToken,
-    });
+        $isDeleted: mutation.deleted ? 1 : 0,
+        $expectedCommittedToken: scope[checkpointVersion].committed,
+        $expectedDraftToken: scope[checkpointVersion].draft,
+    };
 
-    if (signal?.aborted) {
-        try {
-            await restoreCancelledCheckpoint(database, checkpoint, writeToken, previousRow);
-        } catch (error) {
-            logger.error({
-                conversationId: checkpoint.conversationId,
-                kind: checkpoint.kind,
-                error: error instanceof Error ? error.message : String(error),
-            }, '[DB] failed to restore cancelled checkpoint; previous checkpoint may not be preserved');
-            throw error;
-        }
-        signal.throwIfAborted();
-    }
+    // Dispatch is the cancellation boundary. This single SQLite statement atomically
+    // checks the whole conversation version and replaces its payload/version. Committed
+    // writes also retire draft so it cannot remain an active, older input baseline.
+    // Never compensate or throw cancellation after dispatch: accepted writes stay accepted.
+    signal?.throwIfAborted();
+    const result = await database.run(`
+        WITH current_version AS MATERIALIZED (
+            SELECT
+                (SELECT write_token FROM conversation_checkpoints
+                 WHERE conversation_id = $conversationId AND kind = 'committed') IS $expectedCommittedToken
+                AND
+                (SELECT write_token FROM conversation_checkpoints
+                 WHERE conversation_id = $conversationId AND kind = 'draft') IS $expectedDraftToken AS matches
+        ), checkpoint_kinds(kind, is_deleted) AS (
+            SELECT $kind, $isDeleted
+            UNION ALL SELECT 'draft', 1 WHERE $kind = 'committed'
+        )
+        INSERT INTO conversation_checkpoints (
+            conversation_id,
+            kind,
+            root_blob_ids_json,
+            turn_blob_ids_json,
+            summary_archive_ids_json,
+            used_tokens,
+            max_tokens,
+            mode,
+            updated_at,
+            write_token,
+            is_deleted
+        ) SELECT
+            $conversationId,
+            checkpoint_kinds.kind,
+            CASE WHEN checkpoint_kinds.is_deleted = 1 THEN '[]' ELSE $rootBlobIdsJson END,
+            CASE WHEN checkpoint_kinds.is_deleted = 1 THEN '[]' ELSE $turnBlobIdsJson END,
+            CASE WHEN checkpoint_kinds.is_deleted = 1 THEN '[]' ELSE $summaryArchiveIdsJson END,
+            CASE WHEN checkpoint_kinds.is_deleted = 1 THEN 0 ELSE $usedTokens END,
+            CASE WHEN checkpoint_kinds.is_deleted = 1 THEN 0 ELSE $maxTokens END,
+            CASE WHEN checkpoint_kinds.is_deleted = 1 THEN '' ELSE $mode END,
+            $updatedAt,
+            $writeToken,
+            checkpoint_kinds.is_deleted
+        FROM checkpoint_kinds, current_version
+        WHERE current_version.matches
+        ON CONFLICT(conversation_id, kind) DO UPDATE SET
+            root_blob_ids_json = excluded.root_blob_ids_json,
+            turn_blob_ids_json = excluded.turn_blob_ids_json,
+            summary_archive_ids_json = excluded.summary_archive_ids_json,
+            used_tokens = excluded.used_tokens,
+            max_tokens = excluded.max_tokens,
+            mode = excluded.mode,
+            updated_at = excluded.updated_at,
+            write_token = excluded.write_token,
+            is_deleted = excluded.is_deleted
+    `, parameters);
+    if (result.changes === 0) throw new CheckpointConflictError(checkpoint.conversationId);
+    scope[checkpointVersion][checkpoint.kind] = writeToken;
+    if (checkpoint.kind === 'committed') scope[checkpointVersion].draft = writeToken;
 }
 
-/** Completion commits the checkpoint; later cancellation does not undo it. */
+/**
+ * Run callers must pass their run-start scope, reusing it after every accepted write.
+ * Without a scope this is a compatible one-shot CAS, not protection for earlier run work.
+ * Committed writes atomically tombstone draft and advance both tokens in that scope.
+ */
 export function persistConversationCheckpoint(
     checkpoint: PersistedConversationCheckpoint,
     signal?: AbortSignal,
+    writeScope?: CheckpointWriteScope,
 ): Promise<void> {
-    const persistence = checkpointPersistenceTail.then(() => writeConversationCheckpoint(checkpoint, signal));
-    // Failures still reach the caller, but must not poison subsequent queued writes.
-    checkpointPersistenceTail = persistence.catch(() => {});
-    return persistence;
+    return writeCheckpointRows({ checkpoint }, signal, writeScope);
 }
 
 /**
@@ -181,49 +250,53 @@ export async function getPersistedConversationCheckpoint(
 ): Promise<PersistedConversationCheckpoint | null> {
     if (!conversationId) return null;
 
-    const row = await getAgentDatabase().get<CheckpointRow>(`
+    const row = await getCheckpointDatabase().get<CheckpointRow>(`
         SELECT conversation_id, kind, root_blob_ids_json, turn_blob_ids_json, summary_archive_ids_json, used_tokens, max_tokens, mode, updated_at
         FROM conversation_checkpoints
-        WHERE conversation_id = ? AND kind = ?
+        WHERE conversation_id = ? AND kind = ? AND is_deleted = 0
     `, [conversationId, kind]);
-    if (!row) return null;
+    return row ? parseCheckpointRow(row) : null;
+}
 
-    return {
-        conversationId: row.conversation_id,
-        kind: row.kind as CheckpointKind,
-        rootBlobIds: parseStringArray(row.root_blob_ids_json),
-        turnBlobIds: parseStringArray(row.turn_blob_ids_json),
-        summaryArchiveIds: parseStringArray(row.summary_archive_ids_json),
-        tokenDetails: {
-            usedTokens: row.used_tokens,
-            maxTokens: row.max_tokens,
+/** Explicit, version-conditional draft cleanup; run failures never call this automatically. */
+export function clearDraftCheckpoint(
+    conversationId: string,
+    signal?: AbortSignal,
+    writeScope?: CheckpointWriteScope,
+): Promise<void> {
+    return clearCheckpointRows(conversationId, false, signal, writeScope);
+}
+
+/** Explicit reset retains tombstones. Empty client state never implies deletion. */
+export function clearPersistedConversationCheckpoint(
+    conversationId: string,
+    signal?: AbortSignal,
+    writeScope?: CheckpointWriteScope,
+): Promise<void> {
+    return clearCheckpointRows(conversationId, true, signal, writeScope);
+}
+
+async function clearCheckpointRows(
+    conversationId: string,
+    clearAll: boolean,
+    signal?: AbortSignal,
+    writeScope?: CheckpointWriteScope,
+): Promise<void> {
+    if (!conversationId) return;
+    // Retain fresh tokens even when already absent. Physical DELETE would allow ABA
+    // and let a scope captured before reset resurrect the conversation afterwards.
+    // The materialized CAS above is evaluated once before either kind is tombstoned.
+    await writeCheckpointRows({
+        checkpoint: {
+            conversationId,
+            kind: clearAll ? 'committed' : 'draft',
+            rootBlobIds: [],
+            turnBlobIds: [],
+            summaryArchiveIds: [],
+            tokenDetails: { usedTokens: 0, maxTokens: 0 },
+            mode: '',
+            updatedAt: Date.now(),
         },
-        mode: row.mode,
-        updatedAt: row.updated_at,
-    };
-}
-
-/** 清除指定会话的 draft checkpoint (provider error 后调用) */
-export async function clearDraftCheckpoint(conversationId: string): Promise<void> {
-    if (!conversationId) return;
-    await getAgentDatabase().run(
-        `DELETE FROM conversation_checkpoints WHERE conversation_id = ? AND kind = 'draft'`,
-        [conversationId],
-    );
-}
-
-/**
- * 清除指定会话的 sqlite checkpoint。
- *
- * 使用场景: 客户端发送空 conversationState + sqlite 里有旧 checkpoint →
- * 判定为 revert / 用户主动重置 → 清空以避免污染下一次重建。
- *
- * 详见 analysis/checkpoint-revert-protocol.md 的 P0 修复方案。
- */
-export async function clearPersistedConversationCheckpoint(conversationId: string): Promise<void> {
-    if (!conversationId) return;
-    await getAgentDatabase().run(
-        `DELETE FROM conversation_checkpoints WHERE conversation_id = ?`,
-        [conversationId],
-    );
+        deleted: true,
+    }, signal, writeScope);
 }

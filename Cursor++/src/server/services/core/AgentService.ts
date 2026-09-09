@@ -22,8 +22,9 @@
  * 突然结束, 没有 banner。这里的修复是此功能的必要前置。
  */
 import type { ConnectRouter } from '@connectrpc/connect'
-import { toJson } from '@bufbuild/protobuf'
-import { ConnectError } from '@connectrpc/connect'
+import { randomUUID } from 'node:crypto'
+import { toBinary, toJson } from '@bufbuild/protobuf'
+import { Code, ConnectError } from '@connectrpc/connect'
 import { type AgentClientMessage, AgentClientMessageSchema, AgentService } from '../../gen/agent_v1_pb'
 import { handleRunRequest } from '../../handlers/agent/agentOrchestrator'
 import { uploadHandoff } from '../../handlers/agent/uploadHandoff'
@@ -31,7 +32,8 @@ import { registerCloneLineage } from '../../handlers/agent/cloneRegistry'
 import { ModelNotFoundError } from '../../handlers/models/mapper'
 import { makeByokConnectError, makeModelNotFoundError, makeProviderError } from '../../handlers/errors'
 import { ErrorDetails_Error } from '../../gen/aiserver_v1_shared_pb'
-import { type AgentSession, closeSession, createEphemeralSession, getOrCreateSession, markSessionClosed, pushSessionMessage, waitForMessage } from '../../handlers/agent/session'
+import { type AgentSession, attachSessionTransport, closeSession, createEphemeralSession, getOrCreateSession, markSessionClosed, pushSessionMessage, recordSessionBlobRequestSent } from '../../handlers/agent/session'
+import { waitForRunRequest } from '../../handlers/agent/transportStartup'
 import { logger } from '../../logger'
 
 /**
@@ -46,6 +48,8 @@ import { logger } from '../../logger'
 function normalizeToConnectError(error: unknown, context: Record<string, string>): ConnectError {
   if (error instanceof ConnectError)
     return error
+  if (error instanceof Error && error.name === 'AbortError')
+    return new ConnectError(error.message, Code.Canceled, undefined, undefined, error)
   if (error instanceof ModelNotFoundError)
     return makeModelNotFoundError(error.modelId)
   if (error instanceof Error && error.name.startsWith('Blob')) {
@@ -68,8 +72,48 @@ function isStreamDestroyedError(error: unknown): boolean {
     || error.message.includes('ERR_STREAM_DESTROYED')
 }
 
+/** Native generator.return() queues behind next(); close the owned session first. */
+function withSessionConsumerLifecycle<Frame>(
+  createFrames: (claimSession: (session: AgentSession) => void) => AsyncGenerator<Frame, void, unknown>,
+): AsyncGenerator<Frame, void, unknown> {
+  let ownedSession: AgentSession | undefined
+  const iterator = createFrames(session => {
+    ownedSession = session
+  })
+  const releaseOwnership = (): void => {
+    ownedSession = undefined
+  }
+  const interrupt = (): void => {
+    if (ownedSession)
+      markSessionClosed(ownedSession)
+  }
+  return {
+    async next(value) {
+      try {
+        const result = await iterator.next(value)
+        if (result.done)
+          releaseOwnership()
+        return result
+      }
+      catch (error) {
+        releaseOwnership()
+        throw error
+      }
+    },
+    return(value) {
+      interrupt()
+      return iterator.return(value).finally(releaseOwnership)
+    },
+    throw(error) {
+      interrupt()
+      return iterator.throw(error).finally(releaseOwnership)
+    },
+    [Symbol.asyncIterator]() { return this },
+  }
+}
+
 /**
- * Bidi (HTTP/2) 上行泵: 首条 runRequest 之后, 把客户端流上的每一帧推入 session 队列,
+ * Bidi (HTTP/2) 上行泵: 从连接建立起, 把客户端流上的每一帧推入 session 队列,
  * 供 waitForMessageMatching 消费; 流结束时关闭 session。
  *
  * 只有 clientHeartbeat 被丢弃 —— 它纯粹是保活, 没有任何等待方。
@@ -87,13 +131,13 @@ export async function pumpBidiClientMessages(
   session: AgentSession,
 ): Promise<void> {
   try {
-    while (!session.closed) {
+    while (!session.closed && session.cancelledReason === undefined) {
       let resolveClosed!: () => void
       const closed = new Promise<null>((resolve) => {
         resolveClosed = () => resolve(null)
       })
       const onSessionChange = (): void => {
-        if (session.closed)
+        if (session.closed || session.cancelledReason !== undefined)
           resolveClosed()
       }
       session.listeners.add(onSessionChange)
@@ -106,12 +150,12 @@ export async function pumpBidiClientMessages(
       finally {
         session.listeners.delete(onSessionChange)
       }
-      if (!next || next.done || session.closed)
+      if (!next || next.done || session.closed || session.cancelledReason !== undefined)
         break
       const msg = toJson(AgentClientMessageSchema, next.value) as Record<string, unknown>
       if ('clientHeartbeat' in msg)
         continue
-      pushSessionMessage(session, msg)
+      pushSessionMessage(session, msg, toBinary(AgentClientMessageSchema, next.value).byteLength)
     }
   }
   finally {
@@ -122,171 +166,116 @@ export async function pumpBidiClientMessages(
 export default (router: ConnectRouter) => {
   router.service(AgentService, {
     /** Bidi streaming (HTTP/2) */
-    async* run(requests) {
-      logger.info('[SVC] AgentService/Run bidi started')
+    run(requests, context) {
+      return withSessionConsumerLifecycle(async function* (claimSession) {
+        logger.info('[SVC] AgentService/Run bidi started')
 
-      const iterator = requests[Symbol.asyncIterator]()
-      let firstMsg: Record<string, unknown> | null = null
-      let bidiQueuedUserText: string | undefined
+        const iterator = requests[Symbol.asyncIterator]()
+        // Official 3.14.27 transport uses x-request-id, or a fresh UUID. Transport
+        // identity is independent of conversationId and saved turn requestIds.
+        const session = createEphemeralSession(context.requestHeader.get('x-request-id') || randomUUID())
+        const detachTransport = attachSessionTransport(session, context.signal)
+        claimSession(session)
+        const pump = pumpBidiClientMessages(iterator, session).catch((error: unknown) => {
+          session.transportError = error
+          markSessionClosed(session)
+        })
 
-      while (true) {
-        const next = await iterator.next()
-        if (next.done)
-          return
-        const msg = toJson(AgentClientMessageSchema, next.value) as Record<string, unknown>
-        // 首条 runRequest 之前尚未建立 session, kvClientMessage 无处可推 —— 此阶段
-        // 服务端也还没发出任何 getBlobArgs, 这里的 kv 帧只可能是无人等待的 ACK, 丢弃即可。
-        if ('clientHeartbeat' in msg || 'kvClientMessage' in msg)
-          continue
-        if ('conversationAction' in msg && !bidiQueuedUserText) {
-          const ca = msg.conversationAction as Record<string, unknown> | undefined
-          const ua = ca?.userMessageAction as Record<string, unknown> | undefined
-          const um = ua?.userMessage as Record<string, unknown> | undefined
-          bidiQueuedUserText = typeof um?.text === 'string' && um.text ? um.text : undefined
-          logger.info({ queuedUserText: bidiQueuedUserText?.slice(0, 80) }, '[SVC] Run bidi got conversationAction before runRequest')
-          continue
-        }
-        if ('runRequest' in msg) {
-          if (bidiQueuedUserText) {
-            const rr = msg.runRequest as Record<string, unknown>
-            const action = rr?.action as Record<string, unknown> | undefined
-            if (action && !action.userMessageAction && action.resumeAction) {
-              action.userMessageAction = {
-                userMessage: { text: bidiQueuedUserText },
-                requestContext: (action.resumeAction as Record<string, unknown>)?.requestContext,
-              }
-              delete action.resumeAction
-              logger.info({ textLen: bidiQueuedUserText.length }, '[SVC] bidi: injected queued userText into resumeAction → userMessageAction')
+        try {
+          const firstMessage = await waitForRunRequest(session)
+          if (firstMessage) {
+            for await (const frame of handleRunRequest(firstMessage, session)) {
+              context.signal.throwIfAborted()
+              if (session.closed || session.cancelledReason !== undefined)
+                break
+              recordSessionBlobRequestSent(session, frame)
+              yield frame
             }
           }
-          firstMsg = msg
-          break
+          context.signal.throwIfAborted()
+          if (session.transportError)
+            throw session.transportError
         }
-      }
-
-      const session = createEphemeralSession(`bidi-${Date.now()}`)
-      const pump = pumpBidiClientMessages(iterator, session)
-
-      try {
-        for await (const frame of handleRunRequest(firstMsg, session)) {
-          yield frame
+        catch (error) {
+          // 用户中断对话 → stream 已销毁, yield 写入失败 — 正常退出, 不触发 retry banner
+          if (isStreamDestroyedError(error)) {
+            logger.info({ sessionId: session?.requestId }, '[SVC] Run bidi stream destroyed (client abort)')
+            return
+          }
+          // Bidi (HTTP/2) 路径 —— 同 runSSE, 把下游冒上来的错归一化为 ConnectError
+          // + ErrorDetails, 让客户端 retry banner 能识别。
+          const sessionIdStr = session?.requestId ?? 'bidi'
+          const connErr = normalizeToConnectError(error, { transport: 'bidi', sessionId: sessionIdStr })
+          logger.error(
+            { sessionId: sessionIdStr, error: (error as Error).message, stack: (error as Error).stack },
+            '[SVC] AgentService/Run bidi handler error, rethrowing as ConnectError with ErrorDetails',
+          )
+          throw connErr
         }
-      }
-      catch (error) {
-        // 用户中断对话 → stream 已销毁, yield 写入失败 — 正常退出, 不触发 retry banner
-        if (isStreamDestroyedError(error)) {
-          logger.info({ sessionId: session?.requestId }, '[SVC] Run bidi stream destroyed (client abort)')
-          return
+        finally {
+          markSessionClosed(session)
+          detachTransport()
+          // Closing the session releases the pump even with input.next pending.
+          await pump
         }
-        // Bidi (HTTP/2) 路径 —— 同 runSSE, 把下游冒上来的错归一化为 ConnectError
-        // + ErrorDetails, 让客户端 retry banner 能识别。
-        const sessionIdStr = session?.requestId ?? 'bidi'
-        const connErr = normalizeToConnectError(error, { transport: 'bidi', sessionId: sessionIdStr })
-        logger.error(
-          { sessionId: sessionIdStr, error: (error as Error).message, stack: (error as Error).stack },
-          '[SVC] AgentService/Run bidi handler error, rethrowing as ConnectError with ErrorDetails',
-        )
-        throw connErr
-      }
-      finally {
-        markSessionClosed(session)
-        await pump.catch((e) => {
-          logger.warn({ error: (e as Error).message }, '[SVC] Run bidi pump error')
-        })
-      }
+      })
     },
 
     /** Server streaming SSE (HTTP/1.1 降级) */
-    async* runSSE(req) {
-      const requestId = req.requestId
-      if (!requestId) {
-        // 缺 requestId 无法关联到 bidi session, 走静默 return 让 SSE 正常结束。
-        // 这是协议层问题而不是业务错, 不触发 retry banner。
-        logger.warn('[SVC] RunSSE called without requestId')
-        return
-      }
-
-      logger.info({ requestId }, '[SVC] AgentService/RunSSE started')
-      const session = getOrCreateSession(requestId)
-
-      try {
-        const firstMsg = await waitForMessage(session)
-        if (!firstMsg) {
-          // Session 建立后没等到首条消息 —— 通常是 BidiAppend 协调慢或客户端问题。
-          // 也构造一个 ErrorDetails 让客户端 banner 提示, 可 retry。
-          logger.warn({ requestId }, '[SVC] RunSSE no message received (timeout)')
-          throw makeByokConnectError({
-            errorCode: ErrorDetails_Error.EXTENSION_HOST_TIMEOUT,
-            title: 'Agent session timeout',
-            detail: 'RunSSE waited for the first BidiAppend message but none arrived. This is usually a client-side routing issue — please retry.',
-            isRetryable: true,
-            additionalInfo: { requestId },
-          })
+    runSSE(req, context) {
+      return withSessionConsumerLifecycle(async function* (claimSession) {
+        const requestId = req.requestId
+        if (!requestId) {
+          throw new ConnectError('RunSSE requires request_id', Code.InvalidArgument)
         }
 
-        logger.info({ requestId, keys: Object.keys(firstMsg) }, '[SVC] RunSSE first message')
+        logger.info({ requestId }, '[SVC] AgentService/RunSSE started')
+        const session = getOrCreateSession(requestId)
+        const detachTransport = attachSessionTransport(session, context.signal)
+        // A duplicate/rejected consumer must never acquire cancellation rights
+        // over the existing stream; claim only after successful attachment.
+        claimSession(session)
 
-        // 队列消息场景: 客户端先发 conversationAction(含用户文本), 再发 runRequest。
-        // 如果首条不是 runRequest, 提取 conversationAction 中的 userText, 继续等 runRequest。
-        let queuedUserText: string | undefined
-        let actualFirstMsg = firstMsg
-
-        if (!('runRequest' in firstMsg) && 'conversationAction' in firstMsg) {
-          const ca = firstMsg.conversationAction as Record<string, unknown> | undefined
-          const ua = ca?.userMessageAction as Record<string, unknown> | undefined
-          const um = ua?.userMessage as Record<string, unknown> | undefined
-          queuedUserText = typeof um?.text === 'string' && um.text ? um.text : undefined
-          logger.info({ requestId, queuedUserText: queuedUserText?.slice(0, 80) }, '[SVC] RunSSE got conversationAction before runRequest — waiting for runRequest')
-          const nextMsg = await waitForMessage(session)
-          if (!nextMsg || !('runRequest' in nextMsg)) {
-            logger.warn({ requestId, nextMsgKeys: nextMsg ? Object.keys(nextMsg) : null }, '[SVC] RunSSE never received runRequest after conversationAction')
-            return
-          }
-          actualFirstMsg = nextMsg
-        }
-
-        if ('runRequest' in actualFirstMsg) {
-          // 如果 runRequest 是 resumeAction 且有来自 conversationAction 的用户文本, 注入
-          if (queuedUserText) {
-            const rr = actualFirstMsg.runRequest as Record<string, unknown>
-            const action = rr?.action as Record<string, unknown> | undefined
-            if (action && !action.userMessageAction && action.resumeAction) {
-              action.userMessageAction = {
-                userMessage: { text: queuedUserText },
-                requestContext: (action.resumeAction as Record<string, unknown>)?.requestContext,
-              }
-              delete action.resumeAction
-              logger.info({ requestId, textLen: queuedUserText.length }, '[SVC] injected queued userText into resumeAction → userMessageAction')
+        try {
+          const firstMessage = await waitForRunRequest(session)
+          if (firstMessage) {
+            for await (const frame of handleRunRequest(firstMessage, session)) {
+              context.signal.throwIfAborted()
+              if (session.closed || session.cancelledReason !== undefined)
+                break
+              recordSessionBlobRequestSent(session, frame)
+              yield frame
             }
           }
-          for await (const frame of handleRunRequest(actualFirstMsg, session)) {
-            yield frame
+          context.signal.throwIfAborted()
+          if (session.transportError)
+            throw session.transportError
+        }
+        catch (error) {
+          // 用户中断对话 → stream 已销毁, yield 写入失败 — 正常退出
+          if (isStreamDestroyedError(error)) {
+            logger.info({ requestId }, '[SVC] RunSSE stream destroyed (client abort)')
+            return
           }
+          // 关键修复 —— 之前这里是 logger.error(...) 后静默吞掉, 导致下游抛出
+          // 的任何错误都不会到达客户端, SSE 突然结束, Composer 不会显示 banner。
+          //
+          // 现在统一归一化为 ConnectError + aiserver.v1.ErrorDetails outgoing
+          // detail, 让 @connectrpc/connect-fastify 序列化到 SSE trailer, 客户端
+          // @connectrpc 解包后触发 Glass Composer 的 maybeThrowErrorAndRetry,
+          // 最终渲染 input 上方的 retry banner。
+          const connErr = normalizeToConnectError(error, { transport: 'sse', requestId })
+          logger.error(
+            { requestId, error: (error as Error).message, stack: (error as Error).stack },
+            '[SVC] RunSSE handler error, rethrowing as ConnectError with ErrorDetails',
+          )
+          throw connErr
         }
-      }
-      catch (error) {
-        // 用户中断对话 → stream 已销毁, yield 写入失败 — 正常退出
-        if (isStreamDestroyedError(error)) {
-          logger.info({ requestId }, '[SVC] RunSSE stream destroyed (client abort)')
-          return
+        finally {
+          detachTransport()
+          closeSession(requestId)
         }
-        // 关键修复 —— 之前这里是 logger.error(...) 后静默吞掉, 导致下游抛出
-        // 的任何错误都不会到达客户端, SSE 突然结束, Composer 不会显示 banner。
-        //
-        // 现在统一归一化为 ConnectError + aiserver.v1.ErrorDetails outgoing
-        // detail, 让 @connectrpc/connect-fastify 序列化到 SSE trailer, 客户端
-        // @connectrpc 解包后触发 Glass Composer 的 maybeThrowErrorAndRetry,
-        // 最终渲染 input 上方的 retry banner。
-        const connErr = normalizeToConnectError(error, { transport: 'sse', requestId })
-        logger.error(
-          { requestId, error: (error as Error).message, stack: (error as Error).stack },
-          '[SVC] RunSSE handler error, rethrowing as ConnectError with ErrorDetails',
-        )
-        throw connErr
-      }
-      finally {
-        closeSession(requestId)
-      }
+      })
     },
 
     /**

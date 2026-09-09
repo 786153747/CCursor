@@ -8,7 +8,9 @@ import { blobIdFromBytes, blobIdToBytes, encodeBinaryBlob, encodeBlob } from '..
 import { BlobIntegrityError } from '../handlers/agent/blobErrors'
 import { BlobInactiveError, BlobResourceLimitError, RunBlobStore } from '../handlers/agent/blobStore'
 import { BlobTransferError, CLIENT_BLOB_FETCH_BATCH_SIZE, fetchBlobsFromClient, saveCheckpointBlobs } from '../handlers/agent/clientBlobFetch'
+import { AGENT_HEARTBEAT_INTERVAL_MS } from '../handlers/agent/constants'
 import { BlobRunContext } from '../handlers/agent/runContext'
+import { RunResourceBudget } from '../handlers/agent/runResources'
 import { createEphemeralSession, markSessionClosed, pushSessionMessage, waitForMessageMatching } from '../handlers/agent/session'
 import { AgentRunAbortedError, waitForPromiseWithHeartbeat } from '../handlers/agent/wait'
 
@@ -86,10 +88,95 @@ beforeEach(() => {
 })
 
 afterEach(() => {
-  for (const run of activeRuns.splice(0))
+  for (const run of activeRuns.splice(0)) {
     run.dispose()
+    if (run.session)
+      markSessionClosed(run.session)
+  }
   vi.clearAllTimers()
   vi.useRealTimers()
+})
+
+describe('process admission and cross-helper KV bounds', () => {
+  it.each(['get', 'set'] as const)('releases a %s gate granted while its consumer is suspended at a heartbeat', async (kind) => {
+    const run = createRun()
+    const releaseBlocker = await run.kvGate.acquire(run.signal)
+    run.blobs.cacheBlob('pending-save', 'YQ==')
+    const operation: AsyncGenerator<AgentServerMessage, unknown, void> = kind === 'get'
+      ? fetchBlobsFromClient({ run, blobIds: [blobIdToBytes('abandoned-read')] })
+      : saveCheckpointBlobs(run, ['pending-save'])
+    const heartbeatStep = operation.next()
+    await vi.advanceTimersByTimeAsync(AGENT_HEARTBEAT_INTERVAL_MS + 1)
+    expect((await heartbeatStep).done).toBe(false)
+    releaseBlocker?.()
+    await Promise.resolve()
+    await operation.return(undefined)
+    const following = fetchBlobsFromClient({ run, blobIds: [blobIdToBytes('following-read')] })
+    const sent = await nextKvFrame(following)
+    replyGet(run.session!, sent.requestId, Buffer.from('following'))
+    expect((await drain(following))[0]?.status).toBe('ok')
+    expect(run.getSentGetRequestCount()).toBe(1)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('releases admission and counted payload after resource failure and constructor failure', () => {
+    const budget = new RunResourceBudget({ maxRuns: 2, maxBytes: 10 })
+    const first = createRun(null, { resourceBudget: budget })
+    const second = createRun(null, { resourceBudget: budget })
+    first.blobs.cacheBlob('first', 'AAAAAA')
+    expect(() => second.blobs.cacheBlob('second', 'AAAAAA')).toThrow(/Process blob payload/)
+    expect(budget.getStats()).toEqual({ activeRuns: 2, retainedBytes: 6 })
+    expect(() => createRun(null, { resourceBudget: budget })).toThrow(/Active run capacity/)
+    first.dispose()
+    second.blobs.cacheBlob('second', 'AAAAAA')
+    expect(() => createRun(null, { resourceBudget: budget, maxRecords: 0, inheritedBlobIds: ['bad'] })).toThrow(/record limit/)
+    expect(budget.getStats()).toEqual({ activeRuns: 1, retainedBytes: 6 })
+    second.dispose()
+    expect(budget.getStats()).toEqual({ activeRuns: 0, retainedBytes: 0 })
+  })
+
+  it('bounds combined Gets and Sets, counts queue time, and releases cancelled waiters', async () => {
+    const run = createRun(undefined, { batchSize: 2, timeoutMs: 1000, overallTimeoutMs: 2000 })
+    const first = fetchBlobsFromClient({ run, blobIds: ['first', 'second'].map(blobIdToBytes) })
+    const firstRequest = await nextKvFrame(first)
+    const secondRequest = await nextKvFrame(first)
+    const firstCompletion = drain(first)
+    const queued = fetchBlobsFromClient({ run, blobIds: [blobIdToBytes('queued')], overallTimeoutMs: 50 })
+    const queuedFrames: AgentServerMessage[] = []
+    const queuedCompletion = drain(queued, frame => queuedFrames.push(frame))
+    run.blobs.cacheBlob('new', 'bmV3')
+    const saving = saveCheckpointBlobs(run, ['new'])
+    const nextSet = nextKvFrame(saving)
+    await vi.advanceTimersByTimeAsync(51)
+    expect((await queuedCompletion)[0]?.status).toBe('overall-timeout')
+    expect(queuedFrames).toEqual([])
+    expect(run.session!.activeBlobRequestIds?.size).toBe(2)
+    replyGet(run.session!, firstRequest.requestId, Buffer.from('first'))
+    replyGet(run.session!, secondRequest.requestId, Buffer.from('second'))
+    await firstCompletion
+    const setRequest = await nextSet
+    expect(setRequest.kind).toBe('setBlobArgs')
+    expect(run.session!.activeBlobRequestIds?.size).toBe(1)
+    replySet(run.session!, setRequest.requestId)
+    await drain(saving)
+    expect(run.getSentGetRequestCount()).toBe(2)
+    expect(run.session!.activeBlobRequestIds?.size).toBe(0)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('rejects a full KV wait queue and frees queued slots on run cancellation', async () => {
+    const run = createRun()
+    const release = await run.kvGate.acquire(run.signal)
+    const waiting = Array.from({ length: 32 }, () => run.kvGate.acquire(run.signal))
+    expect(() => run.kvGate.acquire(run.signal)).toThrow(/queue is full/)
+    run.abortController.abort()
+    expect(await Promise.all(waiting)).toEqual(Array.from({ length: 32 }).fill(undefined))
+    release?.()
+    const nextSignal = new AbortController().signal
+    const nextRelease = await run.kvGate.acquire(nextSignal)
+    expect(nextRelease).toBeTypeOf('function')
+    nextRelease?.()
+  })
 })
 
 describe('run-owned blob retention', () => {
@@ -121,6 +208,9 @@ describe('run-owned blob retention', () => {
     }
     expect(() => blobs.assertCheckpointReferences([])).toThrow(/original/)
     blobs.addInheritedReferences(['original'])
+    expect(() => blobs.assertCheckpointReferences(['original', 'archive'])).toThrow(/original/)
+    blobs.cacheBlob('original', 'Yw==')
+    blobs.markClientSaved('original')
     blobs.assertCheckpointReferences(['archive'])
     blobs.markClientSaved('unretained')
     expect(() => blobs.assertCheckpointReferences(['unretained'])).toThrow(/unretained.*missing-reference/)
@@ -278,8 +368,9 @@ describe('run-owned client Get', () => {
         return unreadPayload()
       },
     }
+    // Transports supply encoded byte length independently of payload decoding.
     for (const invalidId of [undefined, null, 0, -1, String(first.requestId), first.requestId + 99])
-      pushSessionMessage(run.session!, { kvClientMessage: { id: invalidId, getBlobResult: unrelatedResult } })
+      pushSessionMessage(run.session!, { kvClientMessage: { id: invalidId, getBlobResult: unrelatedResult } }, 64)
     replySet(run.session!, first.requestId)
     const payload = vi.fn(() => Buffer.from('first').toString('base64'))
     pushSessionMessage(run.session!, {
@@ -291,7 +382,7 @@ describe('run-owned client Get', () => {
           },
         },
       },
-    })
+    }, 64)
     replyGet(run.session!, third.requestId, new TextEncoder().encode('third'))
     pushSessionMessage(run.session!, { kvClientMessage: { id: second.requestId, getBlobResult: { blobData: new TextEncoder().encode('second') } } })
     const result = await drain(generator)

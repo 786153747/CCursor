@@ -276,35 +276,36 @@ export function applyMcpsPart(parsed: ParsedRunRequest, part: FetchedMcpsPart): 
   }, '[PROTOCOL] MCP context restored from mcps blob')
 }
 
-/** 解码一个取回的 Part 并合入 parsed; blobData 为 null (取回失败) 时只告警。 */
-export function applyRequestContextPart(parsed: ParsedRunRequest, partName: RequestContextPartName, blobData: Uint8Array | null): void {
+/** Return decode success; the run boundary decides required versus catalog-only. */
+export function applyRequestContextPart(parsed: ParsedRunRequest, partName: RequestContextPartName, blobData: Uint8Array | null): boolean {
   if (!blobData) {
     logger.warn({ partName }, '[PROTOCOL] request-context part blob unavailable from client; keeping inline context')
-    return
+    return false
   }
   switch (partName) {
     case 'rules': {
       const part = decodeRulesPart(blobData)
       if (part)
         applyRulesPart(parsed, part)
-      return
+      return part !== null
     }
     case 'skills': {
       const part = decodeSkillsPart(blobData)
       if (part)
         applySkillsPart(parsed, part)
-      return
+      return part !== null
     }
     case 'subagents': {
       const part = decodeSubagentsPart(blobData)
       if (part)
         applySubagentsPart(parsed, part)
-      return
+      return part !== null
     }
     case 'mcps': {
       const part = decodeMcpsPart(blobData)
       if (part)
         applyMcpsPart(parsed, part)
+      return part !== null
     }
   }
 }

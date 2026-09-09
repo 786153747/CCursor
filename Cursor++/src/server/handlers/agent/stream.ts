@@ -1,5 +1,6 @@
 import type { AgentServerMessage } from '../../gen/agent_v1_pb'
 import type { LLMStreamEvent } from '../llm/types'
+import { type ProviderRequestLifecycle, withProviderRequestLifecycle } from '../llm/requestLifecycle'
 import { blobIdToBytes } from './blob'
 /**
  * Agent 流翻译器
@@ -655,16 +656,33 @@ function resolveAgentMode(mode: string): AgentMode {
 /**
  * 将 LLM streaming events 翻译为 Cursor AgentServerMessage 帧序列
  */
-function delay(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
-}
-
-export async function* translateStream(
-  events: AsyncIterable<LLMStreamEvent>,
+export function translateStream(
+  events: AsyncIterable<LLMStreamEvent> | ((signal: AbortSignal) => AsyncIterable<LLMStreamEvent>),
   stepId: string = '1',
   onEvent?: (event: LLMStreamEvent) => AgentServerMessage | AgentServerMessage[] | void,
   keepAliveMs = AGENT_HEARTBEAT_INTERVAL_MS,
   resolveToolModelCallId?: (event: LLMStreamEvent, defaultModelCallId: string) => string | undefined,
+  signal?: AbortSignal,
+): AsyncGenerator<AgentServerMessage, void, unknown> {
+  // A factory connects the translator's child lifecycle to the real request,
+  // including while next() is pending or the consumer is paused at a heartbeat.
+  return withProviderRequestLifecycle(lifecycle => translateEvents(
+    typeof events === 'function' ? events(lifecycle.signal) : events,
+    lifecycle,
+    stepId,
+    onEvent,
+    keepAliveMs,
+    resolveToolModelCallId,
+  ), signal)
+}
+
+async function* translateEvents(
+  events: AsyncIterable<LLMStreamEvent>,
+  lifecycle: ProviderRequestLifecycle,
+  stepId: string,
+  onEvent: ((event: LLMStreamEvent) => AgentServerMessage | AgentServerMessage[] | void) | undefined,
+  keepAliveMs: number,
+  resolveToolModelCallId: ((event: LLMStreamEvent, defaultModelCallId: string) => string | undefined) | undefined,
 ): AsyncIterable<AgentServerMessage> {
   const startTime = Date.now()
   let thinkingStartTime = startTime
@@ -677,146 +695,180 @@ export async function* translateStream(
   const iterator = events[Symbol.asyncIterator]()
   let lastContentTime = startTime
   let idleHintSent = false
+  let sourceCompleted = false
+  let heartbeatTimer: ReturnType<typeof setTimeout> | undefined
+  let notifyAbort: () => void = () => {}
+  const aborted = new Promise<{ kind: 'aborted' }>((resolve) => {
+    notifyAbort = () => resolve({ kind: 'aborted' })
+  })
+  lifecycle.signal.addEventListener('abort', notifyAbort, { once: true })
 
-  while (true) {
-    const nextPromise = iterator.next()
-    let nextResult: IteratorResult<LLMStreamEvent>
-
+  try {
     while (true) {
-      const raced = await Promise.race([
-        nextPromise.then(value => ({ kind: 'next' as const, value })),
-        delay(keepAliveMs).then(() => ({ kind: 'heartbeat' as const })),
-      ])
+      lifecycle.signal.throwIfAborted()
+      const nextPromise = iterator.next().then(value => ({ kind: 'next' as const, value }))
+      let nextResult: IteratorResult<LLMStreamEvent>
 
-      if (raced.kind === 'heartbeat') {
-        // 空窗期 idle hint: 有内容产出后长时间无新事件 → 注入信号让客户端转到 "Generating response"
-        // 客户端状态机: streaming_text → (thinkingCompleted) → waiting_server_next → (heartbeat) → inference
-        if (!idleHintSent && textChars > 0 && Date.now() - lastContentTime >= IDLE_HINT_AFTER_MS) {
-          idleHintSent = true
-          yield thinkingCompleted(0)
-          streamLogger.debug('[LLM] idle hint: thinkingCompleted(0) injected')
+      while (true) {
+        lifecycle.signal.throwIfAborted()
+        const heartbeatReady = new Promise<{ kind: 'heartbeat' }>((resolve) => {
+          heartbeatTimer = setTimeout(() => resolve({ kind: 'heartbeat' }), keepAliveMs)
+        })
+        let raced: Awaited<typeof nextPromise> | { kind: 'heartbeat' } | { kind: 'aborted' }
+        try {
+          raced = await Promise.race([nextPromise, heartbeatReady, aborted])
         }
-        yield heartbeat()
-        continue
-      }
-
-      nextResult = raced.value
-      break
-    }
-
-    if (nextResult.done) {
-      break
-    }
-
-    const event = nextResult.value
-    eventCount++
-
-    // LLM 事件逐帧详情, 用 debug 级别 (用户可在 Output 面板切 Debug 看细节)
-    streamLogger.debug({
-      type: event.type,
-      n: eventCount,
-      ...('text' in event ? { text: (event as { text: string }).text } : {}),
-      ...('name' in event ? { name: (event as { name: string }).name } : {}),
-      ...('id' in event ? { id: (event as { id: string }).id } : {}),
-    }, '[LLM] event')
-
-    const sideFrames = onEvent?.(event)
-    if (sideFrames) {
-      if (Array.isArray(sideFrames)) { for (const f of sideFrames) yield f }
-      else yield sideFrames
-    }
-
-    switch (event.type) {
-      case 'thinking_delta':
-        if (!isThinking) {
-          isThinking = true
-          thinkingStartTime = Date.now()
+        finally {
+          clearTimeout(heartbeatTimer)
+          heartbeatTimer = undefined
         }
-        thinkingChars += event.text.length
-        lastContentTime = Date.now()
-        idleHintSent = false
-        yield thinkingDelta(event.text)
-        tokenCount++
-        if (tokenCount % 3 === 0)
-          yield tokenDelta(3)
-        break
+        lifecycle.signal.throwIfAborted()
+        if (raced.kind === 'aborted')
+          throw lifecycle.signal.reason
 
-      case 'thinking_done':
-        if (isThinking) {
-          // Cursor UI: durationMs < 500 显示 "Thought briefly"，>= 500 显示 "Thought for Xs"
-          yield thinkingCompleted(Date.now() - thinkingStartTime)
-          isThinking = false
+        if (raced.kind === 'heartbeat') {
+          // 空窗期 idle hint: 有内容产出后长时间无新事件 → 注入信号让客户端转到 "Generating response"
+          // 客户端状态机: streaming_text → (thinkingCompleted) → waiting_server_next → (heartbeat) → inference
+          if (!idleHintSent && textChars > 0 && Date.now() - lastContentTime >= IDLE_HINT_AFTER_MS) {
+            idleHintSent = true
+            yield thinkingCompleted(0)
+            streamLogger.debug('[LLM] idle hint: thinkingCompleted(0) injected')
+          }
+          yield heartbeat()
+          continue
         }
-        break
 
-      case 'text_delta':
-        textChars += event.text.length
-        lastContentTime = Date.now()
-        yield textDelta(event.text)
-        tokenCount++
-        if (tokenCount % 5 === 0)
-          yield tokenDelta(5)
-        break
-
-      case 'tool_use_start': {
-        lastContentTime = Date.now()
-        idleHintSent = false
-        const defaultModelCallId = `model-${stepId}`
-        const modelCallId = resolveToolModelCallId?.(event, defaultModelCallId) ?? defaultModelCallId
-        // null = 类型此刻不可判定 (CallDynamicTool),跳过预告帧,
-        // 由 toolCallStarted 一次给出准确类型 —— 见 mapPartialToolName 注释。
-        const partialType = mapPartialToolName(event.name)
-        if (partialType) {
-          streamLogger.debug({ callId: event.id, toolType: partialType, mcid: modelCallId }, '[EDIT_T] 0.partialToolCall{empty}')
-          yield partialToolCall(event.id, partialType, modelCallId)
-        }
-        else {
-          streamLogger.debug({ callId: event.id, llmToolName: event.name, mcid: modelCallId }, '[EDIT_T] 0.partialToolCall{skipped: type undecidable}')
-        }
-        tokenCount++
-        yield tokenDelta(1)
+        nextResult = raced.value
         break
       }
 
-      case 'tool_use_delta':
-        // 参数 token 流式传输
-        tokenCount++
-        if (tokenCount % 3 === 0)
-          yield tokenDelta(3)
-        break
-
-      case 'tool_use_done':
-        // tool_use block 完成，参数已完整
-        // 实际 toolCallStarted + exec 由 AgentService 处理
-        break
-
-      case 'done': {
-        yield stepCompleted(stepId, Date.now() - startTime)
-
-        // tool_use 时不发 turnEnded — 后续还有 tool call loop
-        // 只有 end_turn 时才发 turnEnded 表示本轮完成
-        if (event.stopReason !== 'tool_use') {
-          yield turnEnded(
-            event.usage.inputTokens,
-            event.usage.outputTokens,
-            event.usage.cacheReadTokens,
-            event.usage.cacheWriteTokens,
-          )
-        }
-
-        // 终端汇总
-        const dur = Date.now() - startTime
-        logger.info({
-          events: eventCount,
-          thinkingChars,
-          textChars,
-          stopReason: event.stopReason,
-          inputTokens: event.usage.inputTokens,
-          outputTokens: event.usage.outputTokens,
-          durationMs: dur,
-        }, `[LLM] stream done (${thinkingChars}t/${textChars}c in ${dur}ms, stop=${event.stopReason})`)
+      if (nextResult.done) {
+        sourceCompleted = true
         break
       }
+
+      const event = nextResult.value
+      eventCount++
+
+      // LLM 事件逐帧详情, 用 debug 级别 (用户可在 Output 面板切 Debug 看细节)
+      streamLogger.debug({
+        type: event.type,
+        n: eventCount,
+        ...('text' in event ? { text: (event as { text: string }).text } : {}),
+        ...('name' in event ? { name: (event as { name: string }).name } : {}),
+        ...('id' in event ? { id: (event as { id: string }).id } : {}),
+      }, '[LLM] event')
+
+      const sideFrames = onEvent?.(event)
+      if (sideFrames) {
+        if (Array.isArray(sideFrames)) { for (const frame of sideFrames) yield frame }
+        else yield sideFrames
+      }
+
+      switch (event.type) {
+        case 'thinking_delta':
+          if (!isThinking) {
+            isThinking = true
+            thinkingStartTime = Date.now()
+          }
+          thinkingChars += event.text.length
+          lastContentTime = Date.now()
+          idleHintSent = false
+          yield thinkingDelta(event.text)
+          tokenCount++
+          if (tokenCount % 3 === 0)
+            yield tokenDelta(3)
+          break
+
+        case 'thinking_done':
+          if (isThinking) {
+            // Cursor UI: durationMs < 500 显示 "Thought briefly"，>= 500 显示 "Thought for Xs"
+            yield thinkingCompleted(Date.now() - thinkingStartTime)
+            isThinking = false
+          }
+          break
+
+        case 'text_delta':
+          textChars += event.text.length
+          lastContentTime = Date.now()
+          yield textDelta(event.text)
+          tokenCount++
+          if (tokenCount % 5 === 0)
+            yield tokenDelta(5)
+          break
+
+        case 'tool_use_start': {
+          lastContentTime = Date.now()
+          idleHintSent = false
+          const defaultModelCallId = `model-${stepId}`
+          const modelCallId = resolveToolModelCallId?.(event, defaultModelCallId) ?? defaultModelCallId
+          // null = 类型此刻不可判定 (CallDynamicTool),跳过预告帧,
+          // 由 toolCallStarted 一次给出准确类型 —— 见 mapPartialToolName 注释。
+          const partialType = mapPartialToolName(event.name)
+          if (partialType) {
+            streamLogger.debug({ callId: event.id, toolType: partialType, mcid: modelCallId }, '[EDIT_T] 0.partialToolCall{empty}')
+            yield partialToolCall(event.id, partialType, modelCallId)
+          }
+          else {
+            streamLogger.debug({ callId: event.id, llmToolName: event.name, mcid: modelCallId }, '[EDIT_T] 0.partialToolCall{skipped: type undecidable}')
+          }
+          tokenCount++
+          yield tokenDelta(1)
+          break
+        }
+
+        case 'tool_use_delta':
+          // 参数 token 流式传输
+          tokenCount++
+          if (tokenCount % 3 === 0)
+            yield tokenDelta(3)
+          break
+
+        case 'tool_use_done':
+          // tool_use block 完成，参数已完整
+          // 实际 toolCallStarted + exec 由 AgentService 处理
+          break
+
+        case 'done': {
+          yield stepCompleted(stepId, Date.now() - startTime)
+
+          // tool_use 时不发 turnEnded — 后续还有 tool call loop
+          // 只有 end_turn 时才发 turnEnded 表示本轮完成
+          if (event.stopReason !== 'tool_use') {
+            yield turnEnded(
+              event.usage.inputTokens,
+              event.usage.outputTokens,
+              event.usage.cacheReadTokens,
+              event.usage.cacheWriteTokens,
+            )
+          }
+
+          // 终端汇总
+          const dur = Date.now() - startTime
+          logger.info({
+            events: eventCount,
+            thinkingChars,
+            textChars,
+            stopReason: event.stopReason,
+            inputTokens: event.usage.inputTokens,
+            outputTokens: event.usage.outputTokens,
+            durationMs: dur,
+          }, `[LLM] stream done (${thinkingChars}t/${textChars}c in ${dur}ms, stop=${event.stopReason})`)
+          break
+        }
+      }
     }
+  }
+  catch (error) {
+    lifecycle.abort(error)
+    throw error
+  }
+  finally {
+    if (!sourceCompleted)
+      lifecycle.abort()
+    clearTimeout(heartbeatTimer)
+    lifecycle.signal.removeEventListener('abort', notifyAbort)
+    if (!sourceCompleted)
+      await iterator.return?.()
   }
 }

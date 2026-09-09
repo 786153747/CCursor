@@ -21,10 +21,13 @@ export class UploadHandoff {
   private readonly conversations = new Map<string, Map<string, UploadEntry>>()
   private retainedBytes = 0
   private retainedEntries = 0
+  private retainedKeyBytes = 0
 
   constructor(private readonly options: {
     maxBytes?: number
     maxEntries?: number
+    /** Separate bound for hex keys and conversation identities, including empty values. */
+    maxKeyBytes?: number
     ttlMs?: number
     now?: () => number
   } = {}) {}
@@ -42,9 +45,12 @@ export class UploadHandoff {
         entries.delete(key)
         this.retainedBytes -= entry.bytes.byteLength
         this.retainedEntries--
+        this.retainedKeyBytes -= key.length
       }
-      if (entries.size === 0)
+      if (entries.size === 0) {
         this.conversations.delete(conversationId)
+        this.retainedKeyBytes -= Buffer.byteLength(conversationId)
+      }
     }
   }
 
@@ -56,19 +62,28 @@ export class UploadHandoff {
     const incoming = new Map<string, Uint8Array>()
     let additionalBytes = 0
     let additionalEntries = 0
+    let additionalKeyBytes = existing || chunk.blobs.length === 0 ? 0 : Buffer.byteLength(chunk.conversationId)
+    const keyBudget = this.options.maxKeyBytes ?? 8 * 1024 * 1024
+    if (this.retainedKeyBytes + additionalKeyBytes > keyBudget)
+      throw new ConnectError('Pre-run upload identity capacity exceeded', Code.ResourceExhausted)
     for (const blob of chunk.blobs) {
       if (blob.id.byteLength === 0)
         throw new ConnectError('Uploaded blob key is empty', Code.InvalidArgument)
-      const key = Buffer.from(blob.id).toString('hex')
+      if (blob.id.byteLength * 2 > keyBudget)
+        throw new ConnectError('Pre-run upload identity capacity exceeded', Code.ResourceExhausted)
+      const key = Buffer.from(blob.id.buffer, blob.id.byteOffset, blob.id.byteLength).toString('hex')
       const previous = incoming.get(key) ?? existing?.get(key)?.bytes
       if (previous) {
-        if (!Buffer.from(previous).equals(Buffer.from(blob.value)))
+        if (!Buffer.from(previous.buffer, previous.byteOffset, previous.byteLength).equals(blob.value))
           throw new ConnectError('Conflicting upload for the same conversation and blob key', Code.FailedPrecondition)
       }
       else {
         additionalBytes += blob.value.byteLength
         additionalEntries++
+        additionalKeyBytes += key.length
       }
+      if (this.retainedKeyBytes + additionalKeyBytes > keyBudget)
+        throw new ConnectError('Pre-run upload identity capacity exceeded', Code.ResourceExhausted)
       incoming.set(key, blob.value)
     }
     if (this.retainedBytes + additionalBytes > (this.options.maxBytes ?? 128 * 1024 * 1024)
@@ -78,16 +93,19 @@ export class UploadHandoff {
     const entries = existing ?? new Map<string, UploadEntry>()
     const expiresAt = this.now() + (this.options.ttlMs ?? 5 * 60_000)
     for (const [key, bytes] of incoming)
-      entries.set(key, { bytes: Uint8Array.from(bytes), expiresAt })
+      entries.set(key, { bytes: entries.get(key)?.bytes ?? Uint8Array.from(bytes), expiresAt })
     if (entries.size > 0)
       this.conversations.set(chunk.conversationId, entries)
     this.retainedBytes += additionalBytes
     this.retainedEntries += additionalEntries
+    this.retainedKeyBytes += additionalKeyBytes
   }
 
   read(conversationId: string, blobId: Uint8Array): Uint8Array | undefined {
+    if (blobId.byteLength * 2 > (this.options.maxKeyBytes ?? 8 * 1024 * 1024))
+      return undefined
     const entries = this.conversations.get(conversationId)
-    const key = Buffer.from(blobId).toString('hex')
+    const key = Buffer.from(blobId.buffer, blobId.byteOffset, blobId.byteLength).toString('hex')
     const entry = entries?.get(key)
     if (!entry)
       return undefined
@@ -95,8 +113,11 @@ export class UploadHandoff {
       entries!.delete(key)
       this.retainedBytes -= entry.bytes.byteLength
       this.retainedEntries--
-      if (entries!.size === 0)
+      this.retainedKeyBytes -= key.length
+      if (entries!.size === 0) {
         this.conversations.delete(conversationId)
+        this.retainedKeyBytes -= Buffer.byteLength(conversationId)
+      }
       return undefined
     }
     return Uint8Array.from(entry.bytes)

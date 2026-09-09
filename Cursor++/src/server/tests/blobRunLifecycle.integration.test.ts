@@ -8,7 +8,7 @@ import { create, toBinary, toJson } from '@bufbuild/protobuf'
 import { ConnectError } from '@connectrpc/connect'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { getPersistedConversationCheckpoint, persistConversationCheckpoint } from '../database/checkpoints'
-import { getAgentDatabase, resetAgentDatabaseForTests } from '../database/sqlite'
+import { getCheckpointDatabase, resetAgentDatabaseForTests } from '../database/sqlite'
 import { queryUsageStats, recordModelUsage } from '../database/usageStats'
 import {
   AgentMode,
@@ -168,13 +168,13 @@ async function settleRuntime(): Promise<void> {
   await new Promise<void>(resolve => setImmediate(resolve))
 }
 
-async function seedPreviousCheckpoint(conversationId: string, roots: ClientBlobFixture[]) {
+async function seedPreviousCheckpoint(conversationId: string, roots: ClientBlobFixture[], turns: ClientBlobFixture[] = [], archives: ClientBlobFixture[] = []) {
   const previous = {
     conversationId,
     kind: 'committed' as const,
     rootBlobIds: roots.map(fixture => blobIdFromBytes(fixture.blobId)),
-    turnBlobIds: [],
-    summaryArchiveIds: [],
+    turnBlobIds: turns.map(fixture => blobIdFromBytes(fixture.blobId)),
+    summaryArchiveIds: archives.map(fixture => blobIdFromBytes(fixture.blobId)),
     tokenDetails: { usedTokens: 1234, maxTokens: 200_000 },
     mode: 'AGENT_MODE_AGENT',
     updatedAt: 123456,
@@ -236,8 +236,8 @@ describe('handleRunRequest required client history', () => {
     it.each(invalidRoots)(`${action} rejects $name roots before provider I/O and preserves the prior checkpoint`, async ({ bytes }) => {
       const conversationId = randomUUID()
       const oldRoots = simpleHistory()
-      const previous = await seedPreviousCheckpoint(conversationId, oldRoots)
       const required = { blobId: Buffer.from('required-history-root'), bytes: bytes ?? new Uint8Array() }
+      const previous = await seedPreviousCheckpoint(conversationId, [...oldRoots, required])
       const client = startClient(
         requestFor({ conversationId, roots: [...oldRoots, required], action }),
         new BlobTestClient([...oldRoots, ...(bytes === undefined ? [] : [required])]),
@@ -277,8 +277,8 @@ describe('registered agent service bidi output lifetime', () => {
   it('returns diagnostic history failure while the client input stream remains open', async () => {
     const conversationId = randomUUID()
     const roots = simpleHistory()
-    const previous = await seedPreviousCheckpoint(conversationId, roots)
     const missingRoot = messageFixture({ role: 'user', content: 'Required but absent on the client.' })
+    const previous = await seedPreviousCheckpoint(conversationId, [...roots, missingRoot])
     const client = new BlobTestClient(roots)
     const input = startServiceClient(requestFor({ conversationId, roots: [...roots, missingRoot] }), client)
     try {
@@ -330,12 +330,12 @@ describe('registered agent service bidi output lifetime', () => {
 })
 
 describe('handleRunRequest client save barrier', () => {
-  it.each([false, true])('handles cancellation during an acknowledged metadata write without hiding restoration failures (restore fails: %s)', async (restoreFails) => {
+  it.each([false, true])('preserves the actual SQL outcome when cancellation races completion (write fails: %s)', async (writeFails) => {
     const conversationId = randomUUID()
     const roots = simpleHistory()
     const previous = await seedPreviousCheckpoint(conversationId, roots)
     const unrelatedPrevious = await seedPreviousCheckpoint(randomUUID(), roots)
-    const database = getAgentDatabase()
+    const database = getCheckpointDatabase()
     const readCheckpointRow = () => database.get<Record<string, unknown>>(
       'SELECT * FROM conversation_checkpoints WHERE conversation_id = ? AND kind = ?',
       [conversationId, 'committed'],
@@ -354,6 +354,11 @@ describe('handleRunRequest client save barrier', () => {
       if (!shouldHold)
         return originalRun(sql, parameters)
       heldInsert = true
+      if (writeFails) {
+        insertFinished.resolve()
+        await releaseInsertCallback.promise
+        throw new Error('checkpoint write failed')
+      }
       // SQLite performs the real INSERT. Delay only notification of completion,
       // reproducing cancellation while the awaited callback is still pending.
       const result = await originalRun(sql, parameters)
@@ -372,7 +377,10 @@ describe('handleRunRequest client save barrier', () => {
       expect(client.setRequests.length).toBeGreaterThan(0)
       expect(client.pendingSets.size).toBe(0)
       expect(client.checkpoints).toHaveLength(0)
-      expect(await readCheckpointRow()).not.toEqual(previousRow)
+      if (writeFails)
+        expect(await readCheckpointRow()).toEqual(previousRow)
+      else
+        expect(await readCheckpointRow()).not.toEqual(previousRow)
 
       const usageModelId = `usage-during-checkpoint-${randomUUID()}`
       await recordModelUsage({
@@ -382,25 +390,22 @@ describe('handleRunRequest client save barrier', () => {
         apiModel: 'independent-model',
         usage: { inputTokens: 17, outputTokens: 9 },
       })
-      if (restoreFails) {
-        await database.exec(`
-          CREATE TRIGGER reject_cancelled_checkpoint_restore
-          BEFORE UPDATE ON conversation_checkpoints
-          BEGIN SELECT RAISE(ABORT, 'checkpoint restoration failed'); END;
-        `)
-      }
       client.cancel()
       releaseInsertCallback.resolve()
       const outcome = await client.completion
-      if (restoreFails) {
+      if (writeFails) {
         expect(outcome.error).toBeInstanceOf(Error)
-        expect((outcome.error as Error).message).toContain('checkpoint restoration failed')
-        expect(await readCheckpointRow()).not.toEqual(previousRow)
+        expect((outcome.error as Error).message).toContain('checkpoint write failed')
+        expect(await readCheckpointRow()).toEqual(previousRow)
+        expect(await getPersistedConversationCheckpoint(conversationId)).toEqual(previous)
       }
       else {
         expect(outcome).toEqual({})
-        expect(await readCheckpointRow()).toEqual(previousRow)
-        expect(await getPersistedConversationCheckpoint(conversationId)).toEqual(previous)
+        expect(await readCheckpointRow()).not.toEqual(previousRow)
+        const accepted = await getPersistedConversationCheckpoint(conversationId)
+        expect(accepted?.rootBlobIds.length).toBeGreaterThan(previous.rootBlobIds.length)
+        expect(accepted?.turnBlobIds).toHaveLength(1)
+        expect(client.pendingSets.size).toBe(0)
       }
       expect(await getPersistedConversationCheckpoint(conversationId, 'draft')).toBeNull()
       expect(await getPersistedConversationCheckpoint(unrelatedPrevious.conversationId)).toEqual(unrelatedPrevious)
@@ -418,8 +423,6 @@ describe('handleRunRequest client save barrier', () => {
       client.cancel()
       await client.completion
       interceptInsert.mockRestore()
-      if (restoreFails)
-        await database.exec('DROP TRIGGER IF EXISTS reject_cancelled_checkpoint_restore')
     }
   })
 
@@ -549,8 +552,8 @@ describe('handleRunRequest run-local lifetime', () => {
   it.each(['missing', 'corrupt'] as const)('rejects a %s resume turn before provider I/O without replacing the checkpoint', async (failure) => {
     const conversationId = randomUUID()
     const roots = simpleHistory()
-    const previous = await seedPreviousCheckpoint(conversationId, roots)
     const oldTurn = oldTurnFixtures()
+    const previous = await seedPreviousCheckpoint(conversationId, roots, [oldTurn.turn])
     const fixtures = [...roots, oldTurn.user, oldTurn.thinking, oldTurn.assistant]
     if (failure === 'corrupt')
       fixtures.push({ blobId: oldTurn.turn.blobId, bytes: Uint8Array.from([0x0A, 0xFF]) })
@@ -636,7 +639,7 @@ describe('agent service upload/fork handoff into handleRunRequest', () => {
     for (const [index, fixture] of earlier.fixtures.entries())
       expect(Buffer.from(fixture.bytes)).not.toEqual(Buffer.from(latest.fixtures[index]!.bytes))
 
-    const previous = await seedPreviousCheckpoint(conversationId, roots)
+    const previous = await seedPreviousCheckpoint(conversationId, roots, [earlier.turn, latest.turn], [archive])
     const client = new BlobTestClient(uploadedFixtures)
     await client.notifyClone(handlers.notifyConversationClone, conversationId, randomUUID())
     await client.uploadChunk(handlers.uploadConversationBlobs, {
@@ -707,6 +710,8 @@ describe('agent service upload/fork handoff into handleRunRequest', () => {
     expect(new Set(coldClient.getRequests.map(request => wireKey(request.blobId)))).toEqual(new Set([
       ...checkpoint.rootPromptMessagesJson.map(wireKey),
       wireKey(checkpoint.turns.at(-1)!),
+      wireKey(graph.turns[1]!.turn.userMessage),
+      ...graph.turns[1]!.turn.steps.map(wireKey),
     ]))
     const uploadedKeys = new Set(uploadedFixtures.map(fixture => wireKey(fixture.blobId)))
     expect(coldClient.setRequests.some(request => uploadedKeys.has(wireKey(request.blobId)))).toBe(false)
@@ -726,7 +731,7 @@ describe('agent service upload/fork handoff into handleRunRequest', () => {
     const conversationId = randomUUID()
     const roots = simpleHistory()
     const oldTurn = oldTurnFixtures(true)
-    const previous = await seedPreviousCheckpoint(conversationId, roots)
+    const previous = await seedPreviousCheckpoint(conversationId, roots, [oldTurn.turn])
     const client = new BlobTestClient([...roots, ...oldTurn.fixtures])
     await client.notifyClone(handlers.notifyConversationClone, conversationId, randomUUID())
     const chunks = [[oldTurn.turn], [oldTurn.thinking, oldTurn.assistant], [oldTurn.user]]
@@ -780,6 +785,8 @@ describe('agent service upload/fork handoff into handleRunRequest', () => {
     for (const fixture of oldTurn.fixtures)
       expect(Buffer.from(client.read(fixture.blobId))).toEqual(Buffer.from(fixture.bytes))
 
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(Date.now() + 5 * 60_000 + 1)
     providerScript = () => answer('Cold resumed fork answer.')
     const coldClient = startClient(requestFor({ conversationId, checkpoint, action: 'resume' }), client.fork())
     expect(await coldClient.completion).toEqual({})
@@ -789,6 +796,8 @@ describe('agent service upload/fork handoff into handleRunRequest', () => {
     expect(new Set(coldClient.getRequests.map(request => wireKey(request.blobId)))).toEqual(new Set([
       ...checkpoint.rootPromptMessagesJson.map(wireKey),
       ...checkpoint.turns.map(wireKey),
+      wireKey(resumed.turn.userMessage),
+      ...resumed.turn.steps.map(wireKey),
     ]))
     const coldCheckpoint = await expectCheckpointMatchesClient(conversationId, coldClient)
     const coldTurn = coldClient.assertCheckpointResolvable(coldCheckpoint).turns[0]!
@@ -803,7 +812,7 @@ describe('agent service upload/fork handoff into handleRunRequest', () => {
     const conversationId = randomUUID()
     const roots = simpleHistory()
     const oldTurn = oldTurnFixtures(true)
-    const previous = await seedPreviousCheckpoint(conversationId, roots)
+    const previous = await seedPreviousCheckpoint(conversationId, roots, [oldTurn.turn])
     const olderClient = new BlobTestClient([...roots, ...oldTurn.fixtures])
     await olderClient.notifyClone(handlers.notifyConversationClone, conversationId, randomUUID())
     await olderClient.uploadChunk(handlers.uploadConversationBlobs, {
@@ -885,6 +894,55 @@ function compactionHistory() {
 }
 
 describe('handleRunRequest compaction lifecycle', () => {
+  it('aborts inline summary I/O without another attempt, fallback, model round or checkpoint', async () => {
+    const conversationId = randomUUID()
+    const { fixtures } = compactionHistory()
+    const previous = await seedPreviousCheckpoint(conversationId, fixtures)
+    const summaryStarted = deferredSignal()
+    let summarySignal: AbortSignal | undefined
+    let summaryFinalized = false
+    providerScript = (request) => {
+      if (request.conversationId) {
+        return (async function* (): AsyncIterable<LLMStreamEvent> {
+          yield { type: 'tool_use_start', id: 'inline-cancel-read', name: 'Read' }
+          yield { type: 'tool_use_delta', id: 'inline-cancel-read', input: '{"path":"/fixture/current.ts"}' }
+          yield { type: 'tool_use_done', id: 'inline-cancel-read' }
+          yield { type: 'done', usage: { inputTokens: 63_000, outputTokens: 200 }, stopReason: 'tool_use' }
+        })()
+      }
+      return (async function* (): AsyncIterable<LLMStreamEvent> {
+        summarySignal = request.signal
+        const aborted = deferredSignal()
+        const onAbort = () => aborted.resolve()
+        request.signal!.addEventListener('abort', onAbort, { once: true })
+        summaryStarted.resolve()
+        try {
+          await aborted.promise
+          request.signal!.throwIfAborted()
+        }
+        finally {
+          request.signal!.removeEventListener('abort', onAbort)
+          summaryFinalized = true
+        }
+      })()
+    }
+    vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] })
+    const client = startClient(requestFor({ conversationId, roots: fixtures, contextTokenLimit: 64_000 }), new BlobTestClient(fixtures))
+    await summaryStarted.promise
+    const acceptedDraft = await getPersistedConversationCheckpoint(conversationId, 'draft')
+    expect(acceptedDraft).not.toBeNull()
+    expect(client.checkpoints).toHaveLength(1)
+    client.cancel()
+    expect(await client.completion).toEqual({})
+    expect(summarySignal?.aborted).toBe(true)
+    expect(summaryFinalized).toBe(true)
+    expect(providerRequests).toHaveLength(2)
+    expect(client.checkpoints).toHaveLength(1)
+    expect(await getPersistedConversationCheckpoint(conversationId)).toEqual(previous)
+    expect(await getPersistedConversationCheckpoint(conversationId, 'draft')).toEqual(acceptedDraft)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('preserves an opaque client history key in the new summary archive dependencies', async () => {
     const conversationId = randomUUID()
     const roots = simpleHistory()

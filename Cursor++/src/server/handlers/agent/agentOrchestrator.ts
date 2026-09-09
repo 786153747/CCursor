@@ -3,8 +3,8 @@ import { collectExtraContextBlobIds, parseRunRequest, resolveExtraContextBlobs }
 import type { AgentSession } from './session';
 import { handleSummarizeAction } from './summarizeRuntime';
 import { handleConversationRun } from './conversationRuntime';
-import { getPersistedConversationCheckpoint } from '../../database/checkpoints';
-import { binaryBlobDataFromClientBytes, blobIdToBytes } from './blob';
+import { beginCheckpointWriteScope, CheckpointConflictError, hasMatchingCheckpointReferences } from '../../database/checkpoints';
+import { binaryBlobDataFromClientBytes, blobIdFromBytes, blobIdToBytes } from './blob';
 import { BlobRunContext } from './runContext';
 import { BlobIntegrityError } from './blobErrors';
 import { uploadHandoff } from './uploadHandoff';
@@ -15,6 +15,8 @@ import { applyRequestContextPart, type RequestContextPartName } from './requestC
 import { makeByokConnectError } from '../errors';
 import { ErrorDetails_Error } from '../../gen/aiserver_v1_shared_pb';
 import { claimUploadedConversationBlobs } from './uploadRunHandoff';
+import { processRunResources } from './runResources';
+import { throwIfBlobRunInactive } from './checkpointManager';
 
 export async function* handleRunRequest(
     msg: Record<string, unknown>,
@@ -22,39 +24,39 @@ export async function* handleRunRequest(
 ): AsyncIterable<AgentServerMessage> {
     const parsed = parseRunRequest(msg);
     const run = new BlobRunContext(session, {
+        conversationId: parsed.conversationId,
+        resourceBudget: processRunResources,
         inheritedBlobIds: [...parsed.historyBlobIds, ...parsed.historyTurnBlobIds, ...parsed.historySummaryArchiveIds],
     });
 
     try {
-        claimUploadedConversationBlobs(parsed, run);
-
-        const persistedCheckpoint = await getPersistedConversationCheckpoint(parsed.conversationId);
-        if (persistedCheckpoint) {
-            // 客户端是 source of truth。sqlite checkpoint 仅用于 auto-summarize 持久化,
-            // 不用于覆盖客户端的 conversationState。
-            const clientSentHistory = parsed.historyBlobIds.length > 0;
-
-            if (!clientSentHistory) {
-                // 客户端是 source of truth — 发空就用空, 不从 sqlite 恢复。
-                // 空 CS 场景: revert / 新会话。跨模型切换时客户端始终携带 history (日志实证)。
-                // sqlite checkpoint 保留不删, 仅用于 auto-summarize 和灾难恢复备份。
-                logger.info({
-                    conversationId: parsed.conversationId,
-                    persistedBlobIds: persistedCheckpoint.rootBlobIds.length,
-                }, '[AGENT] empty conversationState with existing checkpoint — trusting client, skipping restore');
-            } else {
-                // 客户端主动回传了历史 blob → 以客户端为 source of truth。
-                // 只在客户端未携带 tokenDetails 时补充一下 sqlite 里缓存的值, 避免上下文用量显示跳变。
-                // 注意: summaryArchiveIds 也不做 fallback, 因为客户端已经决定了本轮要带哪些 summary。
-                if (!parsed.historyTokenDetails) {
-                    parsed.historyTokenDetails = persistedCheckpoint.tokenDetails;
-                    logger.debug({
-                        conversationId: parsed.conversationId,
-                        tokenDetails: parsed.historyTokenDetails,
-                    }, '[AGENT] merged tokenDetails from sqlite (client did not provide)');
-                }
-            }
+        run.checkpointWriteScope = await beginCheckpointWriteScope(parsed.conversationId, { signal: run.signal });
+        if (run.checkpointWriteScope.hasAmbiguousLegacyPair) {
+            logger.warn({ conversationId: parsed.conversationId }, '[AGENT] legacy draft and committed checkpoints diverge; explicit fork required');
+            throw new CheckpointConflictError(parsed.conversationId);
         }
+        if (run.checkpointWriteScope.isDeleted)
+            throw new CheckpointConflictError(parsed.conversationId);
+        const { committedCheckpoint: persistedCheckpoint, draftCheckpoint } = run.checkpointWriteScope;
+        const latestCheckpoint = draftCheckpoint ?? persistedCheckpoint;
+        const incomingReferences = {
+            rootBlobIds: parsed.historyBlobIds,
+            turnBlobIds: parsed.historyTurnBlobIds,
+            summaryArchiveIds: parsed.historySummaryArchiveIds,
+        };
+        if (latestCheckpoint && !hasMatchingCheckpointReferences(latestCheckpoint, incomingReferences)) {
+            // The wire has no client checkpoint epoch or explicit revert intent.
+            // Do not declare a different client branch newer merely because it arrived later.
+            throw new CheckpointConflictError(parsed.conversationId);
+        }
+        yield* claimUploadedConversationBlobs(parsed, run);
+
+        // The client still owns prompt bytes. Only matching checkpoint metadata is reused.
+        if (latestCheckpoint && !parsed.historyTokenDetails) {
+            parsed.historyTokenDetails = latestCheckpoint.tokenDetails;
+        }
+
+        logger.debug({ conversationId: parsed.conversationId, runId: parsed.runId, requestId: session?.requestId }, '[AGENT] checkpoint write scope admitted');
 
         // Explicitly attached context is required, unlike optional capability
         // catalogs below. Never replace a missing attachment with a prompt marker.
@@ -105,11 +107,44 @@ export async function* handleRunRequest(
             });
             partReferences.forEach((reference, index) => {
                 const result = partBytes[index]!;
-                if (result.status !== 'ok')
-                    logger.warn({ partName: reference.partName, status: result.status }, '[AGENT] optional request context catalog unavailable');
-                applyRequestContextPart(parsed, reference.partName, result.status === 'ok' ? result.bytes : null);
+                throwIfBlobRunInactive(run);
+                const restored = result.status === 'ok'
+                    && applyRequestContextPart(parsed, reference.partName, result.bytes);
+                if (restored)
+                    return;
+                // Rules and MCP parts can carry instructions, not just discovery.
+                // Skills/subagents here are catalogs; explicit attachments are inline
+                // or required extra-context references handled above.
+                const required = reference.partName === 'rules' || reference.partName === 'mcps'
+                    || (reference.partName === 'subagents' && parsed.selectedSubagents.some(selected =>
+                        !parsed.customSubagents.some(subagent => subagent.name === selected.name)));
+                const status = result.status === 'ok' ? 'decode-error' : result.status;
+                if (required) {
+                    const contextError = new BlobIntegrityError([{
+                        blobId: blobIdFromBytes(reference.blobId), status,
+                        message: `Required ${reference.partName} context has no complete inline copy; refusing generation`,
+                    }]);
+                    contextError.message = `Required ${reference.partName} context is unavailable (${status}) and has no complete inline copy; refusing generation`;
+                    logger.error({ partName: reference.partName, status }, '[AGENT] required request context unavailable; generation stopped');
+                    throw contextError;
+                }
+                logger.warn({
+                    partName: reference.partName, status,
+                    unavailableCapability: reference.partName === 'skills' ? 'automatic skill discovery' : 'custom subagent discovery',
+                    inlineAttachmentsPreserved: true,
+                }, '[AGENT] optional request context catalog unavailable; discovery degraded');
             });
         }
+
+        const missingSelectedSubagents = parsed.selectedSubagents.filter(selected =>
+            !parsed.customSubagents.some(subagent => subagent.name === selected.name));
+        if (missingSelectedSubagents.length) {
+            throw new BlobIntegrityError(missingSelectedSubagents.map(selected => ({
+                blobId: `(selected subagent ${selected.name})`, status: 'not-found',
+                message: 'Explicitly selected subagent definition is unavailable',
+            })));
+        }
+        throwIfBlobRunInactive(run);
 
         if (parsed.isSummarize) {
             yield* handleSummarizeAction(parsed, session, run);
@@ -124,6 +159,16 @@ export async function* handleRunRequest(
 
         yield* handleConversationRun(parsed, session, run);
     } catch (error) {
+        if (error instanceof CheckpointConflictError) {
+            throw makeByokConnectError({
+                errorCode: ErrorDetails_Error.CUSTOM,
+                title: 'Checkpoint version conflict; history preserved',
+                detail: `${error.message} The client epoch is not transmitted. This may be a reset/deletion, delayed run, legacy divergent pair, or retry after an accepted checkpoint was not applied. Fork the desired client state into a new conversation; reopening alone may not resolve the gap. Histories are never merged automatically.`,
+                isRetryable: false,
+                additionalInfo: { conversationId: parsed.conversationId, errorClass: error.name },
+                cause: error,
+            });
+        }
         const isBlobCancellation = error instanceof BlobIntegrityError
             && error.failures.length > 0
             && error.failures.every(failure => failure.status === 'cancelled');
