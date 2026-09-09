@@ -1,5 +1,5 @@
 import { create, toBinary } from '@bufbuild/protobuf'
-import { expect, it } from 'vitest'
+import { afterEach, expect, it } from 'vitest'
 import {
   RequestContextRulesPartSchema,
   RequestContextSkillsPartSchema,
@@ -18,7 +18,16 @@ import {
   decodeSkillsPart,
   decodeSubagentsPart,
 } from '../handlers/agent/requestContextParts'
+import { BlobRunContext } from '../handlers/agent/runContext'
 import { createEphemeralSession, pushSessionMessage } from '../handlers/agent/session'
+
+const activeRuns: BlobRunContext[] = []
+
+afterEach(() => {
+  for (const run of activeRuns)
+    run.dispose()
+  activeRuns.length = 0
+})
 
 /**
  * Cursor 3.13+ requestContextParts 分片投递 (ref_only 模式) 兼容。
@@ -157,18 +166,16 @@ it('fetches all Part blobs in one KV batch and decodes each protobuf', async () 
 
   // 客户端并发回包, 顺序与请求无关; JSON transport (SSE 降级) 把 bytes 编成 base64 string
   const session = createEphemeralSession('parts-batch')
+  const run = new BlobRunContext(session)
+  activeRuns.push(run)
   const clientStore = new Map<string, Uint8Array>([
     ['1', rulesBytes],
     ['2', skillsBytes],
     ['3', subagentsBytes],
   ])
   const generator = fetchBlobsFromClient({
-    session,
+    run,
     blobIds: [new Uint8Array([1]), new Uint8Array([2]), new Uint8Array([3])],
-    allocateBlobId: (() => {
-      let next = 900_000
-      return () => next++
-    })(),
   })
   const sentRequests: Array<{ id: number, blobKey: string }> = []
   let step = await generator.next()
@@ -191,7 +198,13 @@ it('fetches all Part blobs in one KV batch and decodes each protobuf', async () 
     }
     step = await generator.next()
   }
-  const [fetchedRules, fetchedSkills, fetchedSubagents] = step.value
+  const fetchedBytes = step.value.map((result) => {
+    expect(result.status).toBe('ok')
+    if (result.status !== 'ok')
+      throw new Error(`Required Part fetch failed: ${result.status}`)
+    return result.bytes
+  })
+  const [fetchedRules, fetchedSkills, fetchedSubagents] = fetchedBytes
 
   expect(sentRequests.map(request => request.id)).toEqual([900_000, 900_001, 900_002])
   expect(decodeRulesPart(fetchedRules!)).toMatchObject({

@@ -2,6 +2,8 @@ import type { IdeFile, ParsedCursorRule, ParsedRunRequest } from './types'
 import { listKnowledgeItems } from '../../../config/knowledgeBaseStore'
 import { logger } from '../../../logger'
 import { emptyParsed, toBytes } from './shared'
+import { blobIdFromBytes } from '../blob'
+import { BlobIntegrityError } from '../blobErrors'
 import {
   categorizeCursorRules,
   isSkillPath,
@@ -19,6 +21,19 @@ type ParsedBackgroundTaskCompletion = {
   detail?: string
   outputPath?: string
   threadId?: string
+}
+
+function parseBlobReferences(value: unknown): string[] {
+  if (value === undefined || value === null)
+    return []
+  if (!Array.isArray(value))
+    throw new BlobIntegrityError([{ blobId: '(reference list)', status: 'invalid-reference' }])
+  return value.map((reference) => {
+    const bytes = toBytes(reference)
+    if (!bytes?.byteLength)
+      throw new BlobIntegrityError([{ blobId: '(empty reference)', status: 'invalid-reference' }])
+    return blobIdFromBytes(bytes)
+  })
 }
 
 function normalizeBackgroundTaskKind(value: unknown): string {
@@ -683,9 +698,9 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
     if (e.blobId) {
       const raw = e.blobId
       const blobId = raw instanceof Uint8Array
-        ? Buffer.from(raw).toString('utf-8')
+        ? blobIdFromBytes(raw)
         : typeof raw === 'string'
-          ? (() => { try { return Buffer.from(raw, 'base64').toString('utf-8') } catch { return raw } })()
+          ? blobIdFromBytes(Buffer.from(raw, 'base64'))
           : ''
       return { blobId }
     }
@@ -696,7 +711,7 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
     }
     if (dob?.case === 'blobId' && dob.value) {
       const blobId = dob.value instanceof Uint8Array
-        ? Buffer.from(dob.value).toString('utf-8')
+        ? blobIdFromBytes(dob.value)
         : String(dob.value)
       return { blobId }
     }
@@ -872,72 +887,10 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
     // ConversationState (runRequest) 中是 string[] (T:9)。
     // protobuf-es 将 bytes → string 时做了 base64 encode,
     // 所以收到的 string 需要 base64 decode 还原为原始 blobId。
-    historyBlobIds: (() => {
-      const raw = conversationState?.rootPromptMessagesJson
-      if (!raw || !Array.isArray(raw))
-        return []
-      const ids = raw.map((v: unknown) => {
-        if (typeof v !== 'string')
-          return String(v)
-        // base64 decode: Server 存入 TextEncoder.encode(blobId) → bytes,
-        // Client 回传时 protobuf-es 对 bytes 做 base64 → 这里 decode 还原
-        try {
-          return Buffer.from(v, 'base64').toString('utf-8')
-        }
-        catch {
-          return v
-        }
-      })
-      if (ids.length > 0) {
-        logger.debug({ first: ids[0], count: ids.length }, '[SESSION] historyBlobIds extracted')
-      }
-      return ids
-    })(),
-    historyTurnBlobIds: (() => {
-      const raw = conversationState?.turns
-      if (!raw || !Array.isArray(raw))
-        return []
-      return raw.map((v: unknown) => {
-        if (typeof v !== 'string')
-          return String(v)
-        try {
-          return Buffer.from(v, 'base64').toString('utf-8')
-        }
-        catch {
-          return v
-        }
-      })
-    })(),
-    historyTurns: (() => {
-      const raw = conversationState?.turns
-      if (!raw || !Array.isArray(raw))
-        return []
-      return raw.map((v: unknown) => {
-        if (typeof v !== 'string')
-          return String(v)
-        try {
-          return Buffer.from(v, 'base64').toString('utf-8')
-        }
-        catch {
-          return v
-        }
-      })
-    })(),
-    historySummaryArchiveIds: (() => {
-      const raw = conversationState?.summaryArchives
-      if (!raw || !Array.isArray(raw))
-        return []
-      return raw.map((v: unknown) => {
-        if (typeof v !== 'string')
-          return String(v)
-        try {
-          return Buffer.from(v, 'base64').toString('utf-8')
-        }
-        catch {
-          return v
-        }
-      })
-    })(),
+    historyBlobIds: parseBlobReferences(conversationState?.rootPromptMessagesJson),
+    historyTurnBlobIds: parseBlobReferences(conversationState?.turns),
+    historyTurns: parseBlobReferences(conversationState?.turns),
+    historySummaryArchiveIds: parseBlobReferences(conversationState?.summaryArchives),
     historyTokenDetails: (() => {
       const tokenDetails = conversationState?.tokenDetails as Record<string, unknown> | undefined
       if (!tokenDetails)

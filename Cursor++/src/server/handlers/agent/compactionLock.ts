@@ -41,13 +41,23 @@ export function tryAcquireCompactionLock(conversationId: string): boolean {
 }
 
 /** 等待锁释放 (不获取 — summarizeAction 释放后重新评估是否仍需压缩) */
-export function waitForCompactionLockRelease(conversationId: string): Promise<void> {
+export function waitForCompactionLockRelease(conversationId: string, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted)
+        return Promise.resolve();
     const entry = getOrCreateLock(conversationId);
     if (!entry.held)
         return Promise.resolve();
     contentionCounts.set(conversationId, (contentionCounts.get(conversationId) ?? 0) + 1);
     return new Promise((resolve) => {
-        entry.waiters.push(resolve);
+        const finish = (): void => {
+            signal?.removeEventListener('abort', finish);
+            const waiterIndex = entry.waiters.indexOf(finish);
+            if (waiterIndex >= 0)
+                entry.waiters.splice(waiterIndex, 1);
+            resolve();
+        };
+        entry.waiters.push(finish);
+        signal?.addEventListener('abort', finish, { once: true });
     });
 }
 

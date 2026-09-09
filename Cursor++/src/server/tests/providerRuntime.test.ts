@@ -7,7 +7,6 @@ import { expect, it } from 'vitest'
 import { getPersistedConversationCheckpoint, persistConversationCheckpoint } from '../database/checkpoints'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
 import { AgentServerMessageSchema } from '../gen/agent_v1_pb'
-import { resetBlobCacheForTests } from '../handlers/agent/blobStore'
 import { checkpoint, kvMessage, summary, summaryCompleted, summaryStarted } from '../handlers/agent/stream'
 import { finalizeToolCall } from '../handlers/agent/toolLifecycle'
 import { addUsage, clampTokenDetails, computeContextUsagePercent, emptyUsageTotals, estimateContextTokens, shouldTriggerCompaction } from '../handlers/agent/usage'
@@ -339,14 +338,12 @@ async function withTempAgentDatabase(run: () => Promise<void>): Promise<void> {
   const prevDbPath = process.env.BYOK_AGENT_DB_PATH
   const tempDir = mkdtempSync(join(tmpdir(), 'cursor-byok-agent-db-'))
   process.env.BYOK_AGENT_DB_PATH = join(tempDir, 'cursor.db')
-  resetBlobCacheForTests()
   await resetAgentDatabaseForTests()
 
   try {
     await run()
   }
   finally {
-    resetBlobCacheForTests()
     await resetAgentDatabaseForTests()
     if (prevDbPath === undefined)
       delete process.env.BYOK_AGENT_DB_PATH

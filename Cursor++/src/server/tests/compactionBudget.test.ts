@@ -14,7 +14,7 @@ import { getSpillDir } from '../config/paths'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
 import { ConversationSummaryArchiveSchema } from '../gen/agent_v1_pb'
 import { encodeBlob } from '../handlers/agent/blob'
-import { cacheBlob, resetBlobCacheForTests } from '../handlers/agent/blobStore'
+import { RunBlobStore } from '../handlers/agent/blobStore'
 import { getCompactionContentionCount, releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from '../handlers/agent/compactionLock'
 import {
   buildSummarySource,
@@ -27,10 +27,11 @@ import {
   generateSummaryWithFallback,
   measureMessagesTokens,
   planCompaction,
+  retainCompactionArtifacts,
 } from '../handlers/agent/compactionStrategy'
 import { CONTEXT_LENGTH_RETRY_MAX } from '../handlers/agent/constants'
 import { HEARTBEAT_TICK, pumpWithTimedHeartbeats } from '../handlers/agent/conversationRuntime'
-import { hydrateHistoryEntries, isSummaryBlobMessage, repairHistoryEntries } from '../handlers/agent/historyManager'
+import { hydrateHistoryEntries, isSummaryBlobMessage, repairHistoryEntries, retainHistoryEntries } from '../handlers/agent/historyManager'
 import { countTokens } from '../handlers/agent/tokenCounter'
 import {
   buildTaskToolResultText,
@@ -48,7 +49,6 @@ export function makeBlobEntry(
 ): HistoryEntry {
   const raw: Record<string, unknown> = { role, content, ...extra }
   const blob = encodeBlob(raw)
-  cacheBlob(blob.blobId, blob.blobData)
   const message: LLMMessage = { role, content }
   if (typeof extra?.toolCallId === 'string')
     message.toolCallId = extra.toolCallId
@@ -60,6 +60,7 @@ export function makeBlobEntry(
     message.providerOptions = extra.providerOptions as Record<string, unknown>
   return {
     blobId: blob.blobId,
+    blobData: blob.blobData,
     raw,
     message,
   }
@@ -124,12 +125,10 @@ beforeEach(async () => {
   tmpDbPath = `/tmp/.tmp-compaction-budget-${Date.now()}-${Math.random().toString(36).slice(2)}.db`
   process.env.BYOK_AGENT_DB_PATH = tmpDbPath
   await resetAgentDatabaseForTests()
-  resetBlobCacheForTests()
 })
 
 afterEach(async () => {
   await resetAgentDatabaseForTests()
-  resetBlobCacheForTests()
   delete process.env.BYOK_AGENT_DB_PATH
   for (const suffix of ['', '-wal', '-shm']) {
     try {
@@ -678,6 +677,7 @@ describe('#5/#6 图片豁免与占位符内容', () => {
 
 describe('#8/#9 多轮不退化与两路一致', () => {
   it('#8 连续 3 次压缩: 地板不单调上升, archive 不含重复条目', () => {
+    const store = new RunBlobStore()
     let entries: HistoryEntry[] = [
       ...makeLeadingEntries(),
       makeBlobEntry('user', makeVariedTokenText(800)),
@@ -688,6 +688,7 @@ describe('#8/#9 多轮不退化与两路一致', () => {
     const floorHistory: number[] = []
     const archivedBlobIdsAcrossRounds = new Set<string>()
     for (let round = 0; round < 3; round++) {
+      retainHistoryEntries(store, entries)
       const plan = planCompaction(entries, { contextTokenLimit: 258_400 })
       expect(plan.summarizeEntries.length).toBeGreaterThan(0)
       const artifacts = createCompactionArtifacts({
@@ -709,7 +710,8 @@ describe('#8/#9 多轮不退化与两路一致', () => {
         expect(archivedIds).not.toContain(artifacts.summaryBlobId)
       }
       // 下一轮从压缩后的 root 重新 hydrate (Σ 带标记), 并追加新一轮工具流
-      const nextEntries = hydrateHistoryEntries(artifacts.nextRootBlobIds)
+      retainCompactionArtifacts(store, artifacts)
+      const nextEntries = hydrateHistoryEntries(artifacts.nextRootBlobIds, store)
       expect(nextEntries.length).toBe(plan.leading.length + 1 + plan.keepTail.length)
       for (let index = 0; index < 8; index++)
         nextEntries.push(...makeToolGroup({ callId: `call_r8_${round}_${index}`, toolName: 'Read', input: { path: `g${index}.ts` }, resultTokens: 5_000 }))

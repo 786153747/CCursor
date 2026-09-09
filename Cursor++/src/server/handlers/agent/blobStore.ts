@@ -1,58 +1,208 @@
-/**
- * Blob Store — 进程内热缓存 (客户端是 blob 的唯一持久持有方)
- *
- * 对齐官方架构: 服务端不落盘任何对话 blob。这里只是当前进程的热缓存:
- *   - 本 run 刚发给客户端 (setBlobArgs) 的 blob 立即可读, 同轮压缩 / 重建不必回取;
- *   - 进程未重启时上一轮的 blob 直接命中, 省一次回取;
- *   - 未命中 (重启 / 淘汰) → 调用方经 getBlobArgs 向客户端取 (clientBlobFetch)。
- *
- * 值是 base64 文本 (JSON blob = base64(JSON), 二进制 blob = base64(raw bytes))。
- * 按字节 LRU 淘汰, 读写都刷新新鲜度。被淘汰的 blob 总能从客户端取回, 上限只需远大于
- * 单个会话的工作集 (实测最大会话 ~4 MB / 1.1k blob), 128 MB 留出并发子代理的余量。
- */
+import type { HistoryEntry } from './historyManager'
+import type { TurnBaseline } from './turnTracker'
+import { BlobIntegrityError, type BlobFailure } from './blobErrors'
+
 const DEFAULT_MAX_BYTES = 128 * 1024 * 1024
+const DEFAULT_MAX_RECORDS = 100_000
 
-/** blobId → blobData (base64); Map 的插入顺序即 LRU 顺序, 最旧在前 */
-const blobCache = new Map<string, string>()
-let cachedBytes = 0
-let maxBytes = DEFAULT_MAX_BYTES
+/** Required working-set data cannot be evicted to recover from a resource limit. */
+export class BlobResourceLimitError extends Error {
+    readonly retryable = false
 
-export function cacheBlob(blobId: string, blobData: string): void {
-    const previous = blobCache.get(blobId)
-    if (previous !== undefined) {
-        cachedBytes -= previous.length
-        blobCache.delete(blobId)
-    }
-    blobCache.set(blobId, blobData)
-    cachedBytes += blobData.length
-    evictLeastRecentlyUsed()
-}
-
-export function getCachedBlob(blobId: string): string | undefined {
-    const blobData = blobCache.get(blobId)
-    if (blobData === undefined)
-        return undefined
-    // 删掉重插 = 移到 Map 末尾 (最新)
-    blobCache.delete(blobId)
-    blobCache.set(blobId, blobData)
-    return blobData
-}
-
-function evictLeastRecentlyUsed(): void {
-    for (const [blobId, blobData] of blobCache) {
-        if (cachedBytes <= maxBytes || blobCache.size <= 1)
-            return
-        blobCache.delete(blobId)
-        cachedBytes -= blobData.length
+    constructor(message: string) {
+        super(message)
+        this.name = 'BlobResourceLimitError'
     }
 }
 
-export function getBlobCacheStats(): { entries: number, bytes: number } {
-    return { entries: blobCache.size, bytes: cachedBytes }
+export class BlobInactiveError extends BlobIntegrityError {
+    constructor(message: string) {
+        super([{ blobId: '(blob-run)', status: 'inactive-run', message }])
+        this.name = 'BlobInactiveError'
+        this.message = message
+    }
 }
 
-export function resetBlobCacheForTests(options: { maxBytes?: number } = {}): void {
-    blobCache.clear()
-    cachedBytes = 0
-    maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
+export interface RetainedBlob {
+    blobId: string
+    /** Normalized base64 data, independent of the original client wire encoding. */
+    blobData: string
+    /** Exact wire bytes when known, including client JSON as well as protobuf. */
+    blobDataRaw?: Uint8Array
+    dependencies: string[]
+}
+
+/**
+ * A run retains its entire working set until disposal; no required data is evicted.
+ * maxBytes bounds raw and normalized payload bytes, not JavaScript heap usage:
+ * decoded objects, map/set overhead and reference strings are not byte-counted.
+ * maxRecords separately bounds distinct blob identities, including empty results,
+ * inherited references and dependencies. Decoded caches use those same identities.
+ */
+export class RunBlobStore {
+    readonly historyEntries = new Map<string, HistoryEntry>()
+    readonly turnBaselines = new Map<string, TurnBaseline>()
+
+    private readonly retainedBlobs = new Map<string, RetainedBlob>()
+    private readonly inheritedReferences = new Set<string>()
+    private readonly clientSavedIds = new Set<string>()
+    private readonly recordedBlobIds = new Set<string>()
+    private readonly maxBytes: number
+    private readonly maxRecords: number
+    private retainedBytes = 0
+    private clientResultBytes = 0
+    private disposed = false
+
+    constructor(options: { maxBytes?: number, maxRecords?: number } = {}) {
+        this.maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES
+        this.maxRecords = options.maxRecords ?? DEFAULT_MAX_RECORDS
+        if (!Number.isSafeInteger(this.maxBytes) || this.maxBytes < 0)
+            throw new BlobResourceLimitError(`Invalid run blob retention limit: ${this.maxBytes}`)
+        if (!Number.isSafeInteger(this.maxRecords) || this.maxRecords < 0)
+            throw new BlobResourceLimitError(`Invalid run blob record limit: ${this.maxRecords}`)
+    }
+
+    cacheBlob(blobId: string, blobData: string, blobDataRaw?: Uint8Array, dependencies?: string[]): void {
+        this.assertActive()
+        const previous = this.retainedBlobs.get(blobId)
+        if (previous && previous.blobData !== blobData) {
+            throw new BlobIntegrityError([{ blobId, status: 'content-conflict', message: `Run blob content changed for retained id ${blobId}` }])
+        }
+        if (previous?.blobDataRaw && blobDataRaw && !Buffer.from(previous.blobDataRaw).equals(blobDataRaw)) {
+            throw new BlobIntegrityError([{ blobId, status: 'content-conflict', message: `Run blob raw bytes changed for retained id ${blobId}` }])
+        }
+
+        const rawBytes = blobDataRaw ?? previous?.blobDataRaw
+        const nextBytes = Buffer.byteLength(blobData) + (rawBytes?.byteLength ?? 0)
+        const previousBytes = previous
+            ? Buffer.byteLength(previous.blobData) + (previous.blobDataRaw?.byteLength ?? 0)
+            : 0
+        this.assertWithinLimit(this.retainedBytes - previousBytes + nextBytes + this.clientResultBytes, blobId)
+        this.reserveBlobRecords([blobId, ...(dependencies ?? [])])
+
+        this.retainedBlobs.set(blobId, {
+            blobId,
+            blobData,
+            blobDataRaw: rawBytes ? new Uint8Array(rawBytes) : undefined,
+            dependencies: [...new Set([...(previous?.dependencies ?? []), ...(dependencies ?? [])])],
+        })
+        this.retainedBytes += nextBytes - previousBytes
+    }
+
+    getCachedBlob(blobId: string): string | undefined {
+        return this.retainedBlobs.get(blobId)?.blobData
+    }
+
+    getBlob(blobId: string): RetainedBlob | undefined {
+        return this.retainedBlobs.get(blobId)
+    }
+
+    markClientSaved(blobId: string): void {
+        this.reserveBlobRecord(blobId)
+        this.clientSavedIds.add(blobId)
+    }
+
+    isClientSaved(blobId: string): boolean {
+        return this.clientSavedIds.has(blobId)
+    }
+
+    addInheritedReferences(blobIds: Iterable<string>): void {
+        this.assertActive()
+        for (const blobId of blobIds) {
+            this.reserveBlobRecord(blobId)
+            this.inheritedReferences.add(blobId)
+        }
+    }
+
+    getPendingBlobs(): RetainedBlob[] {
+        return [...this.retainedBlobs.values()].filter(blob => !this.clientSavedIds.has(blob.blobId))
+    }
+
+    assertCheckpointReferences(blobIds: string[]): void {
+        this.assertActive()
+        // Also validate unsummarized originals: all pending data must be sent, even
+        // when reachable only through a newly generated summary/archive blob.
+        const remaining = [...blobIds, ...this.retainedBlobs.keys()].map(blobId => ({ blobId, owner: 'checkpoint' }))
+        const checked = new Set<string>()
+        const failures: BlobFailure[] = []
+        while (remaining.length > 0) {
+            const reference = remaining.pop()!
+            if (checked.has(reference.blobId))
+                continue
+            checked.add(reference.blobId)
+            const blob = this.retainedBlobs.get(reference.blobId)
+            if (!blob && !this.inheritedReferences.has(reference.blobId)) {
+                failures.push({
+                    blobId: reference.blobId,
+                    status: reference.owner === 'checkpoint' ? 'missing-reference' : 'missing-dependency',
+                    message: `Checkpoint references unavailable blob ${reference.blobId} (referenced by ${reference.owner})`,
+                })
+            }
+            for (const dependency of blob?.dependencies ?? [])
+                remaining.push({ blobId: dependency, owner: reference.blobId })
+        }
+        if (failures.length > 0)
+            throw new BlobIntegrityError(failures)
+    }
+
+    /** Reserve a shared identity for raw Get results, including failures/empty data. */
+    reserveBlobRecord(blobId: string): void {
+        this.assertActive()
+        this.reserveBlobRecords([blobId])
+    }
+
+    /** Raw Get results share the same payload budget as normalized retained blobs. */
+    retainClientResultBytes(byteLength: number, wireKey: string): void {
+        this.assertActive()
+        this.assertWithinLimit(this.retainedBytes + this.clientResultBytes + byteLength, `wire key ${wireKey}`)
+        this.clientResultBytes += byteLength
+    }
+
+    getStats(): { entries: number, records: number, bytes: number, clientResultBytes: number, pending: number } {
+        return {
+            entries: this.retainedBlobs.size,
+            records: this.recordedBlobIds.size,
+            bytes: this.retainedBytes + this.clientResultBytes,
+            clientResultBytes: this.clientResultBytes,
+            pending: this.getPendingBlobs().length,
+        }
+    }
+
+    dispose(): void {
+        this.disposed = true
+        this.retainedBlobs.clear()
+        this.inheritedReferences.clear()
+        this.clientSavedIds.clear()
+        this.recordedBlobIds.clear()
+        this.historyEntries.clear()
+        this.turnBaselines.clear()
+        this.retainedBytes = 0
+        this.clientResultBytes = 0
+    }
+
+    private assertWithinLimit(requiredBytes: number, blobId: string): void {
+        if (requiredBytes > this.maxBytes) {
+            throw new BlobResourceLimitError(`Run blob retention limit exceeded for ${blobId}: requires ${requiredBytes} bytes, limit ${this.maxBytes}; required blobs cannot be evicted`)
+        }
+    }
+
+    private reserveBlobRecords(blobIds: Iterable<string>): void {
+        const additionalBlobIds = new Set<string>()
+        for (const blobId of blobIds) {
+            if (this.recordedBlobIds.has(blobId) || additionalBlobIds.has(blobId))
+                continue
+            const requiredRecords = this.recordedBlobIds.size + additionalBlobIds.size + 1
+            if (requiredRecords > this.maxRecords) {
+                throw new BlobResourceLimitError(`Run blob record limit exceeded for ${blobId}: requires ${requiredRecords} records, limit ${this.maxRecords}; required blobs cannot be evicted`)
+            }
+            additionalBlobIds.add(blobId)
+        }
+        for (const blobId of additionalBlobIds)
+            this.recordedBlobIds.add(blobId)
+    }
+
+    private assertActive(): void {
+        if (this.disposed)
+            throw new BlobInactiveError('Run blob store has been disposed')
+    }
 }

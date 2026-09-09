@@ -1,7 +1,8 @@
 import type { AgentServerMessage } from '../gen/agent_v1_pb'
+import type { BlobRunOptions } from '../handlers/agent/runContext'
 import type { AgentSession } from '../handlers/agent/session'
 import type { LLMMessage } from '../handlers/llm/types'
-import { mkdtempSync, rmSync, statSync } from 'node:fs'
+import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { create, toBinary } from '@bufbuild/protobuf'
@@ -9,11 +10,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { closeAgentDatabase, getAgentDatabase, resetAgentDatabaseForTests } from '../database/sqlite'
 import { ConversationTurnStructureSchema } from '../gen/agent_v1_pb'
 import { binaryBlobDataFromClientBytes, blobIdToBytes, encodeBinaryBlob, encodeBlob, jsonBlobDataFromClientBytes } from '../handlers/agent/blob'
-import { cacheBlob, getBlobCacheStats, getCachedBlob, resetBlobCacheForTests } from '../handlers/agent/blobStore'
-import { CLIENT_BLOB_FETCH_BATCH_SIZE, fetchBlobsFromClient } from '../handlers/agent/clientBlobFetch'
-import { hydrateHistoryEntries, loadHistoryEntries, rebuildConversationHistory, sendRootBlobsUnknownToClient } from '../handlers/agent/historyManager'
+import { RunBlobStore } from '../handlers/agent/blobStore'
+import { CLIENT_BLOB_FETCH_BATCH_SIZE, fetchBlobsFromClient, saveCheckpointBlobs } from '../handlers/agent/clientBlobFetch'
+import { hydrateHistoryEntries, loadHistoryEntries, rebuildConversationHistory } from '../handlers/agent/historyManager'
 import { parseRunRequest } from '../handlers/agent/protocol'
-import { createEphemeralSession, markSessionClosed, pushSessionMessage } from '../handlers/agent/session'
+import { BlobRunContext } from '../handlers/agent/runContext'
+import { createEphemeralSession, pushSessionMessage } from '../handlers/agent/session'
 import { ensureTurnBlobCached, readTurnBaseline } from '../handlers/agent/turnTracker'
 
 /**
@@ -27,8 +29,6 @@ import { ensureTurnBlobCached, readTurnBaseline } from '../handlers/agent/turnTr
 interface FakeClientOptions {
   /** blobId (string 形态) → 客户端本地保存的原始 bytes */
   store: Map<string, Uint8Array>
-  /** 这些 blobId 永不回包 (模拟通道死亡) */
-  neverRespond?: Set<string>
   /** 这些 blobId 回 error */
   respondWithError?: Set<string>
   /** blobData 以原始 Uint8Array 回 (bidi 内存路径) 而非 base64 string (JSON transport) */
@@ -92,12 +92,16 @@ async function runWithFakeClient<TReturn>(
     if (request) {
       client.requests.push(request)
       inFlight++
-      if (!options.neverRespond?.has(request.blobId)) {
-        if (options.deferReply)
-          setTimeout(reply, 0, request)
-        else
-          reply(request)
-      }
+      if (options.deferReply)
+        setTimeout(reply, 0, request)
+      else
+        reply(request)
+    }
+    if (step.value.message.case === 'kvServerMessage' && step.value.message.value.message.case === 'setBlobArgs') {
+      const envelope = step.value.message.value
+      const write = step.value.message.value.message.value
+      options.store.set(Buffer.from(write.blobId).toString('utf8'), new Uint8Array(write.blobData))
+      pushSessionMessage(session, { kvClientMessage: { id: envelope.id, setBlobResult: {} } })
     }
     step = await generator.next()
   }
@@ -126,17 +130,18 @@ function toClientStore(blobs: Array<{ blobId: string, clientBytes: Uint8Array }>
   return new Map(blobs.map(blob => [blob.blobId, blob.clientBytes]))
 }
 
-function allocator(start = 900_000): () => number {
-  let next = start
-  return () => next++
+const activeRuns: BlobRunContext[] = []
+
+function createRun(session: AgentSession | null = createEphemeralSession('client-blob-test'), options: BlobRunOptions = {}): BlobRunContext {
+  const run = new BlobRunContext(session, options)
+  activeRuns.push(run)
+  return run
 }
 
-beforeEach(() => {
-  resetBlobCacheForTests()
-})
-
 afterEach(() => {
-  resetBlobCacheForTests()
+  for (const run of activeRuns)
+    run.dispose()
+  activeRuns.length = 0
 })
 
 describe('blobId / blobData 与客户端字节的互转', () => {
@@ -165,8 +170,9 @@ describe('blobId / blobData 与客户端字节的互转', () => {
     const rawJsonBytes = new TextEncoder().encode('{"role":"user","content":"raw"}')
     const normalized = jsonBlobDataFromClientBytes(rawJsonBytes)
     expect(normalized).toBe(Buffer.from(rawJsonBytes).toString('base64'))
-    cacheBlob('raw-json-blob', normalized!)
-    expect(hydrateHistoryEntries(['raw-json-blob'])[0]?.message).toEqual({ role: 'user', content: 'raw' })
+    const store = new RunBlobStore()
+    store.cacheBlob('raw-json-blob', normalized!)
+    expect(hydrateHistoryEntries(['raw-json-blob'], store)[0]?.message).toEqual({ role: 'user', content: 'raw' })
 
     expect(jsonBlobDataFromClientBytes(new Uint8Array(0))).toBeNull()
     expect(jsonBlobDataFromClientBytes(new TextEncoder().encode('not base64 nor json!!'))).toBeNull()
@@ -177,32 +183,23 @@ describe('blobId / blobData 与客户端字节的互转', () => {
     const turn = encodeBinaryBlob(toBinary(ConversationTurnStructureSchema, create(ConversationTurnStructureSchema, {
       turn: { case: 'agentConversationTurn', value: { userMessage: new TextEncoder().encode('user-blob'), steps: [], dynamicToolCount: 3 } },
     })))
-    cacheBlob(turn.blobId, binaryBlobDataFromClientBytes(turn.blobDataRaw))
-    expect(getCachedBlob(turn.blobId)).toBe(turn.blobData)
-    expect(readTurnBaseline(turn.blobId)).toMatchObject({ userMessageBlobId: 'user-blob', dynamicToolCount: 3 })
+    const store = new RunBlobStore()
+    store.cacheBlob(turn.blobId, binaryBlobDataFromClientBytes(turn.blobDataRaw), turn.blobDataRaw)
+    expect(store.getCachedBlob(turn.blobId)).toBe(turn.blobData)
+    expect(readTurnBaseline(turn.blobId, store)).toMatchObject({ userMessageBlobId: 'user-blob', dynamicToolCount: 3 })
   })
 })
 
 describe('fetchBlobsFromClient', () => {
-  it('无 session → 不发帧, 全部 null', async () => {
-    const { result, frames } = await drain(fetchBlobsFromClient({
-      session: null,
-      blobIds: [new Uint8Array([1]), new Uint8Array([2])],
-      allocateBlobId: allocator(),
-    }))
-    expect(frames).toEqual([])
-    expect(result).toEqual([null, null])
-  })
-
   it('按下标返回字节; 请求 id 单调递增; 回包被消费不残留 (JSON transport base64 string)', async () => {
     const blobs = buildHistoryBlobs(5)
     const session = createEphemeralSession('fetch-all')
     const { result, client } = await runWithFakeClient(
       session,
-      fetchBlobsFromClient({ session, blobIds: blobs.map(blob => blobIdToBytes(blob.blobId)), allocateBlobId: allocator() }),
+      fetchBlobsFromClient({ run: createRun(session), blobIds: blobs.map(blob => blobIdToBytes(blob.blobId)) }),
       { store: toClientStore(blobs) },
     )
-    expect(result.map(bytes => bytes && Buffer.from(bytes).toString('utf-8'))).toEqual(blobs.map(blob => blob.blobData))
+    expect(result).toEqual(blobs.map(blob => ({ status: 'ok', bytes: blob.clientBytes })))
     expect(client.requests.map(request => request.kvRequestId)).toEqual([900_000, 900_001, 900_002, 900_003, 900_004])
     expect(session.messages).toEqual([])
   })
@@ -212,58 +209,23 @@ describe('fetchBlobsFromClient', () => {
     const session = createEphemeralSession('fetch-raw')
     const { result } = await runWithFakeClient(
       session,
-      fetchBlobsFromClient({ session, blobIds: blobs.map(blob => blobIdToBytes(blob.blobId)), allocateBlobId: allocator() }),
+      fetchBlobsFromClient({ run: createRun(session), blobIds: blobs.map(blob => blobIdToBytes(blob.blobId)) }),
       { store: toClientStore(blobs), rawBytes: true },
     )
-    expect(result.map(bytes => bytes && Buffer.from(bytes).toString('utf-8'))).toEqual(blobs.map(blob => blob.blobData))
+    expect(result).toEqual(blobs.map(blob => ({ status: 'ok', bytes: blob.clientBytes })))
   })
 
-  it('客户端回 error / 本地没有 → 对应位置 null, 其余正常', async () => {
+  it('distinguishes client errors from missing blobs without losing successful positions', async () => {
     const blobs = buildHistoryBlobs(4)
     const store = toClientStore(blobs)
     store.delete(blobs[2]!.blobId)
     const session = createEphemeralSession('fetch-partial')
     const { result } = await runWithFakeClient(
       session,
-      fetchBlobsFromClient({ session, blobIds: blobs.map(blob => blobIdToBytes(blob.blobId)), allocateBlobId: allocator() }),
+      fetchBlobsFromClient({ run: createRun(session), blobIds: blobs.map(blob => blobIdToBytes(blob.blobId)) }),
       { store, respondWithError: new Set([blobs[1]!.blobId]) },
     )
-    expect(result.map(bytes => bytes !== null)).toEqual([true, false, false, true])
-  })
-
-  it('一次超时即视为通道已死: 剩余不再等待也不再发送', async () => {
-    const blobs = buildHistoryBlobs(40)
-    const session = createEphemeralSession('fetch-timeout')
-    const startedAt = Date.now()
-    const { result, client } = await runWithFakeClient(
-      session,
-      fetchBlobsFromClient({ session, blobIds: blobs.map(blob => blobIdToBytes(blob.blobId)), allocateBlobId: allocator(), timeoutMs: 50 }),
-      { store: toClientStore(blobs), neverRespond: new Set([blobs[3]!.blobId]) },
-    )
-    // 首批 32 个已发出; 前 3 个成功, 第 4 个超时 → 放弃; 次批 8 个从未发出
-    expect(client.requests).toHaveLength(32)
-    expect(result.slice(0, 3).every(bytes => bytes !== null)).toBe(true)
-    expect(result.slice(3).every(bytes => bytes === null)).toBe(true)
-    expect(Date.now() - startedAt).toBeLessThan(500)
-  })
-
-  it('session 关闭 → 立即放弃, 不等超时', async () => {
-    const blobs = buildHistoryBlobs(3)
-    const session = createEphemeralSession('fetch-closed')
-    const generator = fetchBlobsFromClient({ session, blobIds: blobs.map(blob => blobIdToBytes(blob.blobId)), allocateBlobId: allocator() })
-    const startedAt = Date.now()
-    let requests = 0
-    let step = await generator.next()
-    while (!step.done) {
-      if (decodeGetBlobArgs(step.value)) {
-        requests++
-        if (requests === 3)
-          markSessionClosed(session)
-      }
-      step = await generator.next()
-    }
-    expect(step.value).toEqual([null, null, null])
-    expect(Date.now() - startedAt).toBeLessThan(1_000)
+    expect(result.map(entry => entry.status)).toEqual(['ok', 'client-error', 'not-found', 'ok'])
   })
 
   it('分批: 40 个 → 32 + 8, 每批一次性发出后逐个按 id 收', async () => {
@@ -272,10 +234,10 @@ describe('fetchBlobsFromClient', () => {
     const session = createEphemeralSession('fetch-batches')
     const { result, client } = await runWithFakeClient(
       session,
-      fetchBlobsFromClient({ session, blobIds: blobs.map(blob => blobIdToBytes(blob.blobId)), allocateBlobId: allocator() }),
+      fetchBlobsFromClient({ run: createRun(session), blobIds: blobs.map(blob => blobIdToBytes(blob.blobId)) }),
       { store: toClientStore(blobs), deferReply: true },
     )
-    expect(result.every(bytes => bytes !== null)).toBe(true)
+    expect(result.every(entry => entry.status === 'ok')).toBe(true)
     expect(client.requests).toHaveLength(40)
     // 首批第一次回包时 32 个在飞, 次批第一次回包时 8 个在飞
     expect(client.inFlightAtReply[0]).toBe(32)
@@ -286,7 +248,7 @@ describe('fetchBlobsFromClient', () => {
   it('回包乱序到达也按 id 归位', async () => {
     const blobs = buildHistoryBlobs(3)
     const session = createEphemeralSession('fetch-out-of-order')
-    const generator = fetchBlobsFromClient({ session, blobIds: blobs.map(blob => blobIdToBytes(blob.blobId)), allocateBlobId: allocator() })
+    const generator = fetchBlobsFromClient({ run: createRun(session), blobIds: blobs.map(blob => blobIdToBytes(blob.blobId)) })
     const pending: Array<{ kvRequestId: number, blobId: string }> = []
     let step = await generator.next()
     while (!step.done) {
@@ -301,7 +263,7 @@ describe('fetchBlobsFromClient', () => {
       }
       step = await generator.next()
     }
-    expect(step.value.map(bytes => bytes && Buffer.from(bytes).toString('utf-8'))).toEqual(blobs.map(blob => blob.blobData))
+    expect(step.value).toEqual(blobs.map(blob => ({ status: 'ok', bytes: blob.clientBytes })))
   })
 })
 
@@ -313,8 +275,8 @@ describe('loadHistoryEntries / rebuildConversationHistory', () => {
     currentUserMessage: { role: 'user', content: '继续' } as LLMMessage,
     systemContent: 'sys',
     preambleUserContent: '<user_info>env</user_info>',
-    * sendSystemScaffoldBlob() {},
-    * sendOrderedBlob() {},
+    sendSystemScaffoldBlob() {},
+    sendOrderedBlob() {},
   }
 
   function buildScaffoldedHistory(count: number) {
@@ -331,12 +293,13 @@ describe('loadHistoryEntries / rebuildConversationHistory', () => {
 
   it('全部命中内存 → 不发任何 getBlobArgs 帧', async () => {
     const { all } = buildScaffoldedHistory(4)
-    for (const blob of all)
-      cacheBlob(blob.blobId, blob.blobData)
     const session = createEphemeralSession('rebuild-all-cached')
+    const run = createRun(session)
+    for (const blob of all)
+      run.blobs.cacheBlob(blob.blobId, blob.blobData)
     const { result, client } = await runWithFakeClient(
       session,
-      rebuildConversationHistory({ ...scaffold, historyBlobIds: all.map(blob => blob.blobId), session, allocateBlobId: allocator() }),
+      rebuildConversationHistory({ ...scaffold, historyBlobIds: all.map(blob => blob.blobId), run }),
       { store: toClientStore(all) },
     )
     expect(client.requests).toEqual([])
@@ -347,19 +310,20 @@ describe('loadHistoryEntries / rebuildConversationHistory', () => {
   it('部分缺失 → 只对缺失 id 发帧 (去重), 回包后历史完整并落缓存', async () => {
     const { all, body } = buildScaffoldedHistory(6)
     const missing = [body[1]!, body[4]!]
+    const session = createEphemeralSession('rebuild-partial')
+    const run = createRun(session)
     for (const blob of all) {
       if (!missing.includes(blob))
-        cacheBlob(blob.blobId, blob.blobData)
+        run.blobs.cacheBlob(blob.blobId, blob.blobData)
     }
-    const session = createEphemeralSession('rebuild-partial')
     const historyBlobIds = [...all.map(blob => blob.blobId), body[4]!.blobId]
     const { result, client } = await runWithFakeClient(
       session,
-      rebuildConversationHistory({ ...scaffold, historyBlobIds, session, allocateBlobId: allocator() }),
+      rebuildConversationHistory({ ...scaffold, historyBlobIds, run }),
       { store: toClientStore(all) },
     )
     expect(client.requests.map(request => request.blobId)).toEqual(missing.map(blob => blob.blobId))
-    expect(getCachedBlob(body[1]!.blobId)).toBe(body[1]!.blobData)
+    expect(run.blobs.getCachedBlob(body[1]!.blobId)).toBe(body[1]!.blobData)
     expect(result.messages.map(message => message.content)).toEqual([
       'sys',
       '<user_info>env</user_info>',
@@ -374,48 +338,43 @@ describe('loadHistoryEntries / rebuildConversationHistory', () => {
     ])
   })
 
-  it('回包 error / 客户端也没有 → 对应条目跳过, 其余正常, 对话不中断', async () => {
+  it('rejects incomplete required history with both client-error and not-found details', async () => {
     const { all, body } = buildScaffoldedHistory(5)
     const errored = body[0]!
     const missingEverywhere = body[3]!
     const store = toClientStore(all)
     store.delete(missingEverywhere.blobId)
+    const session = createEphemeralSession('rebuild-errors')
+    const run = createRun(session)
     for (const blob of all) {
       if (blob !== errored && blob !== missingEverywhere && blob !== body[2])
-        cacheBlob(blob.blobId, blob.blobData)
+        run.blobs.cacheBlob(blob.blobId, blob.blobData)
     }
-    const session = createEphemeralSession('rebuild-errors')
-    const { result, client } = await runWithFakeClient(
+    await expect(runWithFakeClient(
       session,
-      rebuildConversationHistory({ ...scaffold, historyBlobIds: all.map(blob => blob.blobId), session, allocateBlobId: allocator() }),
+      rebuildConversationHistory({ ...scaffold, historyBlobIds: all.map(blob => blob.blobId), run }),
       { store, respondWithError: new Set([errored.blobId]) },
-    )
-    expect(client.requests.map(request => request.blobId)).toEqual([errored.blobId, body[2]!.blobId, missingEverywhere.blobId])
-    expect(result.messages.map(message => message.content)).toEqual([
-      'sys',
-      '<user_info>env</user_info>',
-      'turn-1',
-      'turn-2',
-      'turn-4',
-      '继续',
-    ])
+    )).rejects.toMatchObject({
+      name: 'BlobIntegrityError',
+      failures: [
+        expect.objectContaining({ blobId: errored.blobId, status: 'client-error' }),
+        expect.objectContaining({ blobId: missingEverywhere.blobId, status: 'not-found' }),
+      ],
+    })
+    expect(run.blobs.getCachedBlob(body[2]!.blobId)).toBe(body[2]!.blobData)
   })
 
-  it('无 session → 只查内存, 缺失静默跳过, 不发帧', async () => {
+  it('rejects missing required history without a session instead of treating it as an offline bypass', async () => {
     const { all, body } = buildScaffoldedHistory(3)
+    const run = createRun(null)
     for (const blob of all) {
       if (blob !== body[1])
-        cacheBlob(blob.blobId, blob.blobData)
+        run.blobs.cacheBlob(blob.blobId, blob.blobData)
     }
-    const { result, frames } = await drain(rebuildConversationHistory({ ...scaffold, historyBlobIds: all.map(blob => blob.blobId), session: null, allocateBlobId: allocator() }))
-    expect(frames.filter(decodeGetBlobArgs)).toEqual([])
-    expect(result.messages.map(message => message.content)).toEqual([
-      'sys',
-      '<user_info>env</user_info>',
-      'turn-0',
-      'turn-2',
-      '继续',
-    ])
+    await expect(drain(rebuildConversationHistory({ ...scaffold, historyBlobIds: all.map(blob => blob.blobId), run }))).rejects.toMatchObject({
+      name: 'BlobIntegrityError',
+      failures: [expect.objectContaining({ blobId: body[1]!.blobId, status: 'no-session' })],
+    })
   })
 
   it('loadHistoryEntries 直接可供 summarize 路径使用: 取回 + hydrate', async () => {
@@ -423,7 +382,7 @@ describe('loadHistoryEntries / rebuildConversationHistory', () => {
     const session = createEphemeralSession('load-entries')
     const { result, client } = await runWithFakeClient(
       session,
-      loadHistoryEntries({ historyBlobIds: blobs.map(blob => blob.blobId), session, allocateBlobId: allocator() }),
+      loadHistoryEntries({ historyBlobIds: blobs.map(blob => blob.blobId), run: createRun(session) }),
       { store: toClientStore(blobs) },
     )
     expect(client.requests).toHaveLength(3)
@@ -431,28 +390,29 @@ describe('loadHistoryEntries / rebuildConversationHistory', () => {
   })
 })
 
-describe('sendRootBlobsUnknownToClient', () => {
-  it('只补发客户端未持有的 root blob, kv id 从起始值连续分配', () => {
+describe('saveCheckpointBlobs', () => {
+  it('saves only pending blobs after real client reads and acknowledges each stored value', async () => {
     const known = buildHistoryBlobs(3, 'known')
     const fresh = buildHistoryBlobs(2, 'fresh')
-    for (const blob of [...known, ...fresh])
-      cacheBlob(blob.blobId, blob.blobData)
-    const uncached = encodeBlob({ role: 'user', content: 'never cached' })
+    const session = createEphemeralSession('checkpoint-save')
+    const run = createRun(session)
+    const clientStore = toClientStore(known)
+    await runWithFakeClient(session, loadHistoryEntries({ run, historyBlobIds: known.map(blob => blob.blobId) }), { store: clientStore })
+    for (const blob of fresh)
+      run.blobs.cacheBlob(blob.blobId, blob.blobData)
 
-    const nextRootBlobIds = [known[0]!.blobId, fresh[0]!.blobId, known[1]!.blobId, fresh[1]!.blobId, fresh[0]!.blobId, uncached.blobId]
-    const frames: AgentServerMessage[] = []
-    const generator = sendRootBlobsUnknownToClient(nextRootBlobIds, known.map(blob => blob.blobId), 7)
-    let step = generator.next()
-    while (!step.done) {
-      frames.push(step.value)
-      step = generator.next()
-    }
-
-    expect(step.value).toBe(2)
+    const nextRootBlobIds = [known[0]!.blobId, fresh[0]!.blobId, known[1]!.blobId, fresh[1]!.blobId, fresh[0]!.blobId]
+    expect(fresh.every(blob => !clientStore.has(blob.blobId))).toBe(true)
+    const { frames } = await runWithFakeClient(session, saveCheckpointBlobs(run, nextRootBlobIds), { store: clientStore })
     expect(frames.map(decodeSetBlobArgs)).toEqual([
-      { kvId: 7, blobId: fresh[0]!.blobId, blobData: fresh[0]!.blobData },
-      { kvId: 8, blobId: fresh[1]!.blobId, blobData: fresh[1]!.blobData },
+      { kvId: 900_003, blobId: fresh[0]!.blobId, blobData: fresh[0]!.blobData },
+      { kvId: 900_004, blobId: fresh[1]!.blobId, blobData: fresh[1]!.blobData },
     ])
+    expect(run.blobs.getPendingBlobs()).toEqual([])
+    for (const blob of fresh)
+      expect(clientStore.get(blob.blobId)).toEqual(blob.clientBytes)
+    const repeated = await runWithFakeClient(session, saveCheckpointBlobs(run, nextRootBlobIds), { store: clientStore })
+    expect(repeated.frames).toEqual([])
   })
 })
 
@@ -462,54 +422,21 @@ describe('ensureTurnBlobCached', () => {
       turn: { case: 'agentConversationTurn', value: { userMessage: new TextEncoder().encode('u'), steps: [], dynamicToolCount: 5 } },
     })))
     const session = createEphemeralSession('turn-restore')
+    const run = createRun(session)
     const first = await runWithFakeClient(
       session,
-      ensureTurnBlobCached(turn.blobId, session, allocateBlobId()),
+      ensureTurnBlobCached(turn.blobId, run),
       { store: new Map([[turn.blobId, turn.blobDataRaw]]) },
     )
     expect(first.client.requests.map(request => request.blobId)).toEqual([turn.blobId])
-    expect(readTurnBaseline(turn.blobId)?.dynamicToolCount).toBe(5)
+    expect(readTurnBaseline(turn.blobId, run.blobs).dynamicToolCount).toBe(5)
 
-    const second = await runWithFakeClient(session, ensureTurnBlobCached(turn.blobId, session, allocateBlobId()), { store: new Map() })
+    const second = await runWithFakeClient(session, ensureTurnBlobCached(turn.blobId, run), { store: new Map() })
     expect(second.client.requests).toEqual([])
   })
 })
 
-function allocateBlobId(): () => number {
-  return allocator()
-}
-
-describe('blobStore LRU', () => {
-  it('超过字节上限时淘汰最久未用的, 读也刷新新鲜度', () => {
-    resetBlobCacheForTests({ maxBytes: 30 })
-    cacheBlob('a', 'x'.repeat(10))
-    cacheBlob('b', 'y'.repeat(10))
-    cacheBlob('c', 'z'.repeat(10))
-    expect(getBlobCacheStats()).toEqual({ entries: 3, bytes: 30 })
-
-    // 读 a → a 变最新; 再写 d → 淘汰 b
-    expect(getCachedBlob('a')).toBe('x'.repeat(10))
-    cacheBlob('d', 'w'.repeat(10))
-    expect(getCachedBlob('b')).toBeUndefined()
-    expect(getCachedBlob('a')).toBeDefined()
-    expect(getCachedBlob('c')).toBeDefined()
-    expect(getCachedBlob('d')).toBeDefined()
-    expect(getBlobCacheStats()).toEqual({ entries: 3, bytes: 30 })
-
-    // 覆盖写同一 key 不重复计字节
-    cacheBlob('d', 'v'.repeat(5))
-    expect(getBlobCacheStats()).toEqual({ entries: 3, bytes: 25 })
-  })
-
-  it('单个超大 blob 也会被保留 (至少留一条)', () => {
-    resetBlobCacheForTests({ maxBytes: 8 })
-    cacheBlob('big', 'b'.repeat(100))
-    expect(getCachedBlob('big')).toBeDefined()
-    expect(getBlobCacheStats().entries).toBe(1)
-  })
-})
-
-describe('sqlite: 旧版 agent_blobs 表一次性删除', () => {
+describe('sqlite: legacy blob retention', () => {
   let tempDir: string
   let prevDbPath: string | undefined
 
@@ -527,7 +454,7 @@ describe('sqlite: 旧版 agent_blobs 表一次性删除', () => {
     rmSync(tempDir, { recursive: true, force: true })
   })
 
-  it('启动时 DROP + VACUUM, 文件收缩, 其它表保留; 再次启动无事发生', async () => {
+  it('preserves legacy blob rows, indexes, and checkpoints across repeated initialization', async () => {
     await resetAgentDatabaseForTests()
     const database = getAgentDatabase()
     // 模拟旧版留下的表与数据
@@ -535,23 +462,19 @@ describe('sqlite: 旧版 agent_blobs 表一次性删除', () => {
       CREATE TABLE agent_blobs (blob_id TEXT PRIMARY KEY, blob_data TEXT NOT NULL, created_at INTEGER NOT NULL, last_accessed_at INTEGER NOT NULL);
       CREATE INDEX idx_agent_blobs_last_accessed_at ON agent_blobs(last_accessed_at);
     `)
-    const filler = 'x'.repeat(4096)
-    for (let index = 0; index < 500; index++)
-      await database.run('INSERT INTO agent_blobs VALUES (?, ?, 1, 1)', [`blob-${index}`, filler])
+    const originalBlob = encodeBlob({ role: 'user', content: 'legacy content must remain recoverable' })
+    await database.run('INSERT INTO agent_blobs VALUES (?, ?, 1, 1)', [originalBlob.blobId, originalBlob.blobData])
     await database.run(`INSERT INTO conversation_checkpoints (conversation_id, kind, root_blob_ids_json, summary_archive_ids_json, used_tokens, max_tokens, mode, updated_at) VALUES ('c1', 'committed', '["a"]', '[]', 1, 2, 'AGENT_MODE_AGENT', 1)`)
-    await database.exec('PRAGMA wal_checkpoint(TRUNCATE)')
-    const bytesBefore = statSync(process.env.BYOK_AGENT_DB_PATH!).size
-    expect(bytesBefore).toBeGreaterThan(500 * 4096)
-
-    // 重新初始化 = 升级后的第一次启动
-    await resetAgentDatabaseForTests()
-    const reopened = getAgentDatabase()
-    expect(await reopened.get(`SELECT name FROM sqlite_master WHERE type='table' AND name='agent_blobs'`)).toBeUndefined()
-    expect(await reopened.get<{ n: number }>('SELECT count(*) AS n FROM conversation_checkpoints')).toEqual({ n: 1 })
-    expect(statSync(process.env.BYOK_AGENT_DB_PATH!).size).toBeLessThan(bytesBefore / 10)
-
-    // 第二次启动: 表已不存在, 幂等
-    await resetAgentDatabaseForTests()
-    expect(await getAgentDatabase().get<{ n: number }>('SELECT count(*) AS n FROM conversation_checkpoints')).toEqual({ n: 1 })
+    for (let restart = 0; restart < 2; restart++) {
+      await resetAgentDatabaseForTests()
+      const reopened = getAgentDatabase()
+      expect(await reopened.get('SELECT blob_data, created_at, last_accessed_at FROM agent_blobs WHERE blob_id = ?', [originalBlob.blobId])).toEqual({
+        blob_data: originalBlob.blobData,
+        created_at: 1,
+        last_accessed_at: 1,
+      })
+      expect(await reopened.get(`SELECT name FROM sqlite_master WHERE type='index' AND name='idx_agent_blobs_last_accessed_at'`)).toEqual({ name: 'idx_agent_blobs_last_accessed_at' })
+      expect(await reopened.get<{ count: number }>('SELECT count(*) AS count FROM conversation_checkpoints')).toEqual({ count: 1 })
+    }
   })
 })

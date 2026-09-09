@@ -50,6 +50,10 @@ export interface AgentSession {
      * 转后台时登记, AwaitShell 据此分流 readArgs / subagentAwaitArgs。
      */
     backgroundJobs: Map<string, BackgroundJob>;
+    /** KV ids remain monotonic when a transport session is reused by another run. */
+    nextBlobRequestId?: number;
+    /** Only correlation metadata, shared by runs using this transport session. */
+    activeBlobRequestIds?: Set<number>;
     /** env.terminalsFolder — 用于构造后台 shell 的终端文件路径 {terminalsFolder}/{shellId}.txt */
     terminalsFolder?: string;
     /**
@@ -75,6 +79,8 @@ export function createEphemeralSession(requestId: string): AgentSession {
         listeners: new Set(),
         closed: false,
         backgroundJobs: new Map(),
+        nextBlobRequestId: 900_000,
+        activeBlobRequestIds: new Set(),
     };
 }
 
@@ -123,6 +129,16 @@ function extractCancelReason(json: Record<string, unknown>): string | undefined 
  * waitForMessageMatching 的 predicate 会匹配,留在 messages 里只会无限堆积。
  */
 function ingestSessionMessage(session: AgentSession, json: Record<string, unknown>): void {
+    const envelope = json.kvClientMessage as Record<string, unknown> | undefined;
+    const blobRequestId = envelope?.id;
+    if (envelope && typeof envelope === 'object' && ('getBlobResult' in envelope || 'setBlobResult' in envelope)
+        && typeof blobRequestId === 'number' && Number.isInteger(blobRequestId)
+        && blobRequestId >= 900_000 && blobRequestId < (session.nextBlobRequestId ?? 900_000)
+        && !session.activeBlobRequestIds?.has(blobRequestId)) {
+        // A completed request cannot become live again. Discard late bytes before
+        // queueing them, without inspecting or decoding their potentially large body.
+        return;
+    }
     if (isContextInjection(json)) {
         logger.debug({ requestId: session.requestId }, '[SESSION] dropping context injection (run-time injection unsupported)');
         return;
@@ -221,7 +237,9 @@ export async function waitForMessageMatching(
     session: AgentSession,
     predicate: (msg: Record<string, unknown>) => boolean,
     timeoutMs: number | null = 30_000,
+    signal?: AbortSignal,
 ): Promise<Record<string, unknown> | null> {
+    if (signal?.aborted) return null;
     // 先检查队列中是否已有匹配消息
     const idx = session.messages.findIndex(predicate);
     if (idx >= 0) {
@@ -233,21 +251,22 @@ export async function waitForMessageMatching(
 
     return new Promise<Record<string, unknown> | null>((resolve) => {
         let resolved = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
 
         const cleanup = () => {
             resolved = true;
             if (timer != null)
                 clearTimeout(timer);
             session.listeners.delete(listener);
+            signal?.removeEventListener('abort', abortListener);
         };
 
-        const timer = timeoutMs == null ? null : setTimeout(() => {
+        const abortListener = () => {
             if (resolved)
                 return;
             cleanup();
-            logger.warn({ requestId: session.requestId, timeoutMs }, '[SESSION] waitForMessage timeout');
             resolve(null);
-        }, timeoutMs);
+        };
 
         const listener = () => {
             if (resolved)
@@ -265,6 +284,18 @@ export async function waitForMessageMatching(
         };
 
         session.listeners.add(listener);
+        signal?.addEventListener('abort', abortListener, { once: true });
+        if (signal?.aborted) {
+            abortListener();
+            return;
+        }
+        timer = timeoutMs == null ? null : setTimeout(() => {
+            if (resolved)
+                return;
+            cleanup();
+            logger.warn({ requestId: session.requestId, timeoutMs }, '[SESSION] waitForMessage timeout');
+            resolve(null);
+        }, timeoutMs);
     });
 }
 

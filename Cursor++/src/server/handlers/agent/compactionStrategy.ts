@@ -1,8 +1,9 @@
 import { createHash } from 'crypto';
 import { create, toBinary } from '@bufbuild/protobuf';
 import { ConversationSummaryArchiveSchema } from '../../gen/agent_v1_pb';
-import { cacheBlob, getCachedBlob } from './blobStore';
-import { encodeBlob } from './blob';
+import type { RunBlobStore } from './blobStore';
+import { BlobIntegrityError } from './blobErrors';
+import { blobIdToBytes, encodeBlob } from './blob';
 import { logger } from '../../logger';
 import {
     BUDGET_SAFETY_MARGIN,
@@ -88,6 +89,8 @@ export interface CompactionArtifacts {
     archiveBlobs: Array<{ blobId: string; blobData: string; blobDataRaw?: Uint8Array }>;
     nextRootBlobIds: string[];
     nextSummaryArchiveIds: string[];
+    rootEntries: HistoryEntry[];
+    blobs: Array<{ blobId: string; blobData: string; blobDataRaw?: Uint8Array; dependencies: string[] }>;
 }
 
 /** 无 options 调用 (旧签名/测试) 时的缺省窗口 = 设计基线 258,400 */
@@ -1299,19 +1302,13 @@ export function createCompactionArtifacts(params: {
     summaryText: string;
     previousSummaryArchiveIds: string[];
 }): CompactionArtifacts {
-    const summaryBlob = encodeBlob({
+    const summaryMessage = {
         role: 'assistant',
         content: `Previous conversation summary:\n${params.summaryText}`,
         providerOptions: { cursor: { isSummary: true } },
-    });
-    cacheBlob(summaryBlob.blobId, summaryBlob.blobData);
-
-    // 占位/省略/锚点副本 blob 需入缓存 (planCompaction 只算 id 不落缓存, 保持纯函数)
-    for (const entry of params.plan.keepTail) {
-        const blobData = getCachedBlobData(entry);
-        if (blobData)
-            cacheBlob(entry.blobId, blobData);
-    }
+    } as const;
+    const summaryBlob = encodeBlob(summaryMessage);
+    const summaryEntry: HistoryEntry = { ...summaryBlob, raw: summaryMessage, message: summaryMessage };
 
     // archive 名单 = 摘要侧非旧摘要条目 (锚点 blobId 除外 — root 存活的 blob 不标记归档)
     // + 被占位替换的原文 blobId
@@ -1325,41 +1322,52 @@ export function createCompactionArtifacts(params: {
     const archiveBlobs: Array<{ blobId: string; blobData: string; blobDataRaw?: Uint8Array }> = [];
     let nextSummaryArchiveIds = [...params.previousSummaryArchiveIds];
     if (archiveSourceBlobIds.length > 0) {
-        const encoder = new TextEncoder();
         const archiveMessage = create(ConversationSummaryArchiveSchema, {
-            summarizedMessages: archiveSourceBlobIds.map(blobId => encoder.encode(blobId)),
+            summarizedMessages: archiveSourceBlobIds.map(blobIdToBytes),
             summary: params.summaryText,
             windowTail: params.plan.keepTail.length,
-            summaryMessage: encoder.encode(summaryBlob.blobId),
+            summaryMessage: blobIdToBytes(summaryBlob.blobId),
         });
         const archiveBlob = encodeBinaryBlob(toBinary(ConversationSummaryArchiveSchema, archiveMessage));
-        cacheBlob(archiveBlob.blobId, archiveBlob.blobData);
         archiveBlobs.push(archiveBlob);
         nextSummaryArchiveIds = [...nextSummaryArchiveIds, archiveBlob.blobId];
     }
+
+    const rootEntries = [...params.plan.leading, summaryEntry, ...params.plan.keepTail];
+    const historyEntries = [...params.plan.leading, ...params.plan.summarizeEntries, ...params.plan.keepTail, summaryEntry];
+    const historyBlobs = [...new Map(historyEntries.map(entry => [entry.blobId, entry])).values()]
+        .map(entry => ({ blobId: entry.blobId, blobData: getHistoryEntryBlobData(entry), dependencies: [] as string[] }));
 
     return {
         summaryText: params.summaryText,
         summaryBlobId: summaryBlob.blobId,
         summaryBlobData: summaryBlob.blobData,
         archiveBlobs,
-        nextRootBlobIds: [
-            ...params.plan.leading.map(entry => entry.blobId),
-            summaryBlob.blobId,
-            ...params.plan.keepTail.map(entry => entry.blobId),
-        ],
+        nextRootBlobIds: rootEntries.map(entry => entry.blobId),
         nextSummaryArchiveIds,
+        rootEntries,
+        blobs: [
+            ...historyBlobs,
+            ...archiveBlobs.map(blob => ({ ...blob, dependencies: [...archiveSourceBlobIds, summaryBlob.blobId] })),
+        ],
     };
 }
 
-/** keepTail 条目的 blobData: 缓存命中直接用 (原文条目), 未命中按 raw 重编码 (占位条目) */
-function getCachedBlobData(entry: HistoryEntry): string | null {
-    const cached = getCachedBlob(entry.blobId);
-    if (cached) return cached;
-    try {
-        return encodeBlob(entry.raw).blobData;
+function getHistoryEntryBlobData(entry: HistoryEntry): string {
+    if (entry.blobData !== undefined)
+        return entry.blobData;
+    const encoded = encodeBlob(entry.raw);
+    if (encoded.blobId !== entry.blobId)
+        throw new BlobIntegrityError([{ blobId: entry.blobId, status: 'missing-original-bytes' }]);
+    return encoded.blobData;
+}
+
+/** Retention is explicit; planning and artifact construction have no global side effects. */
+export function retainCompactionArtifacts(store: RunBlobStore, artifacts: CompactionArtifacts): void {
+    for (const blob of artifacts.blobs) {
+        const existing = store.getBlob(blob.blobId);
+        store.cacheBlob(blob.blobId, blob.blobData, blob.blobDataRaw ?? existing?.blobDataRaw, blob.dependencies);
     }
-    catch {
-        return null;
-    }
+    for (const entry of artifacts.rootEntries)
+        store.historyEntries.set(entry.blobId, entry);
 }

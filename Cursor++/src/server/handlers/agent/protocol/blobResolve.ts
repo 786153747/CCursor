@@ -1,18 +1,17 @@
 /**
  * Blob 形态字段的二次解包
  *
- * parseRunRequest 是同步函数,只记录 blob 引用。实际从 blobStore (进程内热缓存,
- * 由 UploadConversationBlobs 或 getBlobArgs 回取填充) 取回数据放到 parseRunRequest
- * 之后、进入 hot path 之前的一次专门 resolve 阶段。
+ * parseRunRequest records references only. Resolution reads the explicit run
+ * workspace after upload handoff or client KV retrieval.
  */
 import type { ParsedRunRequest } from './types'
-import { getCachedBlob } from '../blobStore'
+import type { RunBlobStore } from '../blobStore'
 import { logger } from '../../../logger'
 
 /** 收集 parsed 里所有需要从 blobStore 取回的 blobId (当前仅 extraContextEntries) */
 export function collectExtraContextBlobIds(parsed: ParsedRunRequest): string[] {
   return parsed.extraContextEntries
-    .filter(e => !e.data && !!e.blobId)
+    .filter(e => e.data === undefined && !!e.blobId)
     .map(e => e.blobId!)
 }
 
@@ -22,21 +21,22 @@ export function collectExtraContextBlobIds(parsed: ParsedRunRequest): string[] {
  *
  * blobStore 里的数据以 base64 存,这里解码为 UTF-8 文本(extra context 本质是
  * 长文本片段,不做 JSON.parse 避免遇到纯文本时失败)。
- * 未命中的条目保留 blobId,让下游模板显示 pending 占位符。
+ * Unresolved IDs stay visible to the orchestrator, which rejects missing explicit
+ * attachments before generating instead of silently inserting pending markers.
  */
-export function resolveExtraContextBlobs(parsed: ParsedRunRequest): { resolved: number, missed: number } {
+export function resolveExtraContextBlobs(parsed: ParsedRunRequest, store: RunBlobStore): { resolved: number, missed: number } {
   let resolved = 0
   let missed = 0
   for (const entry of parsed.extraContextEntries) {
-    if (entry.data || !entry.blobId)
+    if (entry.data !== undefined || !entry.blobId)
       continue
-    const cached = getCachedBlob(entry.blobId)
-    if (!cached) {
+    const cached = store.getCachedBlob(entry.blobId)
+    if (cached === undefined) {
       missed++
       continue
     }
     try {
-      entry.data = Buffer.from(cached, 'base64').toString('utf-8')
+      entry.data = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.from(cached, 'base64'))
       delete entry.blobId
       resolved++
     }

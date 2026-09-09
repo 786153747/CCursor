@@ -6,19 +6,19 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it } from 'vitest'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
 import { encodeBlob } from '../handlers/agent/blob'
-import { cacheBlob, resetBlobCacheForTests } from '../handlers/agent/blobStore'
-import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction } from '../handlers/agent/compactionStrategy'
-import { hydrateHistoryEntries, isSummaryBlobMessage } from '../handlers/agent/historyManager'
+import { RunBlobStore } from '../handlers/agent/blobStore'
+import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction, retainCompactionArtifacts } from '../handlers/agent/compactionStrategy'
+import { hydrateHistoryEntries, isSummaryBlobMessage, retainHistoryEntries } from '../handlers/agent/historyManager'
 import { clampTokenDetails, computeContextUsagePercent, getAutoCompactThreshold, shouldTriggerCompaction } from '../handlers/agent/usage'
 
 // ─── helpers ───
 
-function makeBlobEntry(role: string, content: string, extra?: Record<string, unknown>): { blobId: string, raw: Record<string, unknown>, message: LLMMessage } {
+function makeBlobEntry(role: string, content: string, extra?: Record<string, unknown>): HistoryEntry {
   const raw: Record<string, unknown> = { role, content, ...extra }
   const blob = encodeBlob(raw)
-  cacheBlob(blob.blobId, blob.blobData)
   return {
     blobId: blob.blobId,
+    blobData: blob.blobData,
     raw,
     message: { role: role as 'system' | 'user' | 'assistant', content },
   }
@@ -50,12 +50,10 @@ beforeEach(async () => {
   tmpDbPath = join(tmpdir(), `.tmp-auto-summarize-${Date.now()}-${Math.random().toString(36).slice(2)}.db`)
   process.env.BYOK_AGENT_DB_PATH = tmpDbPath
   await resetAgentDatabaseForTests()
-  resetBlobCacheForTests()
 })
 
 afterEach(async () => {
   await resetAgentDatabaseForTests()
-  resetBlobCacheForTests()
   delete process.env.BYOK_AGENT_DB_PATH
   for (const suffix of ['', '-wal', '-shm']) {
     try {
@@ -251,21 +249,25 @@ it('createCompactionArtifacts preserves previous summary archive IDs', () => {
 it('hydrateHistoryEntries recovers cached blobs', () => {
   const entries = makeHistoryEntries(4)
   const blobIds = entries.map(e => e.blobId)
+  const store = new RunBlobStore()
+  retainHistoryEntries(store, entries)
 
-  const hydrated = hydrateHistoryEntries(blobIds)
+  const hydrated = hydrateHistoryEntries(blobIds, store)
 
   expect(hydrated.length).toBe(4)
   expect(hydrated[0].message.role).toBe('user')
   expect(hydrated[1].message.role).toBe('assistant')
 })
 
-it('hydrateHistoryEntries skips missing blobs', () => {
+it.each(['missing', 'corrupt'])('hydrateHistoryEntries rejects %s required blobs instead of shortening history', (failureKind) => {
   const entries = makeHistoryEntries(2)
-  const blobIds = [entries[0].blobId, 'nonexistent-blob-id', entries[1].blobId]
+  const blobIds = [entries[0].blobId, 'unusable-blob-id', entries[1].blobId]
+  const store = new RunBlobStore()
+  retainHistoryEntries(store, entries)
+  if (failureKind === 'corrupt')
+    store.cacheBlob('unusable-blob-id', Buffer.from('{invalid JSON').toString('base64'))
 
-  const hydrated = hydrateHistoryEntries(blobIds)
-
-  expect(hydrated.length).toBe(2)
+  expect(() => hydrateHistoryEntries(blobIds, store)).toThrow(/unusable-blob-id/)
 })
 
 // ─── isSummaryBlobMessage tests ───
@@ -344,7 +346,11 @@ it('end-to-end: compaction reduces blob count and token estimate', () => {
   expect(compactedTokenEstimate < originalTokenEstimate, `expected fewer tokens: ${compactedTokenEstimate} < ${originalTokenEstimate}`).toBeTruthy()
 
   // Verify compacted blobs can be hydrated
-  const hydrated = hydrateHistoryEntries(artifacts.nextRootBlobIds)
+  const store = new RunBlobStore()
+  retainHistoryEntries(store, entries)
+  expect(store.getCachedBlob(artifacts.summaryBlobId)).toBeUndefined()
+  retainCompactionArtifacts(store, artifacts)
+  const hydrated = hydrateHistoryEntries(artifacts.nextRootBlobIds, store)
   expect(hydrated.length > 0, 'compacted blobs should be hydratable').toBeTruthy()
 
   // Summary blob should be among them

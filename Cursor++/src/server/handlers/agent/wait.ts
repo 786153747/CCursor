@@ -84,10 +84,6 @@ export async function waitForExecMessageMatching(
     return msg;
 }
 
-function delay(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 /**
  * 在等待 Promise 期间持续 yield heartbeat，防止 Cursor stall detector 误判连接断开。
  *
@@ -101,6 +97,7 @@ export async function* waitForPromiseWithHeartbeat<T>(
     let settled = false;
     let result: T;
     let failure: unknown;
+    let rejected = false;
 
     const wrapped = promise.then(
         (value) => {
@@ -109,21 +106,31 @@ export async function* waitForPromiseWithHeartbeat<T>(
         },
         (error) => {
             settled = true;
+            rejected = true;
             failure = error;
         },
     );
 
     while (!settled) {
-        const raced = await Promise.race([
-            wrapped.then(() => 'done' as const),
-            delay(intervalMs).then(() => 'tick' as const),
-        ]);
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        let raced: 'done' | 'tick';
+        try {
+            raced = await Promise.race([
+                wrapped.then(() => 'done' as const),
+                new Promise<'tick'>(resolve => {
+                    timer = setTimeout(() => resolve('tick'), intervalMs);
+                }),
+            ]);
+        } finally {
+            if (timer !== undefined)
+                clearTimeout(timer);
+        }
         if (raced === 'tick' && !settled) {
             yield heartbeat();
         }
     }
 
-    if (failure !== undefined) throw failure;
+    if (rejected) throw failure;
     return result!;
 }
 
@@ -132,9 +139,10 @@ export async function* waitForMessageMatchingWithHeartbeat(
     predicate: (msg: Record<string, unknown>) => boolean,
     timeoutMs: number | null = null,
     intervalMs = AGENT_HEARTBEAT_INTERVAL_MS,
+    signal?: AbortSignal,
 ): AsyncGenerator<AgentServerMessage, Record<string, unknown> | null, void> {
     return yield* waitForPromiseWithHeartbeat(
-        waitForMessageMatching(session, predicate, timeoutMs),
+        waitForMessageMatching(session, predicate, timeoutMs, signal),
         intervalMs,
     );
 }

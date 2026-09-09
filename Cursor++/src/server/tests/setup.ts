@@ -19,7 +19,34 @@
  *   空字符串会让 resolveProviderRuntime/routeModel 直接抛 Missing credentials。
  */
 import type { ProvidersConfig } from '../data/defaults'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { afterAll, beforeEach } from 'vitest'
 import { setProvidersForTests } from '../config/providersStore'
+import { closeAgentDatabase } from '../database/sqlite'
+
+// setupFiles runs separately for each test file. Never inherit a real DB path.
+const testDirectory = mkdtempSync(join(tmpdir(), 'ccursor-server-tests-'))
+const testDatabasePath = join(testDirectory, 'cursor.db')
+process.env.BYOK_AGENT_DB_PATH = testDatabasePath
+
+// Spill paths use os.homedir(), with no dedicated spill-directory override.
+process.env.HOME = testDirectory
+process.env.USERPROFILE = testDirectory
+
+beforeEach(() => {
+  // Some tests delete their overrides during teardown. Restore safe defaults
+  // without replacing overrides supplied by a test file or its own hooks.
+  process.env.BYOK_AGENT_DB_PATH ||= testDatabasePath
+  process.env.HOME ||= testDirectory
+  process.env.USERPROFILE ||= testDirectory
+})
+
+afterAll(async () => {
+  await closeAgentDatabase()
+  rmSync(testDirectory, { recursive: true, force: true })
+})
 
 const TEST_PROVIDERS: ProvidersConfig = {
   $schemaVersion: 1,

@@ -1,5 +1,6 @@
 import type { AgentServerMessage } from '../../gen/agent_v1_pb'
 import type { LLMStreamEvent } from '../llm/types'
+import { blobIdToBytes } from './blob'
 /**
  * Agent 流翻译器
  *
@@ -464,17 +465,16 @@ export function kvGetBlob(id: number, blobId: Uint8Array): AgentServerMessage {
 /**
  * 构造 kvServerMessage.setBlobArgs 帧 — 向 Client 发送 blob 存储。
  *
- * 对齐 official:
- * - system scaffold blob 使用 id=0 (proto scalar default，JSON 中通常省略)
- * - 首个 ordered blob 从 id=1 开始
+ * Zero is the protobuf default and may be omitted in JSON. Run-owned KV
+ * requests allocate unique positive IDs; this low-level encoder still accepts 0.
  *
  * blobData 分两种场景:
  *   - JSON blob (encodeBlob): base64 文本 → TextEncoder.encode → 客户端按原样存储
  *   - Protobuf blob (encodeBinaryBlob): blobDataRaw 直接传 raw protobuf bytes，
  *     客户端存 raw bytes，fork 时 fromBinary 可直接解析
  *
- * blobId 始终存的是 base64 文本的 UTF-8 字节（sha256 hash 的 base64 表示），
- * 与 checkpoint.turns / turn 内部引用保持一致。
+ * Project-generated IDs retain their legacy base64-hash text bytes; opaque
+ * client fork IDs roundtrip unchanged through the shared key codec.
  */
 export function kvMessage(id: number | undefined, blobId: string, blobData: string, blobDataRaw?: Uint8Array): AgentServerMessage {
   return create(AgentServerMessageSchema, {
@@ -485,7 +485,7 @@ export function kvMessage(id: number | undefined, blobId: string, blobData: stri
         message: {
           case: 'setBlobArgs',
           value: {
-            blobId: new TextEncoder().encode(blobId),
+            blobId: blobIdToBytes(blobId),
             blobData: blobDataRaw ?? new TextEncoder().encode(blobData),
           },
         } as any,
@@ -534,8 +534,6 @@ export function checkpoint(
     breakdownCategories?: Array<{ id: string, label: string, estimatedTokens: number }>
   },
 ): AgentServerMessage {
-  const encoder = new TextEncoder()
-
   const pendingToolCalls: string[] = []
   if (assistantMessage) {
     const content: Array<Record<string, unknown>> = []
@@ -605,8 +603,8 @@ export function checkpoint(
     message: {
       case: 'conversationCheckpointUpdate',
       value: create(ConversationStateStructureSchema, {
-        rootPromptMessagesJson: blobIds.map(id => encoder.encode(id)),
-        turns: (extras?.turnBlobIds ?? []).map(id => encoder.encode(id)),
+        rootPromptMessagesJson: blobIds.map(blobIdToBytes),
+        turns: (extras?.turnBlobIds ?? []).map(blobIdToBytes),
         pendingToolCalls,
         tokenDetails: {
           usedTokens,
@@ -621,7 +619,7 @@ export function checkpoint(
               }
             : {}),
         } as any,
-        summaryArchives: (extras?.summaryArchiveIds ?? []).map(id => encoder.encode(id)),
+        summaryArchives: (extras?.summaryArchiveIds ?? []).map(blobIdToBytes),
         // 以下字段官方 checkpoint 必须携带, 否则 Cursor 客户端不回传 conversationState
         mode: agentMode,
         previousWorkspaceUris: extras?.workspaceUris ?? [],

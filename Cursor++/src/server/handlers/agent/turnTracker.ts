@@ -11,11 +11,11 @@ import {
 } from '../../gen/agent_v1_pb'
 import type { AgentServerMessage } from '../../gen/agent_v1_pb'
 import type { ParsedRunRequest } from './protocol/types'
-import type { AgentSession } from './session'
-import { binaryBlobDataFromClientBytes, blobIdToBytes, encodeBinaryBlob } from './blob'
-import { cacheBlob, getCachedBlob } from './blobStore'
-import { fetchBlobsFromClient } from './clientBlobFetch'
-import { logger } from '../../logger'
+import type { BlobRunContext } from './runContext'
+import { binaryBlobDataFromClientBytes, blobIdFromBytes, blobIdToBytes, encodeBinaryBlob } from './blob'
+import type { RunBlobStore } from './blobStore'
+import { fetchBlobsFromClient, type ClientBlobResult } from './clientBlobFetch'
+import { BlobIntegrityError } from './blobErrors'
 
 function resolveAgentMode(mode: string): AgentMode {
   const normalized = mode.replace('AGENT_MODE_', '').toLowerCase()
@@ -32,6 +32,8 @@ function resolveAgentMode(mode: string): AgentMode {
 export interface EncodedBlob {
   blobId: string
   blobData: string
+  blobDataRaw: Uint8Array
+  dependencies?: string[]
 }
 
 export interface TurnBaseline {
@@ -53,10 +55,8 @@ export class ActiveTurnTracker {
     this.stepBlobIds = [...stepBlobIds]
   }
 
-  static fromTurnBlobId(turnBlobId: string): ActiveTurnTracker | null {
-    const baseline = readTurnBaseline(turnBlobId)
-    if (!baseline)
-      return null
+  static fromTurnBlobId(turnBlobId: string, store: RunBlobStore): ActiveTurnTracker {
+    const baseline = readTurnBaseline(turnBlobId, store)
     return new ActiveTurnTracker(
       baseline.userMessageBlobId,
       baseline.stepBlobIds,
@@ -112,23 +112,19 @@ export class ActiveTurnTracker {
   }
 
   materializeTurnBlob(): EncodedBlob {
-    // userMessage / steps 是指向其它 blob 的引用 (blobId)。这些引用的字节必须与
-    // setBlobArgs.blobId (= UTF-8 of blobId 文本) 完全一致，fork (deepCloneComposer)
-    // 时 Client 才能用该引用从本地 KV store getBlob 命中。
-    // (历史 bug: 曾用 Buffer.from(id,'base64') 得到 32 字节 sha256 raw, 与 44 字节的
-    //  store key 不匹配, fork 时抛 "[composer] Missing user message blob")
-    const encoder = new TextEncoder()
-    return encodeBinaryBlob(toBinary(ConversationTurnStructureSchema, create(ConversationTurnStructureSchema, {
+    // Preserve the exact KV key bytes, including opaque IDs rewritten by client forks.
+    const blob = encodeBinaryBlob(toBinary(ConversationTurnStructureSchema, create(ConversationTurnStructureSchema, {
       turn: {
         case: 'agentConversationTurn',
         value: {
-          userMessage: encoder.encode(this.userMessageBlobId),
-          steps: this.stepBlobIds.map(id => encoder.encode(id)),
+          userMessage: blobIdToBytes(this.userMessageBlobId),
+          steps: this.stepBlobIds.map(blobId => blobIdToBytes(blobId)),
           ...(this.requestId ? { requestId: this.requestId } : {}),
           ...(this.dynamicToolCount !== undefined ? { dynamicToolCount: this.dynamicToolCount } : {}),
         },
       },
     })))
+    return { ...blob, dependencies: [this.userMessageBlobId, ...this.stepBlobIds] }
   }
 }
 
@@ -165,35 +161,73 @@ export function createCurrentTurnUserMessageBlob(params: {
  */
 export async function* ensureTurnBlobCached(
   turnBlobId: string,
-  session: AgentSession | null,
-  allocateBlobId: () => number,
+  run: BlobRunContext,
 ): AsyncGenerator<AgentServerMessage, void, void> {
-  if (getCachedBlob(turnBlobId) !== undefined)
+  if (run.blobs.getCachedBlob(turnBlobId) !== undefined) {
+    const baseline = readTurnBaseline(turnBlobId, run.blobs)
+    if (run.blobs.isClientSaved(turnBlobId))
+      run.blobs.addInheritedReferences([baseline.userMessageBlobId, ...baseline.stepBlobIds])
     return
-  const [bytes] = yield* fetchBlobsFromClient({ session, blobIds: [blobIdToBytes(turnBlobId)], allocateBlobId })
-  if (bytes)
-    cacheBlob(turnBlobId, binaryBlobDataFromClientBytes(bytes))
+  }
+  const [result] = yield* fetchBlobsFromClient({ run, blobIds: [blobIdToBytes(turnBlobId)] })
+  if (!result || result.status !== 'ok') {
+    throw new TurnBlobReadError(
+      turnBlobId,
+      result?.status ?? 'not-found',
+      result?.message ?? 'The client did not return the required conversation turn.',
+    )
+  }
+  const blobData = binaryBlobDataFromClientBytes(result.bytes)
+  const baseline = decodeTurnBaseline(turnBlobId, blobData)
+  const dependencies = [baseline.userMessageBlobId, ...baseline.stepBlobIds]
+  run.blobs.cacheBlob(turnBlobId, blobData, result.bytes, dependencies)
+  run.blobs.markClientSaved(turnBlobId)
+  run.blobs.addInheritedReferences(dependencies)
+  run.blobs.turnBaselines.set(turnBlobId, baseline)
 }
 
-export function readTurnBaseline(turnBlobId: string): TurnBaseline | null {
-  const blobData = getCachedBlob(turnBlobId)
-  if (!blobData)
-    return null
+type TurnBlobReadStatus = Exclude<ClientBlobResult['status'], 'ok'>
+
+export class TurnBlobReadError extends BlobIntegrityError {
+  constructor(
+    readonly turnBlobId: string,
+    readonly status: TurnBlobReadStatus,
+    message: string,
+  ) {
+    super([{ blobId: turnBlobId, status, message }])
+  }
+}
+
+function decodeTurnBaseline(turnBlobId: string, blobData: string): TurnBaseline {
   try {
     const turn = fromBinary(ConversationTurnStructureSchema, Buffer.from(blobData, 'base64'))
     if (turn.turn.case !== 'agentConversationTurn')
-      return null
+      throw new Error('The blob does not contain an agent conversation turn.')
     const value = turn.turn.value
-    // 与 materializeTurnBlob 对称: 引用以 UTF-8 of blobId 文本写入，这里同样按 UTF-8 还原
+    if (value.userMessage.byteLength === 0 || value.steps.some(step => step.byteLength === 0))
+      throw new Error('The conversation turn contains an empty user or step reference.')
+    const userMessageBlobId = blobIdFromBytes(value.userMessage)
+    const stepBlobIds = value.steps.map(step => blobIdFromBytes(step))
     return {
-      userMessageBlobId: Buffer.from(value.userMessage).toString('utf-8'),
-      stepBlobIds: value.steps.map(step => Buffer.from(step).toString('utf-8')),
+      userMessageBlobId,
+      stepBlobIds,
       requestId: value.requestId,
       dynamicToolCount: value.dynamicToolCount,
     }
   }
   catch (error) {
-    logger.warn({ turnBlobId, error: (error as Error).message }, '[TURN] failed to decode turn baseline')
-    return null
+    throw new TurnBlobReadError(turnBlobId, 'decode-error', error instanceof Error ? error.message : String(error))
   }
+}
+
+export function readTurnBaseline(turnBlobId: string, store: RunBlobStore): TurnBaseline {
+  const cachedBaseline = store.turnBaselines.get(turnBlobId)
+  if (cachedBaseline)
+    return cachedBaseline
+  const blobData = store.getCachedBlob(turnBlobId)
+  if (blobData === undefined)
+    throw new TurnBlobReadError(turnBlobId, 'not-found', 'The required conversation turn was not retained for this run.')
+  const baseline = decodeTurnBaseline(turnBlobId, blobData)
+  store.turnBaselines.set(turnBlobId, baseline)
+  return baseline
 }

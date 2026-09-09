@@ -2,30 +2,33 @@ import { randomUUID } from 'crypto';
 import type { AgentServerMessage } from '../../gen/agent_v1_pb';
 import { workspaceUris, type ParsedRunRequest } from './protocol';
 import type { AgentSession } from './session';
-import { heartbeat, checkpoint, kvMessage, summary, summaryCompleted, summaryStarted } from './stream';
+import { heartbeat, checkpoint, summary, summaryCompleted, summaryStarted } from './stream';
 import { clampTokenDetails, computeContextUsagePercent } from './usage';
 import { resolveProviderRuntime } from '../llm';
-import type { BlobRequestIdAllocator } from './agentOrchestrator';
-import { loadHistoryEntries, repairHistoryEntries, sendRootBlobsUnknownToClient } from './historyManager';
-import { buildSummarySource, createCompactionArtifacts, measureMessagesTokens, planCompaction, streamSummaryWithFallback } from './compactionStrategy';
-import { releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock';
-import { HEARTBEAT_TICK, pumpWithTimedHeartbeats } from './conversationRuntime';
+import type { BlobRunContext } from './runContext';
+import { loadHistoryEntries, repairHistoryEntries } from './historyManager';
+import { buildSummarySource, createCompactionArtifacts, measureMessagesTokens, planCompaction, retainCompactionArtifacts, streamSummaryWithFallback } from './compactionStrategy';
+import { releaseCompactionLock, tryAcquireCompactionLock } from './compactionLock';
+import { HEARTBEAT_TICK, pumpWithTimedHeartbeats, waitForRunCompactionLockRelease } from './conversationRuntime';
 import { executePreCompactHook } from './hookRuntime';
 import { persistConversationCheckpoint } from '../../database/checkpoints';
 import { logger } from '../../logger';
+import { saveCheckpointBlobs } from './clientBlobFetch';
+import { throwIfBlobRunInactive } from './checkpointManager';
 
 export async function* handleSummarizeAction(
     parsed: ParsedRunRequest,
     session: AgentSession | null,
-    options: BlobRequestIdAllocator,
+    run: BlobRunContext,
 ): AsyncIterable<AgentServerMessage> {
+    throwIfBlobRunInactive(run);
     const route = resolveProviderRuntime(parsed.modelId);
-    // 并发互斥 (设计文档 §7#7): 等待 inline 压缩释放后再重新评估是否仍需压缩
-    await waitForCompactionLockRelease(parsed.conversationId);
-    if (!tryAcquireCompactionLock(parsed.conversationId))
-        logger.warn({ conversationId: parsed.conversationId }, '[AUTOCOMPACT] summarizeAction lock contention — proceeding after wait');
+    // Release wakes every waiter; only a successful acquire grants lock ownership.
+    while (!tryAcquireCompactionLock(parsed.conversationId))
+        yield* waitForRunCompactionLockRelease(parsed.conversationId, run);
     try {
-        yield* handleSummarizeActionLocked(parsed, session, route, options);
+        throwIfBlobRunInactive(run);
+        yield* handleSummarizeActionLocked(parsed, session, route, run);
     }
     finally {
         releaseCompactionLock(parsed.conversationId);
@@ -36,16 +39,14 @@ async function* handleSummarizeActionLocked(
     parsed: ParsedRunRequest,
     session: AgentSession | null,
     route: ReturnType<typeof resolveProviderRuntime>,
-    options: BlobRequestIdAllocator,
+    run: BlobRunContext,
 ): AsyncIterable<AgentServerMessage> {
     // 历史 blob 与对话路径同源: 内存未命中的经 getBlobArgs 向客户端取
     const hydratedHistoryEntries = yield* loadHistoryEntries({
         historyBlobIds: parsed.historyBlobIds,
-        session,
-        allocateBlobId: options.allocateBlobId,
+        run,
     });
-    const missingHistoryBlobs = Math.max(0, parsed.historyBlobIds.length - hydratedHistoryEntries.length);
-    const historyEntries = repairHistoryEntries(hydratedHistoryEntries);
+    const historyEntries = repairHistoryEntries(hydratedHistoryEntries, run.blobs);
     const contextTokenLimit = parsed.historyTokenDetails?.maxTokens ?? parsed.contextTokenLimit ?? route.contextTokenLimit;
     const compactionPlan = planCompaction(historyEntries, { contextTokenLimit });
     const currentTokenDetails = clampTokenDetails(
@@ -60,7 +61,6 @@ async function* handleSummarizeActionLocked(
         model: route.model,
         historyBlobIds: parsed.historyBlobIds.length,
         hydratedEntries: hydratedHistoryEntries.length,
-        missingBlobs: missingHistoryBlobs,
         summarizeEntries: compactionPlan.summarizeEntries.length,
         keepTail: compactionPlan.keepTail.length,
         contextUsagePercent: contextUsagePercent.toFixed(1),
@@ -84,54 +84,9 @@ async function* handleSummarizeActionLocked(
         execMessageId: 1,
     });
 
+    throwIfBlobRunInactive(run);
     yield summaryStarted();
-
-    if (missingHistoryBlobs > 0) {
-        logger.warn({
-            conversationId: parsed.conversationId,
-            requestedBlobs: parsed.historyBlobIds.length,
-            resolvedBlobs: hydratedHistoryEntries.length,
-            missingHistoryBlobs,
-        }, '[AGENT] summarizeAction skipped due to incomplete history');
-
-        logger.info({
-            conversationId: parsed.conversationId,
-            origin: 'client_summarize',
-            kind: 'committed',
-            usedTokens: currentTokenDetails.usedTokens,
-            maxTokens: currentTokenDetails.maxTokens,
-            rootBlobCount: parsed.historyBlobIds.length,
-            summaryArchiveCount: parsed.historySummaryArchiveIds.length,
-        }, '[AUTOCOMPACT] checkpoint write');
-        persistConversationCheckpoint({
-            kind: 'committed',
-            conversationId: parsed.conversationId,
-            rootBlobIds: parsed.historyBlobIds,
-            turnBlobIds: parsed.historyTurnBlobIds,
-            summaryArchiveIds: parsed.historySummaryArchiveIds,
-            tokenDetails: currentTokenDetails,
-            mode: parsed.mode,
-            updatedAt: Date.now(),
-        });
-
-        yield checkpoint(
-            parsed.historyBlobIds,
-            currentTokenDetails.usedTokens,
-            currentTokenDetails.maxTokens,
-            parsed.mode,
-            undefined,
-            {
-                turnBlobIds: parsed.historyTurnBlobIds,
-                summaryArchiveIds: parsed.historySummaryArchiveIds,
-                workspaceUris: workspaceUris(parsed),
-                readPaths: parsed.readPaths,
-                modelName: route.model,
-                gitRepos: parsed.gitRepos?.map(r => ({ path: r.path, branchName: r.branchName })),
-            },
-        );
-        yield summaryCompleted(hookMessage ?? 'Compaction deferred: conversation history is incomplete.');
-        return;
-    }
+    throwIfBlobRunInactive(run);
 
     if (compactionPlan.summarizeEntries.length === 0) {
         // F2: mode==='disabled' 时 plan 同样返回空 summarizeEntries, 但语义是
@@ -152,7 +107,13 @@ async function* handleSummarizeActionLocked(
             rootBlobCount: parsed.historyBlobIds.length,
             summaryArchiveCount: parsed.historySummaryArchiveIds.length,
         }, '[AUTOCOMPACT] checkpoint write');
-        persistConversationCheckpoint({
+        yield* saveCheckpointBlobs(run, [
+            ...parsed.historyBlobIds,
+            ...parsed.historyTurnBlobIds,
+            ...parsed.historySummaryArchiveIds,
+        ]);
+        throwIfBlobRunInactive(run);
+        await persistConversationCheckpoint({
             kind: 'committed',
             conversationId: parsed.conversationId,
             rootBlobIds: parsed.historyBlobIds,
@@ -161,11 +122,13 @@ async function* handleSummarizeActionLocked(
             tokenDetails: currentTokenDetails,
             mode: parsed.mode,
             updatedAt: Date.now(),
-        });
+        }, run.signal);
 
+        throwIfBlobRunInactive(run);
         yield summaryCompleted(hookMessage ?? (compactionPlan.mode === 'disabled'
             ? 'Compaction unavailable: system prompt plus reserves exceed this model\'s usable context window. Consider a larger-context model.'
             : 'Conversation already compact enough.'));
+        throwIfBlobRunInactive(run);
         yield checkpoint(
             parsed.historyBlobIds,
             currentTokenDetails.usedTokens,
@@ -206,6 +169,7 @@ async function* handleSummarizeActionLocked(
         sourceText: summarySourceText,
         contextTokenLimit,
     }))) {
+        throwIfBlobRunInactive(run);
         if (summaryEvent === HEARTBEAT_TICK) {
             yield heartbeat();
             continue;
@@ -217,6 +181,7 @@ async function* handleSummarizeActionLocked(
         if (summaryEvent.type === 'done')
             summaryText = summaryEvent.text;
     }
+    throwIfBlobRunInactive(run);
 
     logger.info({
         conversationId: parsed.conversationId,
@@ -230,16 +195,12 @@ async function* handleSummarizeActionLocked(
         previousSummaryArchiveIds: parsed.historySummaryArchiveIds,
     });
 
-    yield kvMessage(1, artifacts.summaryBlobId, artifacts.summaryBlobData);
-    for (const [index, archiveBlob] of artifacts.archiveBlobs.entries()) {
-        yield kvMessage(2 + index, archiveBlob.blobId, archiveBlob.blobData, archiveBlob.blobDataRaw);
-    }
-    // repair 重编码 / 占位 / 锚点副本等本轮新造的 root blob, 客户端还没有 → 补发
-    yield* sendRootBlobsUnknownToClient(
-        artifacts.nextRootBlobIds,
-        [...parsed.historyBlobIds, artifacts.summaryBlobId],
-        2 + artifacts.archiveBlobs.length,
-    );
+    retainCompactionArtifacts(run.blobs, artifacts);
+    yield* saveCheckpointBlobs(run, [
+        ...artifacts.nextRootBlobIds,
+        ...parsed.historyTurnBlobIds,
+        ...artifacts.nextSummaryArchiveIds,
+    ]);
 
     const compactedUsedTokens = clampTokenDetails(
         // o200k 实测重置 (与 inline 路径同口径, 两路行为一致由单一实现保证)
@@ -260,7 +221,8 @@ async function* handleSummarizeActionLocked(
         rootBlobCount: artifacts.nextRootBlobIds.length,
         summaryArchiveCount: artifacts.nextSummaryArchiveIds.length,
     }, '[AUTOCOMPACT] checkpoint write');
-    persistConversationCheckpoint({
+    throwIfBlobRunInactive(run);
+    await persistConversationCheckpoint({
         kind: 'committed',
         conversationId: parsed.conversationId,
         rootBlobIds: artifacts.nextRootBlobIds,
@@ -269,8 +231,9 @@ async function* handleSummarizeActionLocked(
         tokenDetails: compactedUsedTokens,
         mode: parsed.mode,
         updatedAt: Date.now(),
-    });
+    }, run.signal);
 
+    throwIfBlobRunInactive(run);
     yield checkpoint(
         artifacts.nextRootBlobIds,
         compactedUsedTokens.usedTokens,
@@ -286,5 +249,6 @@ async function* handleSummarizeActionLocked(
             gitRepos: parsed.gitRepos?.map(r => ({ path: r.path, branchName: r.branchName })),
         },
     );
+    throwIfBlobRunInactive(run);
     yield summaryCompleted(hookMessage ?? 'Chat context summarized.');
 }

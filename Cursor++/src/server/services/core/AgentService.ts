@@ -26,7 +26,7 @@ import { toJson } from '@bufbuild/protobuf'
 import { ConnectError } from '@connectrpc/connect'
 import { type AgentClientMessage, AgentClientMessageSchema, AgentService } from '../../gen/agent_v1_pb'
 import { handleRunRequest } from '../../handlers/agent/agentOrchestrator'
-import { cacheBlob } from '../../handlers/agent/blobStore'
+import { uploadHandoff } from '../../handlers/agent/uploadHandoff'
 import { registerCloneLineage } from '../../handlers/agent/cloneRegistry'
 import { ModelNotFoundError } from '../../handlers/models/mapper'
 import { makeByokConnectError, makeModelNotFoundError, makeProviderError } from '../../handlers/errors'
@@ -48,6 +48,16 @@ function normalizeToConnectError(error: unknown, context: Record<string, string>
     return error
   if (error instanceof ModelNotFoundError)
     return makeModelNotFoundError(error.modelId)
+  if (error instanceof Error && error.name.startsWith('Blob')) {
+    return makeByokConnectError({
+      errorCode: ErrorDetails_Error.CUSTOM,
+      title: 'Conversation data unavailable; checkpoint preserved',
+      detail: error.message,
+      isRetryable: 'retryable' in error && error.retryable === true,
+      additionalInfo: { ...context, errorClass: error.name },
+      cause: error,
+    })
+  }
   return makeProviderError(error, context)
 }
 
@@ -69,17 +79,34 @@ function isStreamDestroyedError(error: unknown): boolean {
  * 此前这里把 kvClientMessage 与 clientHeartbeat 一并 continue 掉, 结果 bidi 模式下
  * 每次 getBlobArgs 都等到 BLOB_FETCH_TIMEOUT_MS 超时才放弃; SSE 降级路径
  * (BidiAppend → appendMessage) 从未做过这种过滤, 所以只有 bidi 受影响。
- * 与 SSE 路径对齐后, setBlobResult ACK 同样会入队 —— 它们体积极小且无人等待,
- * 留在队列里直到 run 结束, 与 SSE 路径的既有行为一致。
+ * SetBlobResult also reaches the run-owned KV waiters; checkpoint publication
+ * requires their successful acknowledgement rather than merely queueing a send.
  */
 export async function pumpBidiClientMessages(
   iterator: AsyncIterator<AgentClientMessage>,
   session: AgentSession,
 ): Promise<void> {
   try {
-    while (true) {
-      const next = await iterator.next()
-      if (next.done)
+    while (!session.closed) {
+      let resolveClosed!: () => void
+      const closed = new Promise<null>((resolve) => {
+        resolveClosed = () => resolve(null)
+      })
+      const onSessionChange = (): void => {
+        if (session.closed)
+          resolveClosed()
+      }
+      session.listeners.add(onSessionChange)
+      // Output can finish or fail while the client is still waiting for it.
+      // Waiting for client EOF here would prevent that error/EOF from being sent.
+      let next: IteratorResult<AgentClientMessage> | null
+      try {
+        next = await Promise.race([iterator.next(), closed])
+      }
+      finally {
+        session.listeners.delete(onSessionChange)
+      }
+      if (!next || next.done || session.closed)
         break
       const msg = toJson(AgentClientMessageSchema, next.value) as Record<string, unknown>
       if ('clientHeartbeat' in msg)
@@ -271,32 +298,24 @@ export default (router: ConnectRouter) => {
      *   - selectedContext.external_links.blob_id (PDF blob)
      *   - selectedContext.selected_pull_requests.blob_id / git_pr_diff_selections.blob_id
      *
-     * 客户端在发 RunRequest **之前**会先 chunk(≤100 条/批)上传 blobs,
-     * Server 把每条存进 blobCache,key 为 utf-8 decode 后的 blob id 字符串,
-     * value 为 base64 encoded bytes。下游 parseRunRequest + resolveExtraContextBlobs
-     * 直接从 blobCache 命中。
+     * Client uploads can precede RunRequest; fork uploads are asynchronously
+     * queued in chunks of at most 100 IDs and are not a Run completion barrier.
+     * Server retains the original key/value bytes in a short-lived handoff,
+     * isolated by conversationId. Runs copy only the blobs they reference.
      *
      * 编码对齐 (与 parseRunRequest.ts 里的 extraContextEntries.blob_id 解码一致):
-     *   - blob.id (bytes) → TextDecoder.decode → utf-8 string 作为 cache key
-     *   - blob.value (bytes) → base64 string 作为 cache value
+     *   - Blob keys remain bytes; JSON/history versus protobuf decoding belongs
+     *     to the consumer, not the upload RPC.
      *
      * 分片语义:
-     *   - chunk_index / total_chunks 只用于客户端进度,server 端逐条 cacheBlob 即可。
-     *   - Response 空体只表示 ACK。
+     *   - Chunks are independent (there is no upload attempt id in this RPC).
+     *   - Empty response acknowledges handoff acceptance, not client storage.
      */
     async uploadConversationBlobs(req) {
       const { conversationId, blobs, chunkIndex, totalChunks } = req
-      let cached = 0
-      for (const blob of blobs) {
-        if (!blob.id || blob.id.length === 0)
-          continue
-        const blobId = Buffer.from(blob.id).toString('utf-8')
-        const blobData = Buffer.from(blob.value ?? new Uint8Array()).toString('base64')
-        cacheBlob(blobId, blobData)
-        cached++
-      }
+      uploadHandoff.putChunk({ conversationId, blobs, chunkIndex, totalChunks })
       logger.debug(
-        { conversationId, chunkIndex, totalChunks, cached, received: blobs.length },
+        { conversationId, chunkIndex, totalChunks, accepted: blobs.length },
         '[SVC] UploadConversationBlobs chunk received',
       )
       return {}
@@ -305,10 +324,11 @@ export default (router: ConnectRouter) => {
     /**
      * NotifyConversationClone — Fork Chat 血缘登记
      *
-     * 客户端 "Fork Chat" 时 deepCloneComposer 在本地复制整个对话(重映射所有
-     * bubbleId/blobId),完成后调用此 RPC 通知后端这是一次克隆。请求只含血缘元数据
+     * Client forks rewrite selected user/turn blobs while retaining unchanged
+     * references. This RPC reports lineage only, not completion of blob uploads.
+     * 请求只含血缘元数据
      * (新对话 id ← 源对话 id + 源 requestId),**不含 blob 内容** —— cloned blob
-     * 由 UploadConversationBlobs 单独上传并缓存,fork 对话首次 Run 时即可命中重建。
+     * 由 UploadConversationBlobs 单独上传到短期交接区; 未到达的引用需经 KV 取回。
      *
      * 此前未实现导致客户端收到 unimplemented、重试 3 次并打 metric。现在登记血缘
      * 并 ACK,消除噪音,同时为诊断 / transcript 关联保留映射。

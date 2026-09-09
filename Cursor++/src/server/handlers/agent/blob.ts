@@ -32,23 +32,43 @@ export function encodeBinaryBlob(bytes: Uint8Array): { blobId: string; blobData:
 
 /** 解码 blob base64 → JSON */
 export function decodeBlob(blobData: string): unknown {
-    const json = Buffer.from(blobData, 'base64').toString('utf-8');
+    const bytes = Buffer.from(blobData, 'base64');
+    if (bytes.toString('base64') !== blobData)
+        throw new Error('Non-canonical or invalid base64 blob data');
+    const json = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     return JSON.parse(json);
 }
 
 /**
  * ── 与客户端 KV 存储之间的字节互转 ──
  *
- * 客户端是 blob 的唯一持久持有方, 服务端只在需要时经 getBlobArgs 取回。
+ * Runtime data is retrieved through the client protocol; this says nothing
+ * about the internal persistence policy of the official cloud service.
  * 线上字节形态由 stream.kvMessage 发 setBlobArgs 时决定, 两类 blob 不对称:
  *   - JSON blob (encodeBlob):      发 TextEncoder.encode(base64 文本) → 客户端存 base64 文本的 UTF-8 字节
  *   - 二进制 blob (encodeBinaryBlob): 发 raw bytes → 客户端存原始 protobuf 字节
- *   - blobId:                      始终是 base64(sha256) 文本的 UTF-8 字节
+ *   - 本项目生成的 blobId:          base64(sha256) 文本的 UTF-8 字节
+ *   - Client fork IDs may be opaque raw hashes; preserve their exact bytes.
  * 取回时按 blob 种类做对应的逆运算, 得到 blobStore 约定的 base64 文本。
  */
 
-/** blobId 文本 → getBlobArgs.blobId 字节 (与 kvMessage 的 setBlobArgs 编码一致) */
+const OPAQUE_BLOB_ID_PREFIX = 'blob-bytes:';
+
+/** Keep legacy textual IDs unchanged; preserve client fork IDs without UTF-8 loss. */
+export function blobIdFromBytes(bytes: Uint8Array): string {
+    try {
+        const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+        if (!text.startsWith(OPAQUE_BLOB_ID_PREFIX))
+            return text;
+    } catch {}
+    // An internal representation only: this prefix is never sent on the wire.
+    return OPAQUE_BLOB_ID_PREFIX + Buffer.from(bytes).toString('base64');
+}
+
+/** Legacy base64 hash TEXT is UTF-8 encoded, never decoded into a raw hash. */
 export function blobIdToBytes(blobId: string): Uint8Array {
+    if (blobId.startsWith(OPAQUE_BLOB_ID_PREFIX))
+        return new Uint8Array(Buffer.from(blobId.slice(OPAQUE_BLOB_ID_PREFIX.length), 'base64'));
     return new TextEncoder().encode(blobId);
 }
 
@@ -61,10 +81,10 @@ export function blobIdToBytes(blobId: string): Uint8Array {
  */
 export function jsonBlobDataFromClientBytes(bytes: Uint8Array): string | null {
     if (bytes.length === 0) return null;
-    const text = Buffer.from(bytes).toString('utf-8');
-    const looksLikeRawJson = /^[\s]*[{[]/.test(text);
-    const blobData = looksLikeRawJson ? Buffer.from(bytes).toString('base64') : text;
     try {
+        const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+        const looksLikeRawJson = /^[\s]*[{[]/.test(text);
+        const blobData = looksLikeRawJson ? Buffer.from(bytes).toString('base64') : text;
         const decoded = decodeBlob(blobData);
         return decoded !== null && typeof decoded === 'object' ? blobData : null;
     } catch {

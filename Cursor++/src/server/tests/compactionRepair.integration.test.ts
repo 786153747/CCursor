@@ -1,17 +1,14 @@
 import type { HistoryEntry } from '../handlers/agent/historyManager'
 import type { LLMContentBlock, LLMMessage } from '../handlers/llm/types'
 import { expect, it } from 'vitest'
+import { RunBlobStore } from '../handlers/agent/blobStore'
 import { planCompaction } from '../handlers/agent/compactionStrategy'
-import { repairHistoryEntries } from '../handlers/agent/historyManager'
+import { hydrateHistoryEntries, materializeHistoryEntries, repairHistoryEntries } from '../handlers/agent/historyManager'
 import { countTokens } from '../handlers/agent/tokenCounter'
 import { repairConversationHistory } from '../handlers/llm/transformMessages'
 
-function makeEntry(index: number, message: LLMMessage): HistoryEntry {
-  return {
-    blobId: `blob-${index}`,
-    raw: { role: message.role, content: message.content as unknown },
-    message,
-  }
+function makeEntry(_index: number, message: LLMMessage): HistoryEntry {
+  return materializeHistoryEntries([message])[0]!
 }
 
 function hasToolUse(message: LLMMessage): boolean {
@@ -158,7 +155,10 @@ it('providerOptions 端到端存续: 摘要 blob 经 hydrate → repair → plan
     content: 'Previous conversation summary:\n- user asked X',
     providerOptions: { cursor: { isSummary: true } },
   }
-  const repaired = repairHistoryEntries([makeEntry(0, summaryMessage)])
+  const store = new RunBlobStore()
+  const [summaryEntry] = materializeHistoryEntries([summaryMessage])
+  store.cacheBlob(summaryEntry!.blobId, summaryEntry!.blobData!)
+  const repaired = repairHistoryEntries(hydrateHistoryEntries([summaryEntry!.blobId], store), store)
   expect(repaired.length).toBe(1)
   expect(repaired[0].message.providerOptions).toEqual({ cursor: { isSummary: true } })
   expect((repaired[0].raw as { providerOptions?: { cursor?: { isSummary?: boolean } } }).providerOptions?.cursor?.isSummary).toBe(true)

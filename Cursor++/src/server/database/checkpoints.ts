@@ -1,3 +1,6 @@
+import type { AsyncDatabase } from './sqlite';
+import { randomUUID } from 'node:crypto';
+import { logger } from '../logger';
 import { getAgentDatabase } from './sqlite';
 
 export type CheckpointKind = 'committed' | 'draft';
@@ -25,6 +28,13 @@ interface CheckpointRow {
     updated_at: number;
 }
 
+interface CheckpointWriteRow extends CheckpointRow {
+    write_token: string;
+}
+
+// Serialize checkpoint writers only, never transactions on the shared usage DB.
+let checkpointPersistenceTail: Promise<void> = Promise.resolve();
+
 function parseStringArray(value: string): string[] {
     try {
         const parsed = JSON.parse(value);
@@ -34,8 +44,71 @@ function parseStringArray(value: string): string[] {
     }
 }
 
-export async function persistConversationCheckpoint(checkpoint: PersistedConversationCheckpoint): Promise<void> {
-    await getAgentDatabase().run(`
+async function restoreCancelledCheckpoint(
+    database: AsyncDatabase,
+    checkpoint: PersistedConversationCheckpoint,
+    writeToken: string,
+    previousRow: CheckpointWriteRow | undefined,
+): Promise<void> {
+    const ownershipParameters = {
+        $conversationId: checkpoint.conversationId,
+        $kind: checkpoint.kind,
+        $cancelledWriteToken: writeToken,
+    };
+
+    // A newer replacement or explicit deletion must not be undone by cancellation.
+    if (!previousRow) {
+        await database.run(`
+            DELETE FROM conversation_checkpoints
+            WHERE conversation_id = $conversationId AND kind = $kind
+              AND write_token = $cancelledWriteToken
+        `, ownershipParameters);
+        return;
+    }
+
+    await database.run(`
+        UPDATE conversation_checkpoints SET
+            root_blob_ids_json = $rootBlobIdsJson,
+            turn_blob_ids_json = $turnBlobIdsJson,
+            summary_archive_ids_json = $summaryArchiveIdsJson,
+            used_tokens = $usedTokens,
+            max_tokens = $maxTokens,
+            mode = $mode,
+            updated_at = $updatedAt,
+            write_token = $previousWriteToken
+        WHERE conversation_id = $conversationId AND kind = $kind
+          AND write_token = $cancelledWriteToken
+    `, {
+        ...ownershipParameters,
+        $rootBlobIdsJson: previousRow.root_blob_ids_json,
+        $turnBlobIdsJson: previousRow.turn_blob_ids_json,
+        $summaryArchiveIdsJson: previousRow.summary_archive_ids_json,
+        $usedTokens: previousRow.used_tokens,
+        $maxTokens: previousRow.max_tokens,
+        $mode: previousRow.mode,
+        $updatedAt: previousRow.updated_at,
+        $previousWriteToken: previousRow.write_token,
+    });
+}
+
+async function writeConversationCheckpoint(
+    checkpoint: PersistedConversationCheckpoint,
+    signal?: AbortSignal,
+): Promise<void> {
+    signal?.throwIfAborted();
+    const database = getAgentDatabase();
+    const previousRow = signal
+        ? await database.get<CheckpointWriteRow>(`
+            SELECT conversation_id, kind, root_blob_ids_json, turn_blob_ids_json,
+                   summary_archive_ids_json, used_tokens, max_tokens, mode, updated_at, write_token
+            FROM conversation_checkpoints
+            WHERE conversation_id = ? AND kind = ?
+        `, [checkpoint.conversationId, checkpoint.kind])
+        : undefined;
+    signal?.throwIfAborted();
+
+    const writeToken = randomUUID();
+    await database.run(`
         INSERT OR REPLACE INTO conversation_checkpoints (
             conversation_id,
             kind,
@@ -45,7 +118,8 @@ export async function persistConversationCheckpoint(checkpoint: PersistedConvers
             used_tokens,
             max_tokens,
             mode,
-            updated_at
+            updated_at,
+            write_token
         ) VALUES (
             $conversationId,
             $kind,
@@ -55,7 +129,8 @@ export async function persistConversationCheckpoint(checkpoint: PersistedConvers
             $usedTokens,
             $maxTokens,
             $mode,
-            $updatedAt
+            $updatedAt,
+            $writeToken
         )
     `, {
         $conversationId: checkpoint.conversationId,
@@ -67,7 +142,33 @@ export async function persistConversationCheckpoint(checkpoint: PersistedConvers
         $maxTokens: checkpoint.tokenDetails.maxTokens,
         $mode: checkpoint.mode,
         $updatedAt: checkpoint.updatedAt,
+        $writeToken: writeToken,
     });
+
+    if (signal?.aborted) {
+        try {
+            await restoreCancelledCheckpoint(database, checkpoint, writeToken, previousRow);
+        } catch (error) {
+            logger.error({
+                conversationId: checkpoint.conversationId,
+                kind: checkpoint.kind,
+                error: error instanceof Error ? error.message : String(error),
+            }, '[DB] failed to restore cancelled checkpoint; previous checkpoint may not be preserved');
+            throw error;
+        }
+        signal.throwIfAborted();
+    }
+}
+
+/** Completion commits the checkpoint; later cancellation does not undo it. */
+export function persistConversationCheckpoint(
+    checkpoint: PersistedConversationCheckpoint,
+    signal?: AbortSignal,
+): Promise<void> {
+    const persistence = checkpointPersistenceTail.then(() => writeConversationCheckpoint(checkpoint, signal));
+    // Failures still reach the caller, but must not poison subsequent queued writes.
+    checkpointPersistenceTail = persistence.catch(() => {});
+    return persistence;
 }
 
 /**

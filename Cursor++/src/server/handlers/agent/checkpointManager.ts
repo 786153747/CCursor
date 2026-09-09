@@ -5,8 +5,22 @@ import { summarizeAssistantContent } from './transcript';
 import { persistConversationCheckpoint } from '../../database/checkpoints';
 import type { LLMContentBlock } from '../llm/types';
 import { logger } from '../../logger';
+import type { BlobRunContext } from './runContext';
+import { saveCheckpointBlobs } from './clientBlobFetch';
+import { AgentRunAbortedError, throwIfSessionCancelled } from './wait';
 
-export function emitRollingCheckpoint(params: {
+export function throwIfBlobRunInactive(run: BlobRunContext): void {
+    if (run.signal.aborted)
+        throw new AgentRunAbortedError('blob run was cancelled or disposed');
+    if (!run.session)
+        return;
+    throwIfSessionCancelled(run.session);
+    if (run.session.closed)
+        throw new AgentRunAbortedError('client disconnected from the run');
+}
+
+export async function* emitRollingCheckpoint(params: {
+    run: BlobRunContext;
     conversationId: string;
     round: number;
     nextBlobbedMessageIndex: number;
@@ -27,7 +41,8 @@ export function emitRollingCheckpoint(params: {
     gitRepos?: Array<{ path: string, branchName: string }>;
     /** Context Window breakdown 分类 token 明细 */
     breakdownCategories?: Array<{ id: string, label: string, estimatedTokens: number }>;
-}): AgentServerMessage {
+}): AsyncGenerator<AgentServerMessage, void, void> {
+    throwIfBlobRunInactive(params.run);
     const rollingAssistantSummary = summarizeAssistantContent(params.lastAssistantContent);
     const rollingTokenDetails = clampTokenDetails(params.usedTokensEstimate, params.contextTokenLimit);
     const rollingContextUsagePercent = computeContextUsagePercent(
@@ -49,7 +64,13 @@ export function emitRollingCheckpoint(params: {
         usageTotals: params.usageTotals,
     }, '[SESSION] round checkpoint update');
 
-    persistConversationCheckpoint({
+    yield* saveCheckpointBlobs(params.run, [
+        ...params.allBlobIds,
+        ...params.turnBlobIds,
+        ...params.summaryArchiveIds,
+    ]);
+    throwIfBlobRunInactive(params.run);
+    await persistConversationCheckpoint({
         conversationId: params.conversationId,
         kind: 'draft',
         rootBlobIds: params.allBlobIds,
@@ -58,9 +79,10 @@ export function emitRollingCheckpoint(params: {
         tokenDetails: rollingTokenDetails,
         mode: params.mode,
         updatedAt: Date.now(),
-    });
+    }, params.run.signal);
 
-    return checkpoint(
+    throwIfBlobRunInactive(params.run);
+    yield checkpoint(
         params.allBlobIds,
         rollingTokenDetails.usedTokens,
         rollingTokenDetails.maxTokens,
@@ -78,7 +100,8 @@ export function emitRollingCheckpoint(params: {
     );
 }
 
-export function emitFinalCheckpoint(params: {
+export async function* emitFinalCheckpoint(params: {
+    run: BlobRunContext;
     conversationId: string;
     allBlobIds: string[];
     turnBlobIds: string[];
@@ -97,7 +120,8 @@ export function emitFinalCheckpoint(params: {
     gitRepos?: Array<{ path: string, branchName: string }>;
     /** Context Window breakdown 分类 token 明细 */
     breakdownCategories?: Array<{ id: string, label: string, estimatedTokens: number }>;
-}): AgentServerMessage {
+}): AsyncGenerator<AgentServerMessage, void, void> {
+    throwIfBlobRunInactive(params.run);
     const assistantSummary = summarizeAssistantContent(params.lastAssistantContent);
     const tokenDetails = clampTokenDetails(params.usedTokensEstimate, params.contextTokenLimit);
     const contextUsagePercent = computeContextUsagePercent(tokenDetails.usedTokens, tokenDetails.maxTokens);
@@ -115,7 +139,13 @@ export function emitFinalCheckpoint(params: {
         usageTotals: params.usageTotals,
     }, '[SESSION] checkpoint assistant content');
 
-    persistConversationCheckpoint({
+    yield* saveCheckpointBlobs(params.run, [
+        ...params.allBlobIds,
+        ...params.turnBlobIds,
+        ...params.summaryArchiveIds,
+    ]);
+    throwIfBlobRunInactive(params.run);
+    await persistConversationCheckpoint({
         conversationId: params.conversationId,
         kind: 'committed',
         rootBlobIds: params.allBlobIds,
@@ -124,9 +154,10 @@ export function emitFinalCheckpoint(params: {
         tokenDetails,
         mode: params.mode,
         updatedAt: Date.now(),
-    });
+    }, params.run.signal);
 
-    return checkpoint(
+    throwIfBlobRunInactive(params.run);
+    yield checkpoint(
         params.allBlobIds,
         tokenDetails.usedTokens,
         tokenDetails.maxTokens,

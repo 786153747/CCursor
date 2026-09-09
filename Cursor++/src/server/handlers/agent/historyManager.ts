@@ -2,60 +2,47 @@ import type { AgentServerMessage } from '../../gen/agent_v1_pb'
 import type { LLMContentBlock, LLMMessage } from '../llm/types'
 import { logger } from '../../logger'
 import { blobIdToBytes, decodeBlob, encodeBlob, jsonBlobDataFromClientBytes } from './blob'
-import { cacheBlob, getCachedBlob } from './blobStore'
+import type { RunBlobStore } from './blobStore'
+import { BlobIntegrityError, type BlobFailure } from './blobErrors'
 import { fetchBlobsFromClient } from './clientBlobFetch'
-import type { AgentSession } from './session'
-import { kvMessage } from './stream'
+import type { BlobRunContext } from './runContext'
 import { normalizeBlobMessage, restoreBlobMessageToLLMMessage } from './transcript'
 import { createRepairDiagnostics, hasRepairMutations, repairConversationHistory, type RepairDiagnostics } from '../llm/transformMessages'
 
 export interface HistoryEntry {
   blobId: string
+  blobData?: string
   raw: Record<string, unknown>
   message: LLMMessage
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object'
+  return !!value && typeof value === 'object' && !Array.isArray(value)
 }
 
-export function* sendAndCacheBlob(
-  buildKvMessage: (id: number, blobId: string, blobData: string) => AgentServerMessage,
-  id: number,
+export function retainMessageBlob(
+  store: RunBlobStore,
   data: { role: string, content: unknown, toolCallId?: string, toolName?: string, isError?: boolean, providerOptions?: Record<string, unknown> },
   blobIds: string[],
-): Generator<AgentServerMessage, void, void> {
+): void {
   const normalized = normalizeBlobMessage(data)
   const blob = encodeBlob(normalized)
   blobIds.push(blob.blobId)
-  cacheBlob(blob.blobId, blob.blobData)
-  yield buildKvMessage(id, blob.blobId, blob.blobData)
+  store.cacheBlob(blob.blobId, blob.blobData)
 }
 
-export function* flushMessageBlobs(
-  buildKvMessage: (id: number, blobId: string, blobData: string) => AgentServerMessage,
+export function retainMessageBlobs(
+  store: RunBlobStore,
   messages: LLMMessage[],
   startIndex: number,
-  blobCounter: number,
   blobIds: string[],
-): Generator<AgentServerMessage, { nextIndex: number, blobCounter: number }, void> {
+): { nextIndex: number } {
   let nextIndex = startIndex
-  let nextBlobCounter = blobCounter
-
-  for (let i = startIndex; i < messages.length; i++) {
-    const msg = messages[i]
-    yield* sendAndCacheBlob(buildKvMessage, ++nextBlobCounter, {
-      role: msg.role,
-      content: msg.content,
-      toolCallId: msg.toolCallId,
-      toolName: msg.toolName,
-      isError: msg.isError,
-      providerOptions: msg.providerOptions,
-    }, blobIds)
-    nextIndex = i + 1
+  for (let messageIndex = startIndex; messageIndex < messages.length; messageIndex++) {
+    retainMessageBlob(store, messages[messageIndex]!, blobIds)
+    nextIndex = messageIndex + 1
   }
-
-  return { nextIndex, blobCounter: nextBlobCounter }
+  return { nextIndex }
 }
 
 export function extractPlainTextContent(message: LLMMessage): string {
@@ -197,30 +184,86 @@ export function isSummaryBlobMessage(raw: Record<string, unknown>): boolean {
   return false
 }
 
-export function hydrateHistoryEntries(blobIds: string[]): HistoryEntry[] {
-  const entries: HistoryEntry[] = []
-  for (const blobId of blobIds) {
-    const blobData = getCachedBlob(blobId)
-    if (!blobData)
-      continue
-    try {
-      const decoded = decodeBlob(blobData)
-      if (!isRecord(decoded))
-        continue
-      const restored = restoreBlobMessageToLLMMessage(decoded)
-      if (!restored)
-        continue
-      entries.push({ blobId, raw: decoded, message: restored })
-    }
-    catch (error) {
-      logger.warn({ blobId, error: (error as Error).message }, '[SESSION] failed to hydrate history entry')
-    }
+function isValidHistoryBlock(block: unknown): boolean {
+  if (!isRecord(block))
+    return false
+  switch (block.type) {
+    case 'text':
+    case 'reasoning':
+    case 'thinking':
+      return typeof block.text === 'string'
+    case 'image':
+      return typeof block.mimeType === 'string' && typeof block.data === 'string'
+    case 'tool-call':
+      return typeof block.toolCallId === 'string' && typeof block.toolName === 'string' && isRecord(block.args)
+    case 'tool_use':
+      return typeof block.id === 'string' && typeof block.name === 'string' && isRecord(block.input)
+    case 'tool-result':
+      return typeof block.toolCallId === 'string' && typeof block.result === 'string'
+    case 'tool_result':
+      return typeof block.toolUseId === 'string' && typeof block.content === 'string'
+    default:
+      return false
   }
-  return entries
 }
 
-export function materializeHistoryEntries(messages: LLMMessage[]): HistoryEntry[] {
-  return messages.map((message) => {
+function decodeHistoryEntry(blobId: string, blobData: string): HistoryEntry {
+  const decoded: unknown = decodeBlob(blobData)
+  if (!isRecord(decoded)
+    || !['system', 'user', 'assistant', 'tool'].includes(String(decoded.role))
+    || !(typeof decoded.content === 'string'
+      || (Array.isArray(decoded.content) && decoded.content.every(isValidHistoryBlock)))) {
+    throw new Error('Blob is not a supported history message; refusing lossy restoration')
+  }
+  const message = restoreBlobMessageToLLMMessage(decoded)
+  if (!message)
+    throw new Error('Blob could not be restored to a history message')
+  return { blobId, blobData, raw: decoded, message }
+}
+
+function retainClientHistoryEntry(store: RunBlobStore, blobId: string, bytes: Uint8Array): void {
+  const blobData = jsonBlobDataFromClientBytes(bytes)
+  if (blobData === null)
+    throw new Error('Invalid JSON blob transport encoding')
+  const entry = decodeHistoryEntry(blobId, blobData)
+  store.cacheBlob(blobId, blobData, bytes)
+  store.markClientSaved(blobId)
+  store.historyEntries.set(blobId, entry)
+}
+
+export function hydrateHistoryEntries(blobIds: string[], store: RunBlobStore): HistoryEntry[] {
+  return blobIds.map((blobId) => {
+    const existing = store.historyEntries.get(blobId)
+    if (existing)
+      return existing
+    const blobData = store.getCachedBlob(blobId)
+    if (blobData === undefined)
+      throw new BlobIntegrityError([{ blobId, status: 'not-found' }])
+    try {
+      const entry = decodeHistoryEntry(blobId, blobData)
+      store.historyEntries.set(blobId, entry)
+      return entry
+    }
+    catch (error) {
+      throw new BlobIntegrityError([{ blobId, status: 'decode-error', message: (error as Error).message }])
+    }
+  })
+}
+
+export function retainHistoryEntries(store: RunBlobStore, entries: HistoryEntry[]): void {
+  for (const entry of entries) {
+    if (store.getCachedBlob(entry.blobId) === undefined) {
+      const encoded = entry.blobData === undefined ? encodeBlob(entry.raw) : undefined
+      if (encoded && encoded.blobId !== entry.blobId)
+        throw new BlobIntegrityError([{ blobId: entry.blobId, status: 'missing-original-bytes' }])
+      store.cacheBlob(entry.blobId, entry.blobData ?? encoded!.blobData)
+    }
+    store.historyEntries.set(entry.blobId, entry)
+  }
+}
+
+export function materializeHistoryEntries(messages: LLMMessage[], store?: RunBlobStore): HistoryEntry[] {
+  const entries = messages.map((message) => {
     const normalized = normalizeBlobMessage({
       role: message.role,
       content: message.content,
@@ -230,13 +273,16 @@ export function materializeHistoryEntries(messages: LLMMessage[]): HistoryEntry[
       providerOptions: message.providerOptions,
     })
     const blob = encodeBlob(normalized)
-    cacheBlob(blob.blobId, blob.blobData)
     return {
       blobId: blob.blobId,
+      blobData: blob.blobData,
       raw: normalized as unknown as Record<string, unknown>,
       message,
     }
   })
+  if (store)
+    retainHistoryEntries(store, entries)
+  return entries
 }
 
 function logHistoryRepair(stage: string, diagnostics: RepairDiagnostics, extra: Record<string, unknown> = {}): void {
@@ -249,96 +295,102 @@ function logHistoryRepair(stage: string, diagnostics: RepairDiagnostics, extra: 
   }, '[HISTORY_REPAIR] canonicalized conversation history')
 }
 
-export function repairHistoryEntries(entries: HistoryEntry[]): HistoryEntry[] {
+export function repairHistoryEntries(entries: HistoryEntry[], store?: RunBlobStore): HistoryEntry[] {
   const diagnostics = createRepairDiagnostics(entries.length)
   const repaired = repairConversationHistory(entries.map(entry => entry.message), diagnostics)
   logHistoryRepair('repairHistoryEntries', diagnostics, {
     entryCount: entries.length,
     inputBlobIds: entries.length,
   })
-  return materializeHistoryEntries(repaired)
+  if (!hasRepairMutations(diagnostics)) {
+    if (store)
+      retainHistoryEntries(store, entries)
+    return entries
+  }
+  return materializeHistoryEntries(repaired, store)
 }
 
 export interface HistoryBlobLoadParams {
   historyBlobIds: string[]
-  /** 本 run 的客户端会话; null (测试 / 特殊路径) 时只查内存, 缺失静默跳过 */
-  session: AgentSession | null
-  /** kvServerMessage.getBlobArgs 的 id 分配器 (agentOrchestrator 全 run 共用一个计数器) */
-  allocateBlobId: () => number
-}
-
-function collectUncachedBlobIds(blobIds: string[]): string[] {
-  return [...new Set(blobIds.filter(blobId => getCachedBlob(blobId) === undefined))]
+  run: BlobRunContext
 }
 
 /**
- * 装载对话历史: 内存未命中的 blob 经 getBlobArgs 向客户端取回, 再 hydrate。
- * 客户端是 blob 的唯一持久持有方, 这是历史 blob 进入服务端的唯一途径。
- *
- * `history blobs from cache` 日志字段是用户核验的依据, 字段名保持稳定:
- *   requestedBlobs / cachedBlobs / fetchedFromClient / stillMissing / resolvedBlobs
- *   恒有 cachedBlobs + fetchedFromClient + stillMissing === requestedBlobs。
+ * Reference counts retain duplicates; only network requests are deduplicated.
+ * Cached means usable, decoded data in THIS run, never a process history cache.
  */
 export async function* loadHistoryEntries(params: HistoryBlobLoadParams): AsyncGenerator<AgentServerMessage, HistoryEntry[], void> {
-  const missingBlobIds = collectUncachedBlobIds(params.historyBlobIds)
+  const store = params.run.blobs
+  let requestedFromClient = 0
+  const failures = new Map<string, BlobFailure>()
+  const availableAtStart = new Set<string>()
+  const fetchedBlobIds = new Set<string>()
+  const missingBlobIds: string[] = []
+  for (const blobId of new Set(params.historyBlobIds)) {
+    try {
+      if (store.getCachedBlob(blobId) === undefined) {
+        const existingResult = params.run.getCompletedClientBlobResult(blobIdToBytes(blobId))
+        if (existingResult?.status === 'ok')
+          retainClientHistoryEntry(store, blobId, existingResult.bytes)
+        else if (existingResult) {
+          failures.set(blobId, { blobId, status: existingResult.status, message: existingResult.message })
+          continue
+        }
+        else {
+          missingBlobIds.push(blobId)
+          continue
+        }
+      }
+      hydrateHistoryEntries([blobId], store)
+      availableAtStart.add(blobId)
+    }
+    catch (error) {
+      if ((error as Error).name === 'BlobResourceLimitError')
+        throw error
+      failures.set(blobId, { blobId, status: 'decode-error', message: (error as Error).message })
+    }
+  }
   if (missingBlobIds.length > 0) {
-    const fetchedBytes = yield* fetchBlobsFromClient({
-      session: params.session,
+    const fetchedResults = yield* fetchBlobsFromClient({
+      run: params.run,
       blobIds: missingBlobIds.map(blobIdToBytes),
-      allocateBlobId: params.allocateBlobId,
+      onRequestSent: () => { requestedFromClient++ },
     })
-    fetchedBytes.forEach((bytes, index) => {
-      const blobData = bytes ? jsonBlobDataFromClientBytes(bytes) : null
-      if (blobData)
-        cacheBlob(missingBlobIds[index]!, blobData)
-      else if (bytes)
-        logger.warn({ blobId: missingBlobIds[index] }, '[SESSION] history blob from client is not a decodable message blob')
+    fetchedResults.forEach((result, index) => {
+      const blobId = missingBlobIds[index]!
+      if (result.status !== 'ok') {
+        failures.set(blobId, { blobId, status: result.status, message: result.message })
+        return
+      }
+      try {
+        retainClientHistoryEntry(store, blobId, result.bytes)
+        fetchedBlobIds.add(blobId)
+      }
+      catch (error) {
+        if ((error as Error).name === 'BlobResourceLimitError')
+          throw error
+        failures.set(blobId, { blobId, status: 'decode-error', message: (error as Error).message })
+      }
     })
   }
 
-  const stillMissing = params.historyBlobIds.filter(blobId => getCachedBlob(blobId) === undefined).length
-  const historyEntries = hydrateHistoryEntries(params.historyBlobIds)
-  const cachedBlobs = params.historyBlobIds.length - missingBlobIds.length
+  const cachedBlobs = params.historyBlobIds.filter(blobId => availableAtStart.has(blobId)).length
+  const fetchedFromClient = params.historyBlobIds.filter(blobId => fetchedBlobIds.has(blobId)).length
+  const stillMissing = params.historyBlobIds.length - cachedBlobs - fetchedFromClient
   logger.info({
     requestedBlobs: params.historyBlobIds.length,
+    uniqueBlobs: new Set(params.historyBlobIds).size,
     cachedBlobs,
-    fetchedFromClient: params.historyBlobIds.length - cachedBlobs - stillMissing,
+    fetchedFromClient,
+    requestedFromClient,
+    uniqueMissingAtStart: missingBlobIds.length,
     stillMissing,
-    resolvedBlobs: historyEntries.length,
+    resolvedBlobs: cachedBlobs + fetchedFromClient,
+    ...(failures.size ? { failures: [...failures.values()] } : {}),
   }, '[SESSION] history blobs from cache')
-  return historyEntries
-}
-
-/**
- * 压缩产物里客户端尚未持有的 root blob 必须经 setBlobArgs 送达。
- *
- * createCompactionArtifacts 的 nextRootBlobIds 含 repair 重编码的条目、占位 / 锚点副本,
- * 这些 blobId 是服务端本轮新造的, 客户端从未收到过; 若只发 checkpoint 不发 blob, 客户端
- * checkpoint 就引用了它没有的 blob —— 服务端不落盘, 重启后即成历史空洞。
- * 返回实际补发数; 起始 kv id 由调用方给出 (与摘要 / 归档 blob 的 id 连续)。
- */
-export function* sendRootBlobsUnknownToClient(
-  nextRootBlobIds: string[],
-  clientKnownBlobIds: Iterable<string>,
-  firstKvMessageId: number,
-): Generator<AgentServerMessage, number, void> {
-  const known = new Set(clientKnownBlobIds)
-  let sent = 0
-  for (const blobId of nextRootBlobIds) {
-    if (known.has(blobId))
-      continue
-    known.add(blobId)
-    const blobData = getCachedBlob(blobId)
-    if (!blobData) {
-      logger.warn({ blobId }, '[SESSION] compacted root blob missing from cache; client checkpoint will reference it anyway')
-      continue
-    }
-    yield kvMessage(firstKvMessageId + sent, blobId, blobData)
-    sent++
-  }
-  if (sent > 0)
-    logger.info({ sent, rootBlobs: nextRootBlobIds.length }, '[SESSION] sent compacted root blobs unknown to client')
-  return sent
+  if (stillMissing > 0)
+    throw new BlobIntegrityError([...failures.values()])
+  return hydrateHistoryEntries(params.historyBlobIds, store)
 }
 
 export async function* rebuildConversationHistory(params: {
@@ -349,8 +401,8 @@ export async function* rebuildConversationHistory(params: {
   currentUserMessage: LLMMessage
   systemContent: string
   preambleUserContent: string
-  sendSystemScaffoldBlob: (data: { role: string, content: unknown, toolCallId?: string, toolName?: string, isError?: boolean }) => Generator<AgentServerMessage, void, void>
-  sendOrderedBlob: (data: { role: string, content: unknown, toolCallId?: string, toolName?: string, isError?: boolean }) => Generator<AgentServerMessage, void, void>
+  sendSystemScaffoldBlob: (data: { role: string, content: unknown, toolCallId?: string, toolName?: string, isError?: boolean }) => void
+  sendOrderedBlob: (data: { role: string, content: unknown, toolCallId?: string, toolName?: string, isError?: boolean }) => void
 } & HistoryBlobLoadParams): AsyncGenerator<AgentServerMessage, { messages: LLMMessage[], insertedPrependUserTexts: string[] }, void> {
   let messages: LLMMessage[] = []
   let insertedPrependUserTexts: string[] = []
@@ -370,7 +422,7 @@ export async function* rebuildConversationHistory(params: {
 
     if (!hasSystemMessage(messages)) {
       messages.unshift(params.systemMessage)
-      yield* params.sendSystemScaffoldBlob({ role: 'system', content: params.systemContent })
+      params.sendSystemScaffoldBlob({ role: 'system', content: params.systemContent })
     }
 
     if (!hasPreambleUserMessage(messages)) {
@@ -378,7 +430,7 @@ export async function* rebuildConversationHistory(params: {
       if (insertAt === -1)
         messages.push(params.preambleUserMessage)
       else messages.splice(insertAt, 0, params.preambleUserMessage)
-      yield* params.sendOrderedBlob({ role: 'user', content: params.preambleUserContent })
+      params.sendOrderedBlob({ role: 'user', content: params.preambleUserContent })
     }
 
     ({ messages, insertedTexts: insertedPrependUserTexts } = mergePrependUserMessages(messages, params.prependUserMessages))
@@ -386,10 +438,10 @@ export async function* rebuildConversationHistory(params: {
   }
   else {
     messages.push(params.systemMessage)
-    yield* params.sendSystemScaffoldBlob({ role: 'system', content: params.systemContent })
+    params.sendSystemScaffoldBlob({ role: 'system', content: params.systemContent })
 
     messages.push(params.preambleUserMessage)
-    yield* params.sendOrderedBlob({ role: 'user', content: params.preambleUserContent });
+    params.sendOrderedBlob({ role: 'user', content: params.preambleUserContent });
 
     ({ messages, insertedTexts: insertedPrependUserTexts } = mergePrependUserMessages(messages, params.prependUserMessages))
     messages.push(params.currentUserMessage)
