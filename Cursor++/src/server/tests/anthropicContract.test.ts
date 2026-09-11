@@ -147,3 +147,27 @@ it('anthropic state strategy keeps canonical tool messages in tool_use order, an
   const encoded = encodeAnthropicRequestMessages(compiled)
   expect(() => assertValidAnthropicToolUseContract(encoded.messages)).not.toThrow()
 })
+
+it('hoists downgraded unsupported tool calls before the surviving tool_use blocks', () => {
+  const messages: LLMMessage[] = [
+    { role: 'user', content: 'go' },
+    {
+      role: 'assistant',
+      content: [
+        { type: 'tool_use', id: 'call_edit', name: 'Edit', input: { path: 'a.ts' } },
+        { type: 'tool_use', id: 'call_patch', name: 'ApplyPatch', input: { patch: 'x' } },
+      ],
+    },
+    { role: 'tool', toolCallId: 'call_edit', toolName: 'Edit', content: 'edit ok' },
+    { role: 'tool', toolCallId: 'call_patch', toolName: 'ApplyPatch', content: 'patch ok' },
+    { role: 'user', content: '继续' },
+  ]
+
+  const compiled = transformMessages(messages, 'anthropic')
+  const encoded = encodeAnthropicRequestMessages(compiled)
+  expect(() => assertValidAnthropicToolUseContract(encoded.messages)).not.toThrow()
+
+  const assistant = encoded.messages.find(message => message.role === 'assistant')
+  const blockTypes = (assistant?.content as Anthropic.ContentBlockParam[]).map(block => block.type)
+  expect(blockTypes).toEqual(['text', 'tool_use'])
+})
