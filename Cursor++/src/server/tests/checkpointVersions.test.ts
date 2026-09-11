@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { beginCheckpointWriteScope, CheckpointConflictError, clearDraftCheckpoint, clearPersistedConversationCheckpoint, getPersistedConversationCheckpoint, persistConversationCheckpoint } from '../database/checkpoints'
+import { adoptConversationCheckpoint, beginCheckpointWriteScope, CheckpointConflictError, clearDraftCheckpoint, clearPersistedConversationCheckpoint, getPersistedConversationCheckpoint, persistConversationCheckpoint } from '../database/checkpoints'
 import { closeAgentDatabase, getAgentDatabase, getCheckpointDatabase, initDatabase } from '../database/sqlite'
 import { recordModelUsage } from '../database/usageStats'
 
@@ -531,8 +531,61 @@ describe('checkpoint version schema migration', () => {
       updated_at: 1700000000000,
       write_token: '',
       is_deleted: 0,
+      terminal_receipt_json: '',
     }])
     await persistConversationCheckpoint(makeCheckpoint('new', 'draft'))
     expect(await getPersistedConversationCheckpoint(conversationId, 'draft')).toEqual(makeCheckpoint('new', 'draft'))
+  })
+})
+
+describe('recovery preservation before conditional adoption', () => {
+  it('keeps byte-exact legacy candidates and invalidates old writers without replacing the conversation', async () => {
+    await seedLegacyCheckpoint(makeCheckpoint('committed'), 'old-committed')
+    await seedLegacyCheckpoint(makeCheckpoint('draft', 'draft'), 'old-draft')
+    const originalRows = await readRawRows()
+    const scope = await beginCheckpointWriteScope(conversationId)
+    const olderScope = await externalCheckpoints.beginCheckpointWriteScope(conversationId)
+    await adoptConversationCheckpoint(makeCheckpoint('selected'), scope, 'user-selected')
+    const snapshots = await getCheckpointDatabase().all<{ checkpoint_rows_json: string }>(
+      'SELECT checkpoint_rows_json FROM conversation_checkpoint_recovery WHERE conversation_id = ?',
+      [conversationId],
+    )
+    expect(snapshots).toHaveLength(1)
+    expect(JSON.parse(snapshots[0]!.checkpoint_rows_json)).toEqual(originalRows)
+    expect(await getPersistedConversationCheckpoint(conversationId)).toEqual(makeCheckpoint('selected'))
+    expect(await getPersistedConversationCheckpoint(conversationId, 'draft')).toBeNull()
+    await expect(externalCheckpoints.persistConversationCheckpoint(makeCheckpoint('late'), undefined, olderScope))
+      .rejects
+      .toMatchObject({ name: 'CheckpointConflictError' })
+  })
+
+  it('never adopts if preserving the original candidates fails', async () => {
+    await persistConversationCheckpoint(makeCheckpoint('original'))
+    const originalRows = await readRawRows()
+    const scope = await beginCheckpointWriteScope(conversationId)
+    vi.spyOn(getCheckpointDatabase(), 'run').mockRejectedValueOnce(new Error('Recovery disk full'))
+    await expect(adoptConversationCheckpoint(makeCheckpoint('selected'), scope, 'user-selected')).rejects.toThrow('Recovery disk full')
+    expect(await readRawRows()).toEqual(originalRows)
+  })
+
+  it('retains a harmless snapshot but refuses adoption if another connection wins after preservation', async () => {
+    await persistConversationCheckpoint(makeCheckpoint('original'))
+    const originalRows = await readRawRows()
+    const scope = await beginCheckpointWriteScope(conversationId)
+    const database = getCheckpointDatabase()
+    const executeRun = database.run.bind(database)
+    vi.spyOn(database, 'run').mockImplementation(async (sql, parameters) => {
+      const result = await executeRun(sql, parameters)
+      if (sql.includes('INSERT INTO conversation_checkpoint_recovery'))
+        await externalCheckpoints.persistConversationCheckpoint(makeCheckpoint('winner'))
+      return result
+    })
+    await expect(adoptConversationCheckpoint(makeCheckpoint('selected'), scope, 'user-selected')).rejects.toBeInstanceOf(CheckpointConflictError)
+    expect(await getPersistedConversationCheckpoint(conversationId)).toEqual(makeCheckpoint('winner'))
+    const snapshot = await database.get<{ checkpoint_rows_json: string }>(
+      'SELECT checkpoint_rows_json FROM conversation_checkpoint_recovery WHERE conversation_id = ?',
+      [conversationId],
+    )
+    expect(JSON.parse(snapshot!.checkpoint_rows_json)).toEqual(originalRows)
   })
 })

@@ -54,14 +54,6 @@ export function computeContextUsagePercent(usedTokens: number, maxTokens: number
 }
 
 /**
- * 旧公式常数 (第一阶段绝对 buffer 模式, 已被第二阶段新公式取代; 保留作历史参照)
- */
-const AUTOCOMPACT_BUFFER_TOKENS = 20_000
-const MAX_OUTPUT_RESERVE = 20_000
-void AUTOCOMPACT_BUFFER_TOKENS
-void MAX_OUTPUT_RESERVE
-
-/**
  * 错误驱动压缩重试: provider 错误分类白名单 (设计文档 §7#9)。
  *
  * 只识别明确的 context-length / input-token-limit 类错误文案与错误码;
@@ -108,23 +100,21 @@ export function computeAutoCompactTriggerReserveTokens(maxTokens: number): numbe
     return Math.min(AUTOCOMPACT_TRIGGER_RESERVE_MAX_TOKENS, Math.floor(AUTOCOMPACT_TRIGGER_RESERVE_RATIO * maxTokens));
 }
 
-export function getAutoCompactThreshold(maxTokens: number, maxOutputTokens = 8192): number {
+export function getAutoCompactThreshold(maxTokens: number): number {
     // 第二阶段新公式 (设计文档 §5 参数表, 审计三修正):
     //   threshold = 窗口 − min(40K, 15% × 窗口)
     // 逐档值: 32K→27,200 / 64K→54,400 / 96K→81,600 / 128K→108,800 /
     //         258.4K→219,640 / 1M→960,000
-    // maxOutputTokens 保留在签名中仅为兼容既有调用方, 不再参与计算
     // (旧双轨 min(max−40K, 0.85max) 在 max<266K 时恒由绝对轨主导, 32K 取到
     //  负值/64K 触发线 24K 逼近地板形成死带 — 详见设计文档 §5 触发公式行)
-    void maxOutputTokens
     if (maxTokens <= 0)
         return 0
     return maxTokens - computeAutoCompactTriggerReserveTokens(maxTokens)
 }
 
-export function shouldTriggerCompaction(usedTokens: number, maxTokens: number, thresholdPercent?: number, maxOutputTokens = 8192): boolean {
+export function shouldTriggerCompaction(usedTokens: number, maxTokens: number, thresholdPercent?: number): boolean {
     if (thresholdPercent !== undefined) {
         return computeContextUsagePercent(usedTokens, maxTokens) >= thresholdPercent;
     }
-    return usedTokens >= getAutoCompactThreshold(maxTokens, maxOutputTokens);
+    return usedTokens >= getAutoCompactThreshold(maxTokens);
 }

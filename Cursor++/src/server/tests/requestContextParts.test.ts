@@ -432,3 +432,29 @@ it('does not enable meta-tool mode when the mcps blob explicitly disables it', (
   applyMcpsPart(parsed, { tools: [], mcpInstructions: [], mcpMetaToolOptions: { enabled: false } })
   expect(parsed.mcpMetaTool).toBeUndefined()
 })
+
+it.each(['\n', '\r\n'])('reads legacy Skill frontmatter with %j line endings', (lineEnding) => {
+  const parsed = parseRunRequest(baseRunRequest({
+    userMessageAction: {
+      userMessage: { text: 'q' },
+      requestContext: {
+        rules: [
+          {
+            fullPath: '/workspace/.cursor/skills/review/SKILL.md',
+            type: { agentFetched: {} },
+            content: ['---  ', 'description:   Review changes carefully  ', '---', 'PRIVATE_SKILL_BODY'].join(lineEnding),
+          },
+          {
+            fullPath: '/workspace/.cursor/skills/manual/SKILL.md',
+            type: { agentFetched: {} },
+            content: ['---', 'description: Manual only', 'disable-model-invocation: true', '---', 'MANUAL_BODY'].join(lineEnding),
+          },
+        ],
+      },
+    },
+  }))
+
+  expect(parsed.agentSkills.map(skill => ({ path: skill.fullPath, description: skill.description }))).toEqual([
+    { path: '/workspace/.cursor/skills/review/SKILL.md', description: 'Review changes carefully' },
+  ])
+})

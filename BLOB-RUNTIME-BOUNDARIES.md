@@ -91,8 +91,9 @@ conversation group or subagent type is not a cancellation/version key.
 
 1. Capture both committed/draft tokens in one SELECT at run admission, before
    asynchronous history/context work. No writer refreshes its scope after a loss.
-2. Reject a client reference triple that does not match the admissible local
-   checkpoint. Do not silently replace the client's prompt with local history.
+2. Admit matching client history normally. Resolve legacy compatibility or an
+   explicit client-state recovery before admitting a different baseline; never
+   silently replace the client's prompt with local history.
 3. Retain and validate required dependencies, send every pending blob, and await
    matching successful Set replies before any rolling/final/summary commit.
 4. A single SQLite statement compares the committed/draft token pair and writes
@@ -115,20 +116,76 @@ than reviving it. Explicit maintenance APIs still require deliberate caller use.
 
 New opaque tokens carry `ccursor-cas-v1:` provenance for the atomic-retirement
 invariant. Legacy committed/draft rows can both exist with different histories;
-timestamps, row preference and arrival order cannot safely select one. Such
-untagged/mixed divergent pairs are left unchanged and require an explicit fork.
+timestamps, row preference and arrival order cannot safely select one. Missing
+provenance alone no longer forces users to fork their conversations.
 Single-active legacy rows and identical reference triples are not rejected on
 provenance alone. Corrupt checkpoint reference JSON is not normalized to `[]`.
 
-### Deliberate compatibility/availability boundary
+### Legacy compatibility and in-place recovery
+
+`admitClientCheckpoint` validates the complete selected graph on the exceptional
+recovery path. Ordinary matching continuations retain lazy history validation.
+Automatic legacy adoption requires the incoming references to match one candidate
+and structurally contain the other: ordered root prefix, identical archive list,
+and ordered turns. Only the formerly active last turn may have changed identity;
+its agent user reference must match and its old steps must be an exact prefix.
+The differing turn structures are decoded; matching children are covered by the
+selected graph's validation. Discarded-branch children do not become required
+dependencies merely to inspect ancestry. No ordering is inferred from timestamps,
+counts, run IDs or missing writer tags.
+
+If that proof is unavailable or the branches genuinely differ, the main chat
+uses the existing native AskQuestion interaction. The user can keep this chat's
+submitted history under the same conversation ID, or cancel. The question warns
+that this does not undo executed tools and that older history can repeat work.
+Consent is bound to this live request and the original token pair, with a
+five-minute cancellable wait; concurrent changes invalidate consent rather than
+refreshing the scope. Background/subagent/summary requests never invent consent.
+A declined live interaction emits turnEnded before EOF to avoid a transport retry
+loop. No model/tool generation occurs on a declined or failed recovery.
+
+Uploaded-only selected data must receive successful Set replies before adoption.
+Before adoption, `conversation_checkpoint_recovery` preserves both exact original
+SQLite rows, including tokens and any terminal receipt. Snapshot insertion must
+succeed before the original-token CAS can adopt the selected baseline. A crash
+or competing write between preservation and adoption may leave an extra snapshot,
+but cannot cause an unbacked overwrite. Identical snapshots are deduplicated by
+content hash; upgrades never delete them. These are recovery **references**, not
+copies of every client-owned blob or a guarantee of indefinite blob availability.
+No alternate-state restoration UI or automatic history merge is introduced.
+
+### Correlated terminal redelivery and remaining availability boundary
 
 The inspected wire request has neither the client's checkpoint epoch nor a
 checkpoint-applied ACK. A mismatch may be an intentional revert, a delayed
 request, or a retry after SQL accepted a checkpoint that the client never applied.
-The adapter cannot safely distinguish them. It fails explicitly rather than
-merging, automatically retrying the same ambiguous state, or replacing recovery
-data. Forking the desired client state under a new conversation ID is the safe
-available path; reopening alone is not guaranteed to close a delivery gap.
+CAS alone cannot distinguish all of them; it still does not order client intent.
+
+`CheckpointDelivery` records a bounded terminal receipt in the **same statement**
+as final checkpoint acceptance. It stores a logical run ID, canonical request and
+model fingerprints, exact input-state fingerprint, same-attempt emitted checkpoint
+fingerprints, and the serialized final stepCompleted/turnEnded/checkpoint frames.
+It is only produced for an observed terminal turn, not arbitrary committed rows
+(inline compaction also writes committed checkpoints). Old rows have no receipt.
+
+Redelivery requires the same logical run and model identity, plus either the exact
+original action/request and input, or a plain native ResumeAction from a recorded
+same-run state. A new message/action/run, unknown state, malformed receipt, later
+draft (even if subsequently cleared), final write, or deletion is not eligible.
+Replay verifies the full saved graph through client KV, confirms any upload-only
+bytes with Set, and rechecks both version tokens before publication. It sends
+terminal markers and the exact checkpoint,
+without model generation, tool execution, or new provider usage recording.
+No text deltas are appended a second time; visible transcript reconstruction
+depends on native checkpoint hydration, not on a replay of the original stream.
+
+Receipts are capped at 2 MiB and 256 intermediate source fingerprints. Unknown
+future request-state fields or exceeding these limits disables automatic replay,
+not normal execution. Nonterminal interrupted work, uncorrelated retries and old
+delivery gaps without a receipt use explicit recovery instead. This is not an
+exactly-once tool ledger, and replay does not create a client-applied ACK. A final
+version check cannot make network publication atomic with another process's SQL
+write. Native scheduling and checkpoint-epoch application remain client-owned.
 
 This is a conservative project policy, not verified cloud behavior or full
 causality protection. Cooperative writers on the same SQLite database receive
@@ -219,6 +276,22 @@ production registration, codecs and SDKs, with mocks at external I/O boundaries.
 Independent reviews found and then verified fixes for legacy baseline selection,
 upload copy amplification, heartbeat-paused KV lease ownership, rolling conflict
 propagation, and return-only lifecycle gaps through usage/service wrappers.
+
+### Recovery follow-up verification (2026-09-09)
+
+The recovery/delivery follow-up passed all 94 tests in six focused files, including
+the registered RPC cold-redelivery path, original-token recovery races, rejected
+Set barriers, discarded-branch missing children, and native consent/cancellation.
+The repository regression run passed 758 of 759 tests; its sole failure is the
+previously documented, untouched `protocol.test.ts:232` `<user_rules>` assertion.
+The unrelated untracked `deathLoopSimulation.test.ts` was explicitly excluded
+because it is a one-off report generator, not part of this change.
+Type checking, repository lint, explicit lint of the two normally ignored new
+runtime modules, and `git diff --check` passed. No dependency or version changed.
+Tests used temporary databases and mocked external model I/O. The installed
+plugin, live databases and application were not changed or restarted; native
+checkpoint hydration and recovery-question rendering still need an installed
+client smoke test before release. No commit, package deployment or push was made.
 
 ## Data and release safety
 

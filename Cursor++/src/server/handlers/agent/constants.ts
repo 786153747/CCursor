@@ -40,17 +40,6 @@ export const SHELL_TIMEOUT_BEHAVIOR_BACKGROUND = 2;
 // 避免兼容性较差的模型提供商 (如 GLM 不流式 tool_use) 导致 UI 看起来卡死。
 export const IDLE_HINT_AFTER_MS = 3_000;
 
-// Heuristic compaction policy (legacy, 条数定额):
-// preserve more recent turns uncompressed so continuation quality keeps short-term state.
-// These values are local policy choices, not protocol-defined by Cursor.
-//
-// @deprecated 第二阶段已切换为 token 预算制 (设计文档 §4/§5),
-// 保留仅作备选方案 (§3.3 灰度前置) 与回滚开关用, 勿在新代码引用。
-export const COMPACTION_MEDIUM_BODY_THRESHOLD = 2;
-export const COMPACTION_MEDIUM_BODY_KEEP_TAIL = 2;
-export const COMPACTION_LONG_BODY_THRESHOLD = 8;
-export const COMPACTION_LONG_BODY_KEEP_TAIL = 6;
-
 // ═══════════════════════════════════════════════════════════════════
 // 第二阶段: keepTail 预算化参数 (设计文档 §5 参数表, 唯一权威为该表)
 // 公式集中于此, planCompaction / usage / 摘要侧共享, 禁止散落内联数字。
@@ -97,7 +86,7 @@ export const FLOOR_VIOLATION_RATIO = 1.2;
 /** 预算安全边际: o200k 是校准估计器 (非 OpenAI 系偏差 10-15%), 计价乘 1.15 由观测校准 */
 export const BUDGET_SAFETY_MARGIN = 1.15;
 
-/** 可行性检查的输出预留 (对齐 usage.MAX_OUTPUT_RESERVE 量级, planCompaction 不感知 maxOutputTokens) */
+/** 可行性检查的固定输出预留; planCompaction 不感知 provider 的 maxOutputTokens。 */
 export const FEASIBILITY_OUTPUT_RESERVE_TOKENS = 20_000;
 
 /** 摘要源总预算 = min(0.6 × 窗口 × 4, 3.2e6) chars; min-quota 200 chars (官方 CC-012) */

@@ -194,11 +194,18 @@ it('buildMessages produces official-style system and structured user content', (
               {
                 content: 'Always reply in Chinese',
                 type: { global: {} },
+                // Source identifies user ownership; global only controls applicability.
+                source: 'CURSOR_RULE_SOURCE_USER',
+              },
+              {
+                content: 'Keep changes focused',
+                fullPath: '/workspace/app/.cursor/rules/always.mdc',
+                type: { global: {} },
               },
               {
                 content: 'Use pnpm',
                 fullPath: '/workspace/app/.cursor/rules/build.md',
-                type: { fileGlobbed: { glob: '**/*' } },
+                type: { fileGlobbed: { globs: ['**/*'] } },
               },
               {
                 fullPath: '/skills/review.md',
@@ -229,9 +236,14 @@ it('buildMessages produces official-style system and structured user content', (
   expect(preambleUserContent).toMatch(/<user_info>/)
   expect(preambleUserContent).toMatch(/<agent_transcripts>/)
   expect(preambleUserContent).toMatch(/<rules>/)
-  expect(preambleUserContent).toMatch(/<user_rules/)
-  expect(preambleUserContent).toMatch(/Always reply in Chinese/)
-  expect(preambleUserContent).toMatch(/<always_applied_workspace_rules/)
+
+  const userRulesSection = preambleUserContent.match(/<user_rules\b[^>]*>([\s\S]*?)<\/user_rules>/)?.[1] ?? ''
+  const workspaceRulesSection = preambleUserContent.match(/<always_applied_workspace_rules\b[^>]*>([\s\S]*?)<\/always_applied_workspace_rules>/)?.[1] ?? ''
+  expect(userRulesSection).toContain('<user_rule>Always reply in Chinese</user_rule>')
+  expect(userRulesSection).not.toContain('Keep changes focused')
+  expect(workspaceRulesSection).toContain('<always_applied_workspace_rule name="/workspace/app/.cursor/rules/always.mdc">Keep changes focused</always_applied_workspace_rule>')
+  expect(workspaceRulesSection).not.toContain('Always reply in Chinese')
+
   // fileGlobbed 正文不预载，读取匹配文件后才通过 related_cursor_rules 注入。
   expect(preambleUserContent).not.toMatch(/Use pnpm/)
   expect(preambleUserContent).toMatch(/<agent_requestable_workspace_rules/)

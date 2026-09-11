@@ -3,7 +3,7 @@
  *
  * 动机: inline 自动压缩与 summarizeAction 手动压缩并发时, 后写者可能用
  * 较旧的历史覆盖更新状态 (数据丢失, 严重性高于"无害只浪费")。
- * 两路同进程 → in-process 锁即可; checkpoint 版本 CAS + 压缩操作幂等 ID 留 future work。
+ * 同进程锁串行化摘要生成; checkpoint 写入另由 run admission 的版本作用域保护。
  *
  * 语义:
  *   - inline 路径用 tryAcquire: 锁被占则本轮跳过 (计数观测, 下轮重试)
@@ -13,17 +13,15 @@
 interface CompactionLockEntry {
     held: boolean;
     waiters: Array<() => void>;
+    contentionCount: number;
 }
 
 const compactionLocks = new Map<string, CompactionLockEntry>();
 
-/** 争用计数 (观测: 互斥锁的等待/跳过次数, [AUTOCOMPACT] 日志消费) */
-const contentionCounts = new Map<string, number>();
-
 function getOrCreateLock(conversationId: string): CompactionLockEntry {
     let entry = compactionLocks.get(conversationId);
     if (!entry) {
-        entry = { held: false, waiters: [] };
+        entry = { held: false, waiters: [], contentionCount: 0 };
         compactionLocks.set(conversationId, entry);
     }
     return entry;
@@ -33,7 +31,7 @@ function getOrCreateLock(conversationId: string): CompactionLockEntry {
 export function tryAcquireCompactionLock(conversationId: string): boolean {
     const entry = getOrCreateLock(conversationId);
     if (entry.held) {
-        contentionCounts.set(conversationId, (contentionCounts.get(conversationId) ?? 0) + 1);
+        entry.contentionCount++;
         return false;
     }
     entry.held = true;
@@ -44,10 +42,10 @@ export function tryAcquireCompactionLock(conversationId: string): boolean {
 export function waitForCompactionLockRelease(conversationId: string, signal?: AbortSignal): Promise<void> {
     if (signal?.aborted)
         return Promise.resolve();
-    const entry = getOrCreateLock(conversationId);
-    if (!entry.held)
+    const entry = compactionLocks.get(conversationId);
+    if (!entry?.held)
         return Promise.resolve();
-    contentionCounts.set(conversationId, (contentionCounts.get(conversationId) ?? 0) + 1);
+    entry.contentionCount++;
     return new Promise((resolve) => {
         const finish = (): void => {
             signal?.removeEventListener('abort', finish);
@@ -75,9 +73,9 @@ export function releaseCompactionLock(conversationId: string): void {
         compactionLocks.delete(conversationId);
 }
 
-/** 当前会话的争用计数 (观测日志用) */
+/** 当前持锁周期的争用计数; 随锁释放, 不保留历史会话表。 */
 export function getCompactionContentionCount(conversationId: string): number {
-    return contentionCounts.get(conversationId) ?? 0;
+    return compactionLocks.get(conversationId)?.contentionCount ?? 0;
 }
 
 /** 只读探测 (不计争用): 错误驱动重试路径的等待循环用 */

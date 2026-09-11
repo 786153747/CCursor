@@ -1,4 +1,5 @@
 import type { ClientBlobResult } from './clientBlobFetch'
+import type { CheckpointDelivery } from './checkpointDelivery'
 import type { AgentSession } from './session'
 import { setMaxListeners } from 'node:events'
 import { blobIdFromBytes } from './blob'
@@ -54,6 +55,7 @@ export class BlobRunContext {
     readonly conversationId: string
     readonly kvGate = new RunKvGate()
     checkpointWriteScope?: CheckpointWriteScope
+    checkpointDelivery?: CheckpointDelivery
     private readonly resourceLease?: ReturnType<RunResourceBudget['acquire']>
 
     private readonly clientBlobReads = new Map<string, RunClientBlobRead>()
@@ -61,6 +63,7 @@ export class BlobRunContext {
     // Zero is a valid protocol default, but reserved and never allocated here.
     // Positive ids avoid ambiguity with default-zero replies whose JSON omits id.
     private nextBlobRequestId = 900_000
+    private nextInteractionId = 1
     private sentGetRequestCount = 0
     private disposed = false
 
@@ -110,6 +113,12 @@ export class BlobRunContext {
         if (!this.checkpointWriteScope)
             throw new Error('Checkpoint write scope must be captured at run admission')
         return this.checkpointWriteScope
+    }
+
+    allocateInteractionId(): number {
+        if (this.disposed || this.signal.aborted)
+            throw new BlobInactiveError('Cannot allocate an interaction for an inactive run')
+        return this.nextInteractionId++
     }
 
     /** Drop only this request's unmatched/duplicate KV frames, never other consumers. */

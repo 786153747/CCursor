@@ -20,7 +20,6 @@ import { blobIdToBytes } from './blob'
 import { create } from '@bufbuild/protobuf'
 import type { GenMessage } from '@bufbuild/protobuf/codegenv2'
 import {
-  AgentMode,
   AgentServerMessageSchema,
   AskQuestionToolCallSchema,
   AwaitToolCallSchema,
@@ -68,6 +67,7 @@ import {
 } from '../../gen/agent_v1_pb'
 import { logger, streamLogger } from '../../logger'
 import { AGENT_HEARTBEAT_INTERVAL_MS, IDLE_HINT_AFTER_MS } from './constants'
+import { resolveAgentMode } from './protocol/agentMode'
 import { mapPartialToolName } from './tools'
 
 type BreakdownCategoryInit = { id: string, label: string, estimatedTokens: number }
@@ -638,19 +638,6 @@ export function checkpoint(
       }),
     },
   })
-}
-
-function resolveAgentMode(mode: string): AgentMode {
-  // 客户端传 "AGENT_MODE_AGENT" 格式, 也兼容内部用的小写 "agent"
-  const normalized = mode.replace('AGENT_MODE_', '').toLowerCase()
-  switch (normalized) {
-    case 'agent': return AgentMode.AGENT
-    case 'ask': return AgentMode.ASK
-    case 'plan': return AgentMode.PLAN
-    case 'debug': return AgentMode.DEBUG
-    case 'triage': return AgentMode.TRIAGE
-    default: return AgentMode.AGENT
-  }
 }
 
 /**

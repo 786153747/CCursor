@@ -54,13 +54,8 @@ export class RunKvGate {
       return Promise.resolve(undefined)
     if (this.occupied && this.waiters.length >= 32)
       throw new BlobResourceLimitError('Run KV operation queue is full (32 waiting batches)')
+    const waiters = this.waiters
     return new Promise((resolve) => {
-      const removeWaiter = (): void => {
-        const position = this.waiters.indexOf(grant)
-        if (position >= 0)
-          this.waiters.splice(position, 1)
-        signal.removeEventListener('abort', cancel)
-      }
       const cancel = (): void => {
         removeWaiter()
         resolve(undefined)
@@ -85,6 +80,12 @@ export class RunKvGate {
         // Its operation still owns cleanup even before it receives the callback.
         signal.addEventListener('abort', releaseLease, { once: true })
         resolve(releaseLease)
+      }
+      function removeWaiter(): void {
+        const position = waiters.indexOf(grant)
+        if (position >= 0)
+          waiters.splice(position, 1)
+        signal.removeEventListener('abort', cancel)
       }
       signal.addEventListener('abort', cancel, { once: true })
       if (this.occupied)

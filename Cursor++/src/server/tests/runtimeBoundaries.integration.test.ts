@@ -254,7 +254,7 @@ describe('required context and explicit catalog degradation', () => {
 })
 
 describe('run-scoped cancellation, versioning and admission', () => {
-  it('preserves divergent legacy candidates and permits an explicit client-state fork', async () => {
+  it('preserves divergent legacy candidates when recovery is declined and still permits a client-state fork', async () => {
     const conversationId = randomUUID()
     const committed = historyFixture('Committed candidate')
     const draft = historyFixture('Draft candidate')
@@ -266,8 +266,9 @@ describe('run-scoped cancellation, versioning and admission', () => {
     const previousRows = await readRows()
     for (const chosen of [committed, draft]) {
       const client = start(runMessage({ conversationId, roots: [chosen] }), new BlobTestClient([chosen]))
-      expect(String((await client.completion).error)).toMatch(/Checkpoint version conflict/)
-      expect(client.getRequests).toHaveLength(0)
+      expect(await client.completion).toEqual({})
+      expect(client.frames.filter(frame => frame.message.case === 'interactionQuery')).toHaveLength(1)
+      expect(client.checkpoints).toHaveLength(0)
     }
     expect(requests).toHaveLength(0)
     expect(await readRows()).toEqual(previousRows)
@@ -413,14 +414,17 @@ describe('run-scoped cancellation, versioning and admission', () => {
     replacement.cancel()
   })
 
-  it('rejects a stale completed source and accepts the current client checkpoint', async () => {
+  it('redelivers a correlated completed retry and accepts a new action from the current checkpoint', async () => {
     const conversationId = randomUUID()
     const message = runMessage({ conversationId })
     const first = start(message)
     expect(await first.completion).toEqual({})
     const accepted = await getPersistedConversationCheckpoint(conversationId)
     const stale = start(message, first.fork())
-    expect(String((await stale.completion).error)).toMatch(/Checkpoint version conflict/)
+    expect(await stale.completion).toEqual({})
+    expect(stale.checkpoints.map(state => toJson(ConversationStateStructureSchema, state)))
+      .toEqual(first.checkpoints.map(state => toJson(ConversationStateStructureSchema, state)))
+    expect(stale.execKinds).toHaveLength(0)
     expect(requests).toHaveLength(1)
     expect(await getPersistedConversationCheckpoint(conversationId)).toEqual(accepted)
     const current = runMessage({ conversationId })

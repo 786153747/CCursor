@@ -1,6 +1,7 @@
 import { mkdirSync, writeFileSync } from 'fs';
 import { join } from 'path';
 import { getConversationSpillDir } from '../../../../config/paths';
+import { TASK_ENTRY_CAP_RATIO } from '../../constants';
 import { countTokens, sliceTextHeadTailTokens } from '../../tokenCounter';
 import {
     arr,
@@ -31,7 +32,7 @@ export function resolveTaskEntryCapTokens(contextTokenLimit?: number): number {
     const window = contextTokenLimit !== undefined && contextTokenLimit > 0
         ? contextTokenLimit
         : TASK_ENTRY_CAP_DEFAULT_WINDOW_TOKENS;
-    return Math.min(TASK_ENTRY_CAP_MAX_TOKENS, Math.floor(0.25 * window));
+    return Math.min(TASK_ENTRY_CAP_MAX_TOKENS, Math.floor(TASK_ENTRY_CAP_RATIO * window));
 }
 
 /** toolCallId → 文件名安全形式 (call id 可能含 ':' 等 shell 不友好字符)。 */
@@ -260,10 +261,11 @@ export function buildTaskToolResultText(
         const backgroundReason = optionalSubagentBackgroundReason(value.backgroundReason);
         if (backgroundReason !== undefined && backgroundReason !== 0) {
             const agentId = typeof value.agentId === 'string' ? value.agentId : '';
+            const pollingInstruction = agentId
+                ? `Use AwaitShell with task_id="${agentId}" to poll for completion.`
+                : 'Use AwaitShell with the agent id to poll for completion.';
             parts.push(
-                `[Task moved to background: ${subagentBackgroundReasonName(backgroundReason)}.`
-                + (agentId ? ` Use AwaitShell with task_id="${agentId}" to poll for completion.` : ' Use AwaitShell with the agent id to poll for completion.')
-                + ']',
+                `[Task moved to background: ${subagentBackgroundReasonName(backgroundReason)}. ${pollingInstruction}]`,
             );
         }
 

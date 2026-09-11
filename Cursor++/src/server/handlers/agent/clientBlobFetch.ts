@@ -5,14 +5,12 @@ import type { BlobRunContext, RunClientBlobRead } from './runContext'
 import { setMaxListeners } from 'node:events'
 import { fromJson } from '@bufbuild/protobuf'
 import { GetBlobResultSchema, SetBlobResultSchema } from '../../gen/agent_v1_pb'
-import { BLOB_KV_BATCH_SIZE, BLOB_KV_OVERALL_TIMEOUT_MS, BLOB_KV_TIMEOUT_MS, normalizeBlobBatchSize, validateBlobTimeout } from './runContext'
+import { BLOB_KV_BATCH_SIZE, normalizeBlobBatchSize, validateBlobTimeout } from './runContext'
 import { waitForMessageMatching } from './session'
 import { kvGetBlob, kvMessage } from './stream'
 import { AgentRunAbortedError, waitForPromiseWithHeartbeat } from './wait'
 
 export const CLIENT_BLOB_FETCH_BATCH_SIZE = BLOB_KV_BATCH_SIZE
-export const CLIENT_BLOB_FETCH_TIMEOUT_MS = BLOB_KV_TIMEOUT_MS
-export const CLIENT_BLOB_FETCH_OVERALL_TIMEOUT_MS = BLOB_KV_OVERALL_TIMEOUT_MS
 
 export type ClientBlobResult =
   | { status: 'ok', bytes: Uint8Array }

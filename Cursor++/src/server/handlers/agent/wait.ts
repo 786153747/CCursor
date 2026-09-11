@@ -1,7 +1,58 @@
 import type { AgentServerMessage } from '../../gen/agent_v1_pb';
+import { withProviderRequestLifecycle } from '../llm/requestLifecycle';
 import { AGENT_HEARTBEAT_INTERVAL_MS } from './constants';
 import { waitForInteractionResponse, waitForMessageMatching, type AgentSession } from './session';
 import { heartbeat } from './stream';
+
+export const HEARTBEAT_TICK: unique symbol = Symbol('summary-heartbeat-tick');
+
+/** Keep silent provider streams alive without requesting a second pending next(). */
+export function pumpWithTimedHeartbeats<TEvent>(
+    source: AsyncIterable<TEvent> | ((signal: AbortSignal) => AsyncIterable<TEvent>),
+    heartbeatIntervalMs: number = AGENT_HEARTBEAT_INTERVAL_MS,
+    signal?: AbortSignal,
+): AsyncGenerator<TEvent | typeof HEARTBEAT_TICK, void, unknown> {
+    return withProviderRequestLifecycle(lifecycle => pumpHeartbeatEvents(
+        typeof source === 'function' ? source(lifecycle.signal) : source,
+        heartbeatIntervalMs,
+    ), signal);
+}
+
+async function* pumpHeartbeatEvents<TEvent>(
+    sourceStream: AsyncIterable<TEvent>,
+    heartbeatIntervalMs: number,
+): AsyncGenerator<TEvent | typeof HEARTBEAT_TICK, void, void> {
+    const sourceIterator = sourceStream[Symbol.asyncIterator]();
+    let pendingStep: Promise<IteratorResult<TEvent>> | null = null;
+    try {
+        while (true) {
+            pendingStep = pendingStep ?? sourceIterator.next();
+            let timerId: ReturnType<typeof setTimeout> | undefined;
+            const tickPromise = new Promise<typeof HEARTBEAT_TICK>((resolveTick) => {
+                timerId = setTimeout(() => resolveTick(HEARTBEAT_TICK), heartbeatIntervalMs);
+            });
+            let raceOutcome: IteratorResult<TEvent> | typeof HEARTBEAT_TICK;
+            try {
+                raceOutcome = await Promise.race([pendingStep, tickPromise]);
+            }
+            finally {
+                clearTimeout(timerId);
+            }
+            if (raceOutcome === HEARTBEAT_TICK) {
+                yield HEARTBEAT_TICK;
+                continue;
+            }
+            pendingStep = null;
+            if (raceOutcome.done)
+                return;
+            yield raceOutcome.value;
+        }
+    }
+    finally {
+        // The lifecycle aborts the request; return() can still wait behind next().
+        void Promise.resolve().then(() => sourceIterator.return?.()).catch(() => {});
+    }
+}
 
 export class AgentRunAbortedError extends Error {
     readonly execMessageId?: number;
@@ -95,28 +146,23 @@ export async function* waitForPromiseWithHeartbeat<T>(
     intervalMs = AGENT_HEARTBEAT_INTERVAL_MS,
 ): AsyncGenerator<AgentServerMessage, T, void> {
     let settled = false;
-    let result: T;
-    let failure: unknown;
-    let rejected = false;
-
-    const wrapped = promise.then(
+    const completion = promise.then(
         (value) => {
             settled = true;
-            result = value;
+            return { kind: 'resolved' as const, value };
         },
-        (error) => {
+        (error: unknown) => {
             settled = true;
-            rejected = true;
-            failure = error;
+            return { kind: 'rejected' as const, error };
         },
     );
 
-    while (!settled) {
+    while (true) {
         let timer: ReturnType<typeof setTimeout> | undefined;
-        let raced: 'done' | 'tick';
+        let outcome: Awaited<typeof completion> | 'tick';
         try {
-            raced = await Promise.race([
-                wrapped.then(() => 'done' as const),
+            outcome = await Promise.race([
+                completion,
                 new Promise<'tick'>(resolve => {
                     timer = setTimeout(() => resolve('tick'), intervalMs);
                 }),
@@ -125,13 +171,14 @@ export async function* waitForPromiseWithHeartbeat<T>(
             if (timer !== undefined)
                 clearTimeout(timer);
         }
-        if (raced === 'tick' && !settled) {
-            yield heartbeat();
+        if (outcome !== 'tick') {
+            if (outcome.kind === 'rejected')
+                throw outcome.error;
+            return outcome.value;
         }
+        if (!settled)
+            yield heartbeat();
     }
-
-    if (rejected) throw failure;
-    return result!;
 }
 
 export async function* waitForMessageMatchingWithHeartbeat(

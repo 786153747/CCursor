@@ -128,7 +128,6 @@ describe('checkpoint cancellation dispatch boundary', () => {
       vi.spyOn(database, 'run'),
       vi.spyOn(database, 'exec'),
       vi.spyOn(database, 'all'),
-      vi.spyOn(database, 'prepare'),
       vi.spyOn(database, 'transaction'),
     ]
     const timeoutSpy = vi.spyOn(globalThis, 'setTimeout')

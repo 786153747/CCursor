@@ -34,34 +34,73 @@ function estimateTokensForSameCharRun(runChar: string, runLength: number): numbe
   return Math.ceil(runLength * tokensPerChar)
 }
 
-/** 有界样本的诚实 token/字符比率 (不走折叠, 样本长度有界故无退化风险) */
-function measureTokensPerChar(text: string): number {
-  const sample = text.slice(0, RUN_ESTIMATE_SAMPLE_LENGTH)
-  const sampleTokens = encode(sample, { allowedSpecial: 'all' }).length
-  return Math.max(1 / 16, sampleTokens / Math.max(1, sample.length))
+interface TokenizedTextSegment {
+  text: string
+  tokenCount: number
+  tokens?: number[]
 }
 
-function countTokensWithRunEstimates(text: string): number {
-  let total = 0
+function encodeTextSegment(text: string): TokenizedTextSegment {
+  const tokens = encode(text, { allowedSpecial: 'all' })
+  return { text, tokenCount: tokens.length, tokens }
+}
+
+function* tokenizeWithRunEstimates(text: string): Generator<TokenizedTextSegment> {
   let cursor = 0
   const pattern = new RegExp(`(.)\\1{${SAME_CHAR_RUN_LIMIT - 1},}`, 'g')
-  let match: RegExpExecArray | null
-  while ((match = pattern.exec(text)) !== null) {
+  for (const match of text.matchAll(pattern)) {
     if (match.index > cursor)
-      total += encode(text.slice(cursor, match.index), { allowedSpecial: 'all' }).length
-    total += estimateTokensForSameCharRun(match[1]!, match[0].length)
+      yield encodeTextSegment(text.slice(cursor, match.index))
+    yield {
+      text: match[0],
+      tokenCount: estimateTokensForSameCharRun(match[1]!, match[0].length),
+    }
     cursor = match.index + match[0].length
   }
   if (cursor < text.length)
-    total += encode(text.slice(cursor), { allowedSpecial: 'all' }).length
-  return total
+    yield encodeTextSegment(text.slice(cursor))
 }
 
 export function countTokens(text: string): number {
   if (!text) return 0
   if (!hasOversizedSameCharRuns(text))
     return encode(text, { allowedSpecial: 'all' }).length
-  return countTokensWithRunEstimates(text)
+  let total = 0
+  for (const segment of tokenizeWithRunEstimates(text))
+    total += segment.tokenCount
+  return total
+}
+
+function sliceTokenizedSegments(segments: TokenizedTextSegment[], maxTokens: number, direction: 'head' | 'tail'): string {
+  if (maxTokens <= 0)
+    return ''
+  let remainingTokens = Math.floor(maxTokens)
+  const parts: string[] = []
+  const orderedSegments = direction === 'head' ? segments : [...segments].reverse()
+  for (const segment of orderedSegments) {
+    if (segment.tokenCount <= remainingTokens) {
+      parts.push(segment.text)
+      remainingTokens -= segment.tokenCount
+      continue
+    }
+    let retainedUnits = segment.tokens
+      ? remainingTokens
+      : Math.floor(segment.text.length * remainingTokens / segment.tokenCount)
+    while (retainedUnits > 0) {
+      const candidate = segment.tokens
+        ? decode(direction === 'head' ? segment.tokens.slice(0, retainedUnits) : segment.tokens.slice(-retainedUnits))
+        : segment.text.slice(0, retainedUnits)
+      const preservesBoundary = direction === 'head' ? segment.text.startsWith(candidate) : segment.text.endsWith(candidate)
+      if (preservesBoundary && countTokens(candidate) <= remainingTokens) {
+        parts.push(candidate)
+        break
+      }
+      // A partial UTF-8 token or a short repeated run may need one fewer unit.
+      retainedUnits--
+    }
+    break
+  }
+  return (direction === 'head' ? parts : parts.reverse()).join('')
 }
 
 /**
@@ -70,20 +109,20 @@ export function countTokens(text: string): number {
  * 用于入口截断与压缩占位符预览 — token 封顶 (而非字符封顶) 保证
  * CJK 内容下截断产物有构造上界 (中文 1000 字符 ≈ 1000 tok, 字符封顶会被击穿)。
  *
- * 病态输入 (同字符长游程) 精确编码会退化到秒级, 按有界样本比率折算字符切点。
+ * 病态输入复用分段计数来验证切片, 不用头部字符密度推算整篇正文。
  */
 export function sliceTextHeadTailTokens(text: string, headTokens: number, tailTokens: number): { head: string, tail: string } {
   if (!text)
     return { head: '', tail: '' }
 
   if (hasOversizedSameCharRuns(text)) {
-    const tokensPerChar = measureTokensPerChar(text)
-    const headChars = Math.min(text.length, Math.floor(headTokens / tokensPerChar))
-    const tailChars = Math.min(text.length - headChars, Math.floor(tailTokens / tokensPerChar))
-    return {
-      head: text.slice(0, headChars),
-      tail: text.slice(Math.max(headChars, text.length - tailChars)),
-    }
+    const segments = [...tokenizeWithRunEstimates(text)]
+    const totalTokens = segments.reduce((total, segment) => total + segment.tokenCount, 0)
+    if (totalTokens <= headTokens + tailTokens)
+      return { head: text, tail: '' }
+    const head = sliceTokenizedSegments(segments, headTokens, 'head')
+    const tail = sliceTokenizedSegments(segments, tailTokens, 'tail')
+    return { head, tail }
   }
 
   const tokens = encode(text, { allowedSpecial: 'all' })
@@ -100,7 +139,7 @@ export function takeTextByTokens(text: string, maxTokens: number): string {
     return ''
 
   if (hasOversizedSameCharRuns(text))
-    return text.slice(0, Math.min(text.length, Math.floor(maxTokens / measureTokensPerChar(text))))
+    return sliceTokenizedSegments([...tokenizeWithRunEstimates(text)], maxTokens, 'head')
 
   const tokens = encode(text, { allowedSpecial: 'all' })
   if (tokens.length <= maxTokens)

@@ -4,110 +4,30 @@ import type { ParsedRunRequest } from './protocol'
 import type { AgentSession } from './session'
 import type { ToolCallInfo } from './tools'
 import { resolveExecutionToolName } from './tools'
-import { CheckpointConflictError, persistConversationCheckpoint } from '../../database/checkpoints'
+import { CheckpointConflictError } from '../../database/checkpoints'
 import { logger } from '../../logger'
 import { resolveProviderRuntime } from '../llm'
 import { emitFinalCheckpoint, emitRollingCheckpoint, throwIfBlobRunInactive } from './checkpointManager'
-import { saveCheckpointBlobs } from './clientBlobFetch'
 import { BlobIntegrityError } from './blobErrors'
 import { ContextTokenTracker } from './tokenCounter'
-import { buildSummarySource, createCompactionArtifacts, estimateMessagesTokens, measureMessagesTokens, planCompaction, retainCompactionArtifacts, streamSummaryWithFallback } from './compactionStrategy'
-import { getCompactionContentionCount, isCompactionLockHeld, releaseCompactionLock, tryAcquireCompactionLock, waitForCompactionLockRelease } from './compactionLock'
+import { estimateMessagesTokens, measureMessagesTokens, planCompaction } from './compactionStrategy'
+import { executeCompaction, waitForRunCompactionLockRelease } from './compactionExecution'
+import { getCompactionContentionCount, isCompactionLockHeld, releaseCompactionLock, tryAcquireCompactionLock } from './compactionLock'
 import { extractPlainTextContent, materializeHistoryEntries, rebuildConversationHistory, repairHistoryEntries, retainMessageBlob, retainMessageBlobs } from './historyManager'
 import { buildMessages, workspaceUris } from './protocol'
-import { checkpoint, editToolCallStreamDelta, heartbeat, partialToolCall, summary, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
+import { checkpoint, editToolCallStreamDelta, heartbeat, partialToolCall, summaryCompleted, summaryStarted, translateStream, userMessageAppended } from './stream'
 import { finalizeTaskResult, launchTaskTool, runToolCall, type TaskLaunchContext } from './toolRuntime'
-import { awaitExecResultAndClose, waitForPromiseWithHeartbeat } from './wait'
+import { awaitExecResultAndClose, isAgentRunAbortedError, waitForPromiseWithHeartbeat } from './wait'
 import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, ensureTurnBlobCached, probeTurnDynamicToolCount, readTurnBaseline, type EncodedBlob } from './turnTracker'
 import { restoreRequiredBlobGraph } from './requiredBlobGraph'
 import type { BlobRunContext } from './runContext'
 import { contextualizeDynamicMetaTools, partitionCursorBuiltinTools, shouldEnableBuiltinDynamicProfile } from './dynamicTools'
 import { contextualizeSubagentTools } from './subagentCatalog'
-import { addUsage, AUTOCOMPACT_NET_GROWTH_MIN_TOKENS, clampTokenDetails, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, isContextLengthLimitError, shouldTriggerCompaction } from './usage'
-import { AGENT_HEARTBEAT_INTERVAL_MS, CONTEXT_LENGTH_RETRY_MAX } from './constants'
-import { isAgentRunAbortedError } from './wait'
+import { addUsage, AUTOCOMPACT_NET_GROWTH_MIN_TOKENS, emptyUsageTotals, estimateContextTokens, getAutoCompactThreshold, isContextLengthLimitError, shouldTriggerCompaction } from './usage'
+import { CONTEXT_LENGTH_RETRY_MAX } from './constants'
 import { isSessionCancelled } from './session'
 import { makeProviderError, makeToolError } from '../errors'
 import { createRepairDiagnostics, hasRepairMutations, repairConversationHistory } from '../llm/transformMessages'
-import { withProviderRequestLifecycle } from '../llm/requestLifecycle'
-
-const LEADING_DASH_RE = /^-\s*/
-
-/**
- * SSE 保活哨兵 (2026-08-29 二次实弹修正): 摘要流消费循环的心跳必须定时驱动。
- * 思考模型摘要期零事件 → 事件驱动心跳饿死 → SSE 静默 ~93s → Cursor 客户端
- * stall 判死弃 run 重发, 在飞行摘要作废且并发 run 续涨上下文。
- */
-export const HEARTBEAT_TICK: unique symbol = Symbol('summary-heartbeat-tick')
-
-export async function* waitForRunCompactionLockRelease(
-  conversationId: string,
-  run: BlobRunContext,
-): AsyncGenerator<AgentServerMessage, void, void> {
-  const cancellation = new AbortController()
-  try {
-    throwIfBlobRunInactive(run)
-    yield* waitForPromiseWithHeartbeat(waitForCompactionLockRelease(
-      conversationId, AbortSignal.any([run.signal, cancellation.signal]),
-    ))
-    throwIfBlobRunInactive(run)
-  }
-  finally {
-    cancellation.abort()
-  }
-}
-
-/**
- * 包装摘要事件流: 源流静默超过 AGENT_HEARTBEAT_INTERVAL_MS 时产出
- * HEARTBEAT_TICK, 消费方转发为 SSE heartbeat, 与源流事件无关地维持连接活性。
- */
-export function pumpWithTimedHeartbeats<TEvent>(
-  source: AsyncIterable<TEvent> | ((signal: AbortSignal) => AsyncIterable<TEvent>),
-  heartbeatIntervalMs: number = AGENT_HEARTBEAT_INTERVAL_MS,
-  signal?: AbortSignal,
-): AsyncGenerator<TEvent | typeof HEARTBEAT_TICK, void, unknown> {
-  return withProviderRequestLifecycle(lifecycle => pumpHeartbeatEvents(
-    typeof source === 'function' ? source(lifecycle.signal) : source,
-    heartbeatIntervalMs,
-  ), signal)
-}
-
-async function* pumpHeartbeatEvents<TEvent>(
-  sourceStream: AsyncIterable<TEvent>,
-  heartbeatIntervalMs: number,
-): AsyncGenerator<TEvent | typeof HEARTBEAT_TICK, void, void> {
-  const sourceIterator = sourceStream[Symbol.asyncIterator]()
-  let pendingStep: Promise<IteratorResult<TEvent>> | null = null
-  try {
-    while (true) {
-      // 复用未决的 next(): 心跳分支返回后源 promise 仍在飞行, 不可重复调用 next()
-      pendingStep = pendingStep ?? sourceIterator.next()
-      let timerId: ReturnType<typeof setTimeout> | undefined
-      const tickPromise = new Promise<typeof HEARTBEAT_TICK>((resolveTick) => {
-        timerId = setTimeout(() => resolveTick(HEARTBEAT_TICK), heartbeatIntervalMs)
-      })
-      let raceOutcome: IteratorResult<TEvent> | typeof HEARTBEAT_TICK
-      try {
-        raceOutcome = await Promise.race([pendingStep, tickPromise])
-      }
-      finally {
-        clearTimeout(timerId)
-      }
-      if (raceOutcome === HEARTBEAT_TICK) {
-        yield HEARTBEAT_TICK
-        continue
-      }
-      pendingStep = null
-      if (raceOutcome.done)
-        return
-      yield raceOutcome.value
-    }
-  }
-  finally {
-    // 消费方提前退出 (run 取消): 不 await return() — 源可能悬在内部 await
-    void Promise.resolve().then(() => sourceIterator.return?.()).catch(() => {})
-  }
-}
 
 const EDIT_TOOL_NAMES = new Set(['ApplyPatch', 'Edit', 'Write', 'EditNotebook'])
 
@@ -325,7 +245,7 @@ export function detectEditPathFromToolInput(toolName: string, rawInput: string):
   const m = rawInput.match(new RegExp(`"${pathKey}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`))
   if (m?.[1]) return decodeJsonStringFragment(m[1])
   if (toolName === 'ApplyPatch') {
-    const p = rawInput.match(/\*\*\*\s+(?:Update|Add|Delete)\s+File:\s+(.+?)(?:\\n|\n)/)
+    const p = rawInput.match(/\*\*\*\s+(?:Update|Add|Delete)\s+File:([^\r\n]*?)(?:\\n|\r?\n)/)
     if (p?.[1]) return p[1].trim()
   }
   return ''
@@ -426,7 +346,7 @@ function decodeEscape(ch: string): string {
     case '"': return '"'
     case '/': return '/'
     case 'r': return '\r'
-    default: return '\\' + ch
+    default: return `\\${ch}`
   }
 }
 
@@ -496,10 +416,6 @@ function editToolTargetStats(toolName: string, input: Record<string, unknown>): 
     add('new_string')
   }
   return stats
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 function recordAssistantBlocksIntoTurn(turn: ActiveTurnTracker | null, blocks: LLMContentBlock[]): EncodedBlob[] {
@@ -576,6 +492,29 @@ function flushPendingAssistantPrefix(params: {
   return { currentThinking, currentText }
 }
 
+interface InlineCompactionParams {
+  run: BlobRunContext
+  parsed: ParsedRunRequest
+  allBlobIds: string[]
+  turnBlobIds: string[]
+  summaryArchiveIds: string[]
+  usedTokensEstimate: number
+  contextTokenLimit: number
+  messages: LLMMessage[]
+  route: ReturnType<typeof resolveProviderRuntime>
+  readPaths: string[]
+  budgetOverride?: number
+}
+
+interface InlineCompactionResult {
+  newBlobIds: string[]
+  newSummaryArchiveIds: string[]
+  newUsedTokens: number
+  newMessages: LLMMessage[]
+  /** Base budget used by subsequent context-length retries. */
+  baseBudgetTokens: number
+}
+
 /**
  * 在 Agent Run 流内执行 inline auto-summarize。
  *
@@ -592,26 +531,9 @@ function flushPendingAssistantPrefix(params: {
  * 7. yield summaryCompleted — 通知客户端 summarize 完成
  * 8. 返回 compacted 状态供后续 round 继续使用
  */
-async function* performInlineAutoSummarize(params: {
-  run: BlobRunContext
-  parsed: ParsedRunRequest
-  allBlobIds: string[]
-  turnBlobIds: string[]
-  summaryArchiveIds: string[]
-  usedTokensEstimate: number
-  contextTokenLimit: number
-  messages: LLMMessage[]
-  route: ReturnType<typeof resolveProviderRuntime>
-  readPaths: string[]
-  budgetOverride?: number
-}): AsyncGenerator<AgentServerMessage, {
-  newBlobIds: string[]
-  newSummaryArchiveIds: string[]
-  newUsedTokens: number
-  newMessages: LLMMessage[]
-  /** 本轮规划实际采用的基准预算 (错误驱动重试的 budget/2^retry 被除数) */
-  baseBudgetTokens: number
-} | 'lock-held' | null> {
+async function* performInlineAutoSummarize(
+  params: InlineCompactionParams,
+): AsyncGenerator<AgentServerMessage, InlineCompactionResult | 'lock-held' | null> {
   const { parsed, run } = params
   throwIfBlobRunInactive(run)
 
@@ -634,25 +556,9 @@ async function* performInlineAutoSummarize(params: {
   }
 }
 
-async function* performInlineAutoSummarizeLocked(params: {
-  run: BlobRunContext
-  parsed: ParsedRunRequest
-  allBlobIds: string[]
-  turnBlobIds: string[]
-  summaryArchiveIds: string[]
-  usedTokensEstimate: number
-  contextTokenLimit: number
-  messages: LLMMessage[]
-  route: ReturnType<typeof resolveProviderRuntime>
-  readPaths: string[]
-  budgetOverride?: number
-}): AsyncGenerator<AgentServerMessage, {
-  newBlobIds: string[]
-  newSummaryArchiveIds: string[]
-  newUsedTokens: number
-  newMessages: LLMMessage[]
-  baseBudgetTokens: number
-} | null> {
+async function* performInlineAutoSummarizeLocked(
+  params: InlineCompactionParams,
+): AsyncGenerator<AgentServerMessage, InlineCompactionResult | null> {
   const { parsed, run, allBlobIds, turnBlobIds, summaryArchiveIds, usedTokensEstimate, contextTokenLimit, route } = params
 
   const historyEntries = repairHistoryEntries(materializeHistoryEntries(params.messages, run.blobs), run.blobs)
@@ -714,92 +620,17 @@ async function* performInlineAutoSummarizeLocked(params: {
   yield summaryStarted()
   throwIfBlobRunInactive(run)
 
-  // 摘要源构造 (阶段 4): 总预算 min(0.6×窗口×4, 3.2e6) chars, 超限走 max-min 水位分配
-  const summarySourceText = buildSummarySource(compactionPlan.summarizeEntries, { contextTokenLimit })
-
-  const llmStartTime = Date.now()
-  logger.info({
-    conversationId: parsed.conversationId,
-    sourceTextLen: summarySourceText.length,
-    summarizeEntries: compactionPlan.summarizeEntries.length,
-    keepTail: compactionPlan.keepTail.length,
-  }, '[SUMMARIZE] LLM summary starting')
-
-  // 三级兜底 (流式): ≤3 次重试 (源预算递减 + shorter-output 指令) → 确定性降级 → 占位文本;
-  // SUMMARY_HARD_CAP: 产出超 2×预留 → shorter-output 重试 → token 级裁剪。
-  // 心跳必须定时驱动 (2026-08-29 二次实弹): 思考模型摘要期零事件, 事件驱动心跳
-  // 会饿死 → SSE 静默 ~93s → 客户端 stall 判死弃 run 重发 → 摘要成果作废 +
-  // 并发 run 续涨上下文 → 背靠背二次压缩 (三次实测 92.5/92.7/95.0s 一致实锤)。
-  let summaryText = ''
-  for await (const summaryEvent of pumpWithTimedHeartbeats(signal => streamSummaryWithFallback({
-    provider: route.provider,
-    signal,
-    model: route.model,
-    sourceText: summarySourceText,
-    contextTokenLimit,
-  }), undefined, run.signal)) {
-    throwIfBlobRunInactive(run)
-    if (summaryEvent === HEARTBEAT_TICK) {
-      yield heartbeat()
-      continue
-    }
-    if (summaryEvent.type === 'delta') {
-      summaryText += summaryEvent.text
-      yield summary(summaryEvent.text)
-    }
-    if (summaryEvent.type === 'done')
-      summaryText = summaryEvent.text
-  }
-  throwIfBlobRunInactive(run)
-
-  logger.info({
-    conversationId: parsed.conversationId,
-    summaryLen: summaryText.length,
-    durationMs: Date.now() - llmStartTime,
-  }, '[SUMMARIZE] LLM summary done')
-
-  const artifacts = createCompactionArtifacts({
-    plan: compactionPlan,
-    summaryText,
-    previousSummaryArchiveIds: summaryArchiveIds,
-  })
-
-  retainCompactionArtifacts(run.blobs, artifacts)
-  yield* saveCheckpointBlobs(run, [
-    ...artifacts.nextRootBlobIds,
-    ...turnBlobIds,
-    ...artifacts.nextSummaryArchiveIds,
-  ])
-
-  // o200k 实测重置 (替代 chars/4): 重置精度直接决定 provider usage 反弹差大小
-  const compactedTokenDetails = clampTokenDetails(
-    measureMessagesTokens([
-      ...compactionPlan.leading.map(entry => entry.message),
-      { role: 'assistant', content: `Previous conversation summary:\n${artifacts.summaryText}` },
-      ...compactionPlan.keepTail.map(entry => entry.message),
-    ]),
-    contextTokenLimit,
-  )
-
-  logger.info({
+  const { artifacts, tokenDetails: compactedTokenDetails } = yield* executeCompaction({
+    run,
     conversationId: parsed.conversationId,
     origin: 'inline',
-    kind: 'committed',
-    usedTokens: compactedTokenDetails.usedTokens,
-    maxTokens: compactedTokenDetails.maxTokens,
-    rootBlobCount: artifacts.nextRootBlobIds.length,
-    summaryArchiveCount: artifacts.nextSummaryArchiveIds.length,
-  }, '[AUTOCOMPACT] checkpoint write')
-  throwIfBlobRunInactive(run)
-  await persistConversationCheckpoint({ kind: 'committed',
-    conversationId: parsed.conversationId,
-    rootBlobIds: artifacts.nextRootBlobIds,
+    plan: compactionPlan,
+    route,
+    contextTokenLimit,
     turnBlobIds,
-    summaryArchiveIds: artifacts.nextSummaryArchiveIds,
-    tokenDetails: compactedTokenDetails,
+    previousSummaryArchiveIds: summaryArchiveIds,
     mode: parsed.mode,
-    updatedAt: Date.now(),
-  }, run.signal, run.requireCheckpointWriteScope())
+  })
 
   throwIfBlobRunInactive(run)
   yield checkpoint(
@@ -1044,7 +875,6 @@ export async function* handleConversationRun(
   let breakdownCategories: BreakdownCategory[] | undefined
 
   let execMessageIdCounter = 0
-  let interactionIdCounter = 1
   let blobIds: string[] = []
   let turnBlobIds = [...parsed.historyTurnBlobIds]
   let messages: LLMMessage[] = []
@@ -1578,7 +1408,7 @@ export async function* handleConversationRun(
           roundContext,
           messages,
           allocateExecMessageId: () => ++execMessageIdCounter,
-          allocateInteractionId: () => interactionIdCounter++,
+          allocateInteractionId: () => run.allocateInteractionId(),
           imageCollector: roundImageBlocks,
           readContext,
           // GetDynamicTools 需要据此决定取哪些 server、是否补 mcp_auth
@@ -1693,10 +1523,9 @@ export async function* handleConversationRun(
       //   1. 净增长门槛: 距上次有效压缩基线的净增长 >= 15K 才允许再次触发,
       //      打断"压缩后 provider usage 立刻反弹 -> 读一个文件就再压"的锯齿循环;
       //   2. 硬安全线: 距窗口上限不足 8K 时无视门槛立即压缩,不为等门槛撑爆窗口。
-      // 阈值传入 route 真实 maxOutputTokens, 恢复注释宣称的 40K 余量 (此前恒为默认 8192, 仅 28K)。
-      const autoCompactThreshold = getAutoCompactThreshold(contextTokenLimit, route.maxOutputTokens)
+      const autoCompactThreshold = getAutoCompactThreshold(contextTokenLimit)
       const overThreshold = autoCompactEnabled
-        && shouldTriggerCompaction(usedTokensEstimate, contextTokenLimit, undefined, route.maxOutputTokens)
+        && shouldTriggerCompaction(usedTokensEstimate, contextTokenLimit)
       const netGrowthSinceCompaction = usedTokensEstimate - lastCompactionBaseline
       const netGrowthOk = netGrowthSinceCompaction >= AUTOCOMPACT_NET_GROWTH_MIN_TOKENS
       const hardPressure = usedTokensEstimate >= contextTokenLimit - Math.min(contextTokenLimit, 8192)

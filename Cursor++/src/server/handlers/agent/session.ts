@@ -76,8 +76,6 @@ export interface BackgroundJob {
 export interface AgentSession {
     requestId: string;
     messages: Array<Record<string, unknown>>;
-    /** @deprecated 保留向后兼容，新代码使用 listeners */
-    notify: (() => void) | null;
     listeners: Set<() => void>;
     closed: boolean;
     /** The Run/RunSSE RPC signal, never the short-lived BidiAppend unary signal. */
@@ -120,7 +118,6 @@ export function createEphemeralSession(requestId: string): AgentSession {
     return {
         requestId,
         messages: [],
-        notify: null,
         listeners: new Set(),
         closed: false,
         backgroundJobs: new Map(),
@@ -238,7 +235,6 @@ export function getBackgroundJob(session: AgentSession, taskId: string): Backgro
 }
 
 function notifyAll(session: AgentSession): void {
-    session.notify?.();
     for (const fn of session.listeners) fn();
 }
 
@@ -469,14 +465,6 @@ export function appendMessage(requestId: string, data: string, appendSeqno: bigi
     }
 }
 
-/** 等待下一条消息（任意类型） */
-export async function waitForMessage(
-    session: AgentSession,
-    timeoutMs: number | null = 30_000,
-): Promise<Record<string, unknown> | null> {
-    return waitForMessageMatching(session, () => true, timeoutMs);
-}
-
 /**
  * 等待匹配特定条件的消息
  *
@@ -504,14 +492,6 @@ export async function waitForMessageMatching(
         let resolved = false;
         let timer: ReturnType<typeof setTimeout> | null = null;
 
-        const cleanup = () => {
-            resolved = true;
-            if (timer != null)
-                clearTimeout(timer);
-            session.listeners.delete(listener);
-            signal?.removeEventListener('abort', abortListener);
-        };
-
         const abortListener = () => {
             if (resolved)
                 return;
@@ -533,6 +513,14 @@ export async function waitForMessageMatching(
                 resolve(null);
             }
         };
+
+        function cleanup(): void {
+            resolved = true;
+            if (timer != null)
+                clearTimeout(timer);
+            session.listeners.delete(listener);
+            signal?.removeEventListener('abort', abortListener);
+        }
 
         session.listeners.add(listener);
         signal?.addEventListener('abort', abortListener, { once: true });

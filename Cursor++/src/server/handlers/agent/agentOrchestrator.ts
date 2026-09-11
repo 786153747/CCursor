@@ -3,7 +3,7 @@ import { collectExtraContextBlobIds, parseRunRequest, resolveExtraContextBlobs }
 import type { AgentSession } from './session';
 import { handleSummarizeAction } from './summarizeRuntime';
 import { handleConversationRun } from './conversationRuntime';
-import { beginCheckpointWriteScope, CheckpointConflictError, hasMatchingCheckpointReferences } from '../../database/checkpoints';
+import { beginCheckpointWriteScope, CheckpointConflictError } from '../../database/checkpoints';
 import { binaryBlobDataFromClientBytes, blobIdFromBytes, blobIdToBytes } from './blob';
 import { BlobRunContext } from './runContext';
 import { BlobIntegrityError } from './blobErrors';
@@ -17,6 +17,8 @@ import { ErrorDetails_Error } from '../../gen/aiserver_v1_shared_pb';
 import { claimUploadedConversationBlobs } from './uploadRunHandoff';
 import { processRunResources } from './runResources';
 import { throwIfBlobRunInactive } from './checkpointManager';
+import { CheckpointDelivery } from './checkpointDelivery';
+import { admitClientCheckpoint } from './checkpointRecovery';
 
 export async function* handleRunRequest(
     msg: Record<string, unknown>,
@@ -30,30 +32,28 @@ export async function* handleRunRequest(
     });
 
     try {
+        const hasUserContent = parsed.userText || parsed.selectedImages.length > 0;
+        if (!hasUserContent && !parsed.isResume && !parsed.isExecutePlan && !parsed.isBackgroundTaskCompletion && !parsed.isSummarize)
+            return;
         run.checkpointWriteScope = await beginCheckpointWriteScope(parsed.conversationId, { signal: run.signal });
-        if (run.checkpointWriteScope.hasAmbiguousLegacyPair) {
-            logger.warn({ conversationId: parsed.conversationId }, '[AGENT] legacy draft and committed checkpoints diverge; explicit fork required');
-            throw new CheckpointConflictError(parsed.conversationId);
-        }
         if (run.checkpointWriteScope.isDeleted)
             throw new CheckpointConflictError(parsed.conversationId);
-        const { committedCheckpoint: persistedCheckpoint, draftCheckpoint } = run.checkpointWriteScope;
-        const latestCheckpoint = draftCheckpoint ?? persistedCheckpoint;
-        const incomingReferences = {
-            rootBlobIds: parsed.historyBlobIds,
-            turnBlobIds: parsed.historyTurnBlobIds,
-            summaryArchiveIds: parsed.historySummaryArchiveIds,
-        };
-        if (latestCheckpoint && !hasMatchingCheckpointReferences(latestCheckpoint, incomingReferences)) {
-            // The wire has no client checkpoint epoch or explicit revert intent.
-            // Do not declare a different client branch newer merely because it arrived later.
-            throw new CheckpointConflictError(parsed.conversationId);
+        if (parsed.runId && !parsed.isSummarize) {
+            try {
+                run.checkpointDelivery = new CheckpointDelivery(msg.runRequest as Record<string, unknown>);
+            } catch {
+                // Replay is optional; unknown future state fields must not break normal runs.
+                logger.warn({ conversationId: parsed.conversationId }, '[CHECKPOINT] request cannot be fingerprinted for terminal redelivery');
+            }
         }
+        if (run.checkpointDelivery && (yield* run.checkpointDelivery.replayTerminalCheckpoint(run)))
+            return;
         yield* claimUploadedConversationBlobs(parsed, run);
+        const admittedCheckpoint = yield* admitClientCheckpoint(parsed, run);
 
         // The client still owns prompt bytes. Only matching checkpoint metadata is reused.
-        if (latestCheckpoint && !parsed.historyTokenDetails) {
-            parsed.historyTokenDetails = latestCheckpoint.tokenDetails;
+        if (admittedCheckpoint && !parsed.historyTokenDetails) {
+            parsed.historyTokenDetails = admittedCheckpoint.tokenDetails;
         }
 
         logger.debug({ conversationId: parsed.conversationId, runId: parsed.runId, requestId: session?.requestId }, '[AGENT] checkpoint write scope admitted');
@@ -151,19 +151,16 @@ export async function* handleRunRequest(
             return;
         }
 
-        const hasUserContent = parsed.userText || parsed.selectedImages.length > 0
-        if (!hasUserContent && !parsed.isResume && !parsed.isExecutePlan && !parsed.isBackgroundTaskCompletion) {
-            logger.warn({ keys: Object.keys(msg) }, '[AGENT] runRequest without userText/images, resume, executePlan, summarizeAction, or backgroundTaskCompletionAction');
-            return;
+        for await (const frame of handleConversationRun(parsed, session, run)) {
+            run.checkpointDelivery?.observe(frame);
+            yield frame;
         }
-
-        yield* handleConversationRun(parsed, session, run);
     } catch (error) {
         if (error instanceof CheckpointConflictError) {
             throw makeByokConnectError({
                 errorCode: ErrorDetails_Error.CUSTOM,
                 title: 'Checkpoint version conflict; history preserved',
-                detail: `${error.message} The client epoch is not transmitted. This may be a reset/deletion, delayed run, legacy divergent pair, or retry after an accepted checkpoint was not applied. Fork the desired client state into a new conversation; reopening alone may not resolve the gap. Histories are never merged automatically.`,
+                detail: `${error.message} Saved history was not overwritten. Compatible legacy checkpoints and correlated completed retries recover automatically. For an unresolved branch, continue from the main chat and answer the recovery question. A deletion, unavailable recovery interaction, or a version change during recovery requires checking the current chat state before retrying. Histories are never merged automatically.`,
                 isRetryable: false,
                 additionalInfo: { conversationId: parsed.conversationId, errorClass: error.name },
                 cause: error,

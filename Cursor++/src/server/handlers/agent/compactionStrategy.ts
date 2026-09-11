@@ -1,9 +1,8 @@
-import { createHash } from 'crypto';
 import { create, toBinary } from '@bufbuild/protobuf';
 import { ConversationSummaryArchiveSchema } from '../../gen/agent_v1_pb';
 import type { RunBlobStore } from './blobStore';
 import { BlobIntegrityError } from './blobErrors';
-import { blobIdToBytes, encodeBlob } from './blob';
+import { blobIdToBytes, encodeBinaryBlob, encodeBlob } from './blob';
 import { logger } from '../../logger';
 import {
     BUDGET_SAFETY_MARGIN,
@@ -232,11 +231,6 @@ export function measureMessagesTokens(messages: LLMMessage[], countTokens: (text
     return messages.reduce((sum, message) => sum + measureMessageTokens(message, countTokens), 0);
 }
 
-/** 测试辅助: 清空 blobId→count 缓存 */
-export function resetTokenCountCacheForTests(): void {
-    tokenCountCache.clear();
-}
-
 // ═══════════════════════════════════════════════════════════════════
 // 消息形态判定
 // ═══════════════════════════════════════════════════════════════════
@@ -285,7 +279,7 @@ interface BodyGroup {
     endIndexExclusive: number;
     entries: HistoryEntry[];
     /** 组内 assistant(tool_use) 的 id→input 映射, 供占位 locator/字段省略使用 */
-    toolUseInputById: Map<string, { name: string, input: Record<string, unknown> }>;
+    toolUseInputById: Map<string, Record<string, unknown>>;
 }
 
 function partitionBodyIntoGroups(body: HistoryEntry[]): BodyGroup[] {
@@ -294,12 +288,12 @@ function partitionBodyIntoGroups(body: HistoryEntry[]): BodyGroup[] {
     while (index < body.length) {
         const entry = body[index]!;
         let endIndexExclusive = index + 1;
-        const toolUseInputById = new Map<string, { name: string, input: Record<string, unknown> }>();
+        const toolUseInputById = new Map<string, Record<string, unknown>>();
 
         if (hasToolUse(entry.message)) {
             for (const block of entry.message.content) {
                 if (typeof block !== 'string' && block.type === 'tool_use')
-                    toolUseInputById.set(block.id, { name: block.name, input: block.input });
+                    toolUseInputById.set(block.id, block.input);
             }
             // 吸收其全部连续 tool_results (repair 后连续; 容忍 legacy 混排)
             while (endIndexExclusive < body.length && isToolResultCarrier(body[endIndexExclusive]!.message))
@@ -345,7 +339,6 @@ function makeToolResultPlaceholderEntry(
     entry: HistoryEntry,
     toolUseInput: Record<string, unknown> | undefined,
     realTokens: number,
-    countTokens: (text: string) => number,
 ): HistoryEntry {
     const payload = extractToolResultPayload(entry.message);
     const locator = buildToolResultLocator(payload.toolName, toolUseInput, payload.contentText);
@@ -398,7 +391,7 @@ function hasOversizedToolUseField(message: LLMMessage, largeEntryLine: number, c
     if (!Array.isArray(message.content)) return false;
     for (const block of message.content) {
         if (block.type !== 'tool_use') continue;
-        for (const [fieldName, fieldValue] of Object.entries(block.input)) {
+        for (const fieldValue of Object.values(block.input)) {
             if (typeof fieldValue === 'string' && countTokens(fieldValue) > largeEntryLine)
                 return true;
         }
@@ -579,14 +572,11 @@ function buildNoOpPlan(leading: HistoryEntry[], body: HistoryEntry[], diagnostic
 
 /** 计价结果: 每条目按占位后大小计价 (前沿/图片豁免按真实成本) */
 interface BilledEntry {
-    entry: HistoryEntry;
     billedTokens: number;
-    realTokens: number;
     replacement: HistoryEntry | null;
 }
 
 function billEntries(
-    body: HistoryEntry[],
     groups: BodyGroup[],
     frontierStartIndex: number,
     largeEntryLine: number,
@@ -601,27 +591,27 @@ function billEntries(
             const isFrontier = bodyIndex >= frontierStartIndex;
 
             if (isFrontier || containsImageBlock(entry.message)) {
-                billedByEntry.set(entry, { entry, billedTokens: realTokens, realTokens, replacement: null });
+                billedByEntry.set(entry, { billedTokens: realTokens, replacement: null });
                 continue;
             }
 
             if (isToolResultCarrier(entry.message) && realTokens > largeEntryLine) {
                 const payload = extractToolResultPayload(entry.message);
-                const toolUse = group.toolUseInputById.get(payload.toolCallId);
-                const placeholder = makeToolResultPlaceholderEntry(entry, toolUse?.input, realTokens, countTokens);
+                const toolUseInput = group.toolUseInputById.get(payload.toolCallId);
+                const placeholder = makeToolResultPlaceholderEntry(entry, toolUseInput, realTokens);
                 const placeholderTokens = measureMessageTokens(placeholder.message, countTokens, placeholder.blobId);
-                billedByEntry.set(entry, { entry, billedTokens: placeholderTokens, realTokens, replacement: placeholder });
+                billedByEntry.set(entry, { billedTokens: placeholderTokens, replacement: placeholder });
                 continue;
             }
 
             if (hasToolUse(entry.message) && hasOversizedToolUseField(entry.message, largeEntryLine, countTokens)) {
                 const elided = makeInputElidedEntry(entry, largeEntryLine, countTokens);
                 const elidedTokens = measureMessageTokens(elided.message, countTokens, elided.blobId);
-                billedByEntry.set(entry, { entry, billedTokens: elidedTokens, realTokens, replacement: elided });
+                billedByEntry.set(entry, { billedTokens: elidedTokens, replacement: elided });
                 continue;
             }
 
-            billedByEntry.set(entry, { entry, billedTokens: realTokens, realTokens, replacement: null });
+            billedByEntry.set(entry, { billedTokens: realTokens, replacement: null });
         }
     }
     return billedByEntry;
@@ -777,7 +767,7 @@ export function planCompaction(entries: HistoryEntry[], options?: PlanCompaction
     }
 
     const assemble = (effectiveBudget: number, effectiveLargeEntryLine: number): AssembleResult => {
-        const billedByEntry = billEntries(body, groups, frontierStartIndex, effectiveLargeEntryLine, countTokens);
+        const billedByEntry = billEntries(groups, frontierStartIndex, effectiveLargeEntryLine, countTokens);
         // 安全边际 (§10): o200k 是校准估计器, 扫描预算按 1.15 收紧
         const scanBudget = Math.floor(effectiveBudget / BUDGET_SAFETY_MARGIN);
 
@@ -930,15 +920,6 @@ export function planCompaction(entries: HistoryEntry[], options?: PlanCompaction
                 firstConsumptionLossCount,
             },
         };
-    }
-
-    if (lastViolation) {
-        logger.error({
-            contextTokenLimit,
-            occupancy: leadingTokens + summaryReserveTokens + (finalAssembled?.tailTokens ?? 0),
-            violationLimit,
-            frontierExcess: lastFrontierExcess,
-        }, '[AUTOCOMPACT] floor violation — occupancy exceeds promise ×1.2 after frontier excess deduction');
     }
 
     const summarizeEntries = body.slice(0, finalAssembled!.cutIndex);
@@ -1149,7 +1130,7 @@ function createCancellableTimeout(timeoutMs: number): { promise: Promise<typeof 
  * maxTokens / reasoning 参数, 输出长度与推理行为交给模型默认, 同两家生产形态;
  * 推理模型黑箱思考期零事件属正常, 由宽松 idle 容纳。
  */
-async function streamSummaryAttempt(params: SummaryGenerationParams, sourceForAttempt: string, shorterOutputInstruction: boolean, onDelta: (text: string) => void, idleTimeoutMs: number): Promise<string> {
+async function collectSummaryAttempt(params: SummaryGenerationParams, sourceForAttempt: string, shorterOutputInstruction: boolean, idleTimeoutMs: number): Promise<string> {
     params.signal?.throwIfAborted();
     const { buildSummaryUserMessage, SUMMARY_SYSTEM_PROMPT } = await import('./summaryPrompt');
     params.signal?.throwIfAborted();
@@ -1193,7 +1174,6 @@ async function streamSummaryAttempt(params: SummaryGenerationParams, sourceForAt
             const event = stepResult.value;
             if (event.type === 'text_delta' && event.text) {
                 collected += event.text;
-                onDelta(event.text);
             }
         }
     }
@@ -1209,17 +1189,15 @@ async function streamSummaryAttempt(params: SummaryGenerationParams, sourceForAt
 }
 
 /**
- * 三级兜底:
+ * 摘要候选生成:
  *   1. ≤3 次 LLM 尝试 (attempt≥2 附 "Write a shorter summary" + 源预算递减
  *      max(50K, min(÷2 或 ÷3, 0.75×原长)); attempt 3 剥控制字符)
- *   2. 确定性降级 (不经模型, 水位分配拼接 + 注入防御声明)
- *   3. '- Prior conversation compacted.'
+ *   2. 确定性降级 (不再请求模型, 水位分配拼接 + 注入防御声明)
  *
- * SUMMARY_HARD_CAP: 产出超 2×预留 → 一次 shorter-output 重试 → 仍超则
- * 水位裁剪至 cap (token 级), 超支率进观测。
+ * 模型摘要超硬上限时重试一次 shorter-output, 之后统一本地裁剪。
+ * 候选通过长度治理后才发布, 保证客户端看到的文字与归档内容一致。
  *
- * 两种消费形态: streamSummaryWithFallback (两路 runtime, 保流式 delta) /
- * generateSummaryWithFallback (测试与非流式调用)。
+ * 等待期间由外层定时心跳保活; stream 和非 stream 消费方共用最终文本。
  */
 async function* runSummaryLadder(params: SummaryGenerationParams): AsyncGenerator<{ type: 'delta', text: string } | { type: 'done', text: string }, void, void> {
     const originalLength = params.sourceText.length;
@@ -1241,13 +1219,8 @@ async function* runSummaryLadder(params: SummaryGenerationParams): AsyncGenerato
         }
         const attemptStartTime = Date.now();
         try {
-            const attemptDeltas: string[] = [];
-            const attemptText = await streamSummaryAttempt(params, attemptSource, attempt > 1, (deltaText) => {
-                attemptDeltas.push(deltaText);
-            }, idleTimeoutMs);
+            const attemptText = await collectSummaryAttempt(params, attemptSource, attempt > 1, idleTimeoutMs);
             if (attemptText) {
-                for (const deltaText of attemptDeltas)
-                    yield { type: 'delta', text: deltaText };
                 summaryText = attemptText;
                 break;
             }
@@ -1259,30 +1232,22 @@ async function* runSummaryLadder(params: SummaryGenerationParams): AsyncGenerato
     }
 
     params.signal?.throwIfAborted();
-    if (!summaryText) {
+    const hasProviderSummary = summaryText.length > 0;
+    if (!hasProviderSummary) {
         logger.warn({ contextTokenLimit: params.contextTokenLimit }, '[SUMMARIZE] LLM summary unavailable — deterministic fallback (no model)');
         summaryText = buildDeterministicFallbackSummary(params.sourceText, params.contextTokenLimit);
-    }
-    if (!summaryText) {
-        yield { type: 'done', text: '- Prior conversation compacted.' };
-        return;
     }
 
     // SUMMARY_HARD_CAP (审计四): 一次 shorter-output 重试 → 仍超则 token 级裁剪
     const hardCapTokens = computeSummaryHardCapTokens(params.contextTokenLimit);
-    if (countTokensWithO200k(summaryText) > hardCapTokens) {
+    if (hasProviderSummary && countTokensWithO200k(summaryText) > hardCapTokens) {
         logger.warn({ hardCapTokens, actualTokens: countTokensWithO200k(summaryText), stage: 'pre-retry' }, '[AUTOCOMPACT] summary exceeds hard cap — retrying with shorter-output instruction');
         try {
-            const retryDeltas: string[] = [];
-            const retryText = await streamSummaryAttempt(params, params.sourceText.slice(0, Math.max(SUMMARY_RETRY_MIN_BUDGET_CHARS, Math.floor(originalLength * SUMMARY_RETRY_MAX_INPUT_RATIO))), true, (deltaText) => {
-                retryDeltas.push(deltaText);
-            }, idleTimeoutMs);
-            if (retryText && countTokensWithO200k(retryText) <= hardCapTokens) {
-                for (const deltaText of retryDeltas)
-                    yield { type: 'delta', text: deltaText };
-                yield { type: 'done', text: retryText };
-                return;
-            }
+            const retrySource = params.sourceText.slice(0, Math.max(
+                SUMMARY_RETRY_MIN_BUDGET_CHARS,
+                Math.floor(originalLength * SUMMARY_RETRY_MAX_INPUT_RATIO),
+            ));
+            const retryText = await collectSummaryAttempt(params, retrySource, true, idleTimeoutMs);
             if (retryText)
                 summaryText = retryText;
         }
@@ -1290,17 +1255,20 @@ async function* runSummaryLadder(params: SummaryGenerationParams): AsyncGenerato
             params.signal?.throwIfAborted();
             logger.warn({ error: (error as Error).message }, '[SUMMARIZE] shorter-output retry failed');
         }
-        if (countTokensWithO200k(summaryText) > hardCapTokens) {
-            logger.warn({ hardCapTokens, actualTokens: countTokensWithO200k(summaryText), stage: 'final-trim' }, '[AUTOCOMPACT] summary still over hard cap — trimming to cap');
-            summaryText = takeTextByTokens(summaryText, hardCapTokens);
-        }
+    }
+    if (countTokensWithO200k(summaryText) > hardCapTokens) {
+        logger.warn({ hardCapTokens, actualTokens: countTokensWithO200k(summaryText), stage: 'final-trim' }, '[AUTOCOMPACT] summary still over hard cap — trimming to cap');
+        summaryText = takeTextByTokens(summaryText, hardCapTokens);
     }
 
+    params.signal?.throwIfAborted();
+    if (summaryText)
+        yield { type: 'delta', text: summaryText };
     params.signal?.throwIfAborted();
     yield { type: 'done', text: summaryText };
 }
 
-/** 流式消费: 两路 runtime 逐 delta 转发给客户端 (保持 SSE 活性) */
+/** 发布通过长度治理的摘要; 等待期间由外层 pumpWithTimedHeartbeats 保活。 */
 export function streamSummaryWithFallback(params: SummaryGenerationParams): AsyncGenerator<{ type: 'delta', text: string } | { type: 'done', text: string }, void, void> {
     return withProviderRequestLifecycle(lifecycle => runSummaryLadder({ ...params, signal: lifecycle.signal }), params.signal);
 }
@@ -1313,12 +1281,6 @@ export async function generateSummaryWithFallback(params: SummaryGenerationParam
             finalText = event.text;
     }
     return finalText;
-}
-
-function encodeBinaryBlob(bytes: Uint8Array): { blobId: string; blobData: string; blobDataRaw: Uint8Array } {
-    const blobData = Buffer.from(bytes).toString('base64');
-    const blobId = createHash('sha256').update(blobData).digest('base64');
-    return { blobId, blobData, blobDataRaw: bytes };
 }
 
 export function createCompactionArtifacts(params: {

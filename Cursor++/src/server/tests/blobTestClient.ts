@@ -1,6 +1,6 @@
 import type { JsonObject } from '@bufbuild/protobuf'
 import type { ConnectRouter, ServiceImpl } from '@connectrpc/connect'
-import type { AgentClientMessage, AgentServerMessage, ConversationStateStructure } from '../gen/agent_v1_pb'
+import type { AgentClientMessage, AgentServerMessage, ConversationStateStructure, InteractionQuery } from '../gen/agent_v1_pb'
 import type { AgentSession } from '../handlers/agent/session'
 import { randomUUID } from 'node:crypto'
 import { create, fromBinary, fromJson, toBinary, toJson } from '@bufbuild/protobuf'
@@ -145,6 +145,7 @@ export class BlobTestClient {
   readonly checkpoints: ConversationStateStructure[] = []
   readonly execKinds: string[] = []
   autoAcknowledgeSets = true
+  onInteractionQuery?: (query: InteractionQuery) => void
   readResultText = 'Fixture file contents returned by the client.'
   completion: Promise<RuntimeOutcome> = Promise.resolve({})
 
@@ -387,6 +388,12 @@ export class BlobTestClient {
       else {
         throw new Error(`Unexpected external tool request: ${Object.keys(envelope).join(', ')}`)
       }
+    }
+    else if (frame.message.case === 'interactionQuery') {
+      if (this.onInteractionQuery)
+        this.onInteractionQuery(frame.message.value)
+      else
+        this.send({ interactionResponse: { id: frame.message.value.id, askQuestionInteractionResponse: { result: { rejected: { reason: 'No recovery consent in this test' } } } } })
     }
     else if (frame.message.case === 'conversationCheckpointUpdate') {
       // A checkpoint is invalid even transiently if any dependency lacks an ACK.

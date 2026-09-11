@@ -15,23 +15,22 @@ import { finalizeEditToolCall } from './editRuntime';
 import { finalizeExecTool } from './execRuntime';
 import { fetchMcpState, mergeMcpStateIntoRoutingTable, type McpRoutingEntry, type McpStateServerInfo } from './mcpState';
 import { finalizeInteractionTool } from './interactionRuntime';
-import { execMessage, toolCallCompleted, toolCallStarted } from './stream';
+import { execMessage, interactionQuery, toolCallCompleted, toolCallStarted } from './stream';
 import { buildToolArgs } from './toolBuilders';
 import {
     buildAskQuestionResultFromInteractionResponse,
+    buildExecToolResult,
     buildLocalToolResult,
     buildWebFetchApprovalResultFromInteractionResponse,
     buildWebSearchApprovalResultFromInteractionResponse,
+    type ToolResultEnvelope,
 } from './toolResults';
 import { finalizeToolCall } from './toolLifecycle';
 import { buildEditPlan, buildExecArgs, mapToolToExecArgs, resolveToolCall, type AvailableDynamicBuiltinTool, type AvailableMcpTool, type ToolCallInfo } from './tools';
 import { getBackgroundJob, registerBackgroundJob, type AgentSession } from './session';
-import { buildExecToolResult } from './toolResults';
 import { str } from './toolkit/results/shared';
 import { waitForInteractionResponseWithHeartbeat, waitForPromiseWithHeartbeat } from './wait';
 import { performWebFetch, performWebSearch } from './web';
-import { interactionQuery } from './stream';
-import type { ToolResultEnvelope } from './toolResults';
 import type { ParsedRunRequest } from './protocol/types';
 import type { ReadContextState } from './contextCatalog';
 import type { TaskEntryTruncationContext } from './toolkit/results/taskToolResults';

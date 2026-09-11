@@ -2,7 +2,7 @@ import type { AgentServerMessage } from '../../gen/agent_v1_pb';
 import { checkpoint } from './stream';
 import { clampTokenDetails, computeContextUsagePercent, shouldTriggerCompaction, type UsageTotals } from './usage';
 import { summarizeAssistantContent } from './transcript';
-import { persistConversationCheckpoint } from '../../database/checkpoints';
+import { persistConversationCheckpoint, type PersistedConversationCheckpoint } from '../../database/checkpoints';
 import type { LLMContentBlock } from '../llm/types';
 import { logger } from '../../logger';
 import type { BlobRunContext } from './runContext';
@@ -17,6 +17,30 @@ export function throwIfBlobRunInactive(run: BlobRunContext): void {
     throwIfSessionCancelled(run.session);
     if (run.session.closed)
         throw new AgentRunAbortedError('client disconnected from the run');
+}
+
+/** Save all referenced blobs before a scoped write; callers own UI frame ordering. */
+export async function* saveRunCheckpoint(
+    run: BlobRunContext,
+    state: Omit<PersistedConversationCheckpoint, 'updatedAt'>,
+    terminalCheckpoint?: AgentServerMessage,
+): AsyncGenerator<AgentServerMessage, void, void> {
+    throwIfBlobRunInactive(run);
+    yield* saveCheckpointBlobs(run, [
+        ...state.rootBlobIds,
+        ...state.turnBlobIds,
+        ...state.summaryArchiveIds,
+    ]);
+    throwIfBlobRunInactive(run);
+    // Only final publication creates a receipt, and only after successful Set ACKs.
+    const terminalReceiptJson = terminalCheckpoint
+        ? run.checkpointDelivery?.createTerminalReceipt(terminalCheckpoint)
+        : undefined;
+    await persistConversationCheckpoint({
+        ...state,
+        updatedAt: Date.now(),
+    }, run.signal, run.requireCheckpointWriteScope(), terminalReceiptJson);
+    throwIfBlobRunInactive(run);
 }
 
 export async function* emitRollingCheckpoint(params: {
@@ -64,13 +88,7 @@ export async function* emitRollingCheckpoint(params: {
         usageTotals: params.usageTotals,
     }, '[SESSION] round checkpoint update');
 
-    yield* saveCheckpointBlobs(params.run, [
-        ...params.allBlobIds,
-        ...params.turnBlobIds,
-        ...params.summaryArchiveIds,
-    ]);
-    throwIfBlobRunInactive(params.run);
-    await persistConversationCheckpoint({
+    yield* saveRunCheckpoint(params.run, {
         conversationId: params.conversationId,
         kind: 'draft',
         rootBlobIds: params.allBlobIds,
@@ -78,8 +96,7 @@ export async function* emitRollingCheckpoint(params: {
         summaryArchiveIds: params.summaryArchiveIds,
         tokenDetails: rollingTokenDetails,
         mode: params.mode,
-        updatedAt: Date.now(),
-    }, params.run.signal, params.run.requireCheckpointWriteScope());
+    });
 
     throwIfBlobRunInactive(params.run);
     yield checkpoint(
@@ -139,25 +156,7 @@ export async function* emitFinalCheckpoint(params: {
         usageTotals: params.usageTotals,
     }, '[SESSION] checkpoint assistant content');
 
-    yield* saveCheckpointBlobs(params.run, [
-        ...params.allBlobIds,
-        ...params.turnBlobIds,
-        ...params.summaryArchiveIds,
-    ]);
-    throwIfBlobRunInactive(params.run);
-    await persistConversationCheckpoint({
-        conversationId: params.conversationId,
-        kind: 'committed',
-        rootBlobIds: params.allBlobIds,
-        turnBlobIds: params.turnBlobIds,
-        summaryArchiveIds: params.summaryArchiveIds,
-        tokenDetails,
-        mode: params.mode,
-        updatedAt: Date.now(),
-    }, params.run.signal, params.run.requireCheckpointWriteScope());
-
-    throwIfBlobRunInactive(params.run);
-    yield checkpoint(
+    const finalCheckpoint = checkpoint(
         params.allBlobIds,
         tokenDetails.usedTokens,
         tokenDetails.maxTokens,
@@ -173,4 +172,16 @@ export async function* emitFinalCheckpoint(params: {
             breakdownCategories: params.breakdownCategories,
         },
     );
+    yield* saveRunCheckpoint(params.run, {
+        conversationId: params.conversationId,
+        kind: 'committed',
+        rootBlobIds: params.allBlobIds,
+        turnBlobIds: params.turnBlobIds,
+        summaryArchiveIds: params.summaryArchiveIds,
+        tokenDetails,
+        mode: params.mode,
+    }, finalCheckpoint);
+
+    throwIfBlobRunInactive(params.run);
+    yield finalCheckpoint;
 }

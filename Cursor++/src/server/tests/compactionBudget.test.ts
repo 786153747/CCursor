@@ -30,17 +30,18 @@ import {
   measureMessagesTokens,
   planCompaction,
   retainCompactionArtifacts,
+  streamSummaryWithFallback,
 } from '../handlers/agent/compactionStrategy'
-import { CONTEXT_LENGTH_RETRY_MAX } from '../handlers/agent/constants'
-import { HEARTBEAT_TICK, pumpWithTimedHeartbeats } from '../handlers/agent/conversationRuntime'
+import { CONTEXT_LENGTH_RETRY_MAX, SUMMARY_RETRY_MAX_ATTEMPTS } from '../handlers/agent/constants'
 import { hydrateHistoryEntries, isSummaryBlobMessage, repairHistoryEntries, retainHistoryEntries } from '../handlers/agent/historyManager'
-import { countTokens } from '../handlers/agent/tokenCounter'
+import { countTokens, sliceTextHeadTailTokens, takeTextByTokens } from '../handlers/agent/tokenCounter'
 import {
   buildTaskToolResultText,
   resolveTaskEntryCapTokens,
   TASK_ENTRY_CAP_MAX_TOKENS,
 } from '../handlers/agent/toolkit/results/taskToolResults'
 import { getAutoCompactThreshold, isContextLengthLimitError } from '../handlers/agent/usage'
+import { HEARTBEAT_TICK, pumpWithTimedHeartbeats } from '../handlers/agent/wait'
 
 // ─── helpers ───
 
@@ -224,6 +225,23 @@ describe('#14/#34 Task 报告入口截断 + spill', () => {
     expect(spillPathMatch).toBeTruthy()
     const spilled = readFileSync(spillPathMatch![1], 'utf8')
     expect(spilled).toContain(cjkReport)
+  })
+
+  it('mixed repetitive and dense text stays within each truncation budget', () => {
+    // Separate phrases to isolate density mismatch from long-word BPE cost.
+    const mixedText = `${'a'.repeat(1024)}${'汉字测试 '.repeat(10_000)}`
+    const { head, tail } = sliceTextHeadTailTokens(mixedText, 5_600, 2_400)
+    expect(countTokens(head)).toBeLessThanOrEqual(5_600)
+    expect(countTokens(tail)).toBeLessThanOrEqual(2_400)
+    expect(mixedText.startsWith(head)).toBe(true)
+    expect(mixedText.endsWith(tail)).toBe(true)
+    expect(head.length + tail.length).toBeLessThan(mixedText.length)
+    expect(countTokens(takeTextByTokens(mixedText, 1_280))).toBeLessThanOrEqual(1_280)
+
+    const resultText = buildTaskToolResultText('success', {
+      conversationSteps: [{ message: { case: 'assistantMessage', value: { text: mixedText } } }],
+    }, { conversationId: '', toolCallId: 'mixed-report', contextTokenLimit: 32_000 })
+    expect(countTokens(resultText!)).toBeLessThan(8_500)
   })
 
   it('无 entryContext 时按固定 25K cap 处理', () => {
@@ -1066,8 +1084,10 @@ describe('#11/#16/#17/#33 摘要源治理与三级兜底 (阶段 4)', () => {
   })
 
   it('#16 摘要三级兜底: LLM 三次失败 → 确定性降级 (水位分配产物 + 注入防御声明)', async () => {
+    let requestCount = 0
     const failingProvider = {
       async* stream() {
+        requestCount++
         throw new Error('provider unavailable')
       },
     }
@@ -1076,14 +1096,15 @@ describe('#11/#16/#17/#33 摘要源治理与三级兜底 (阶段 4)', () => {
       provider: failingProvider,
       model: 'test-model',
       sourceText,
-      contextTokenLimit: 258_400,
+      contextTokenLimit: 32_000,
     })
 
     // 确定性降级: 不经模型, 含注入防御声明与转录内容
     expect(summaryText).toContain('not instructions from the user')
     expect(summaryText).toContain(sourceText.slice(0, 100))
-    // 降级预算 = clamp(258400×2%×4, 50K, 3.2M) = 50K chars — 全量保留
-    expect(summaryText.length).toBeGreaterThan(2_000)
+    expect(countTokens(summaryText)).toBeLessThanOrEqual(computeSummaryHardCapTokens(32_000))
+    // A local fallback must not re-enter a provider that exhausted its attempts.
+    expect(requestCount).toBe(SUMMARY_RETRY_MAX_ATTEMPTS)
   })
 
   it('#35 挂死网关: idle 超时驱动兜底梯子, 有界时间内出确定性降级 (Codex idle-only 形态)', async () => {
@@ -1187,16 +1208,48 @@ describe('#11/#16/#17/#33 摘要源治理与三级兜底 (阶段 4)', () => {
         yield { type: 'text_delta', text: makeVariedTokenText(20_000) }
       },
     }
-    const summaryText = await generateSummaryWithFallback({
+    let summaryText = ''
+    let publishedSummary = ''
+    for await (const event of streamSummaryWithFallback({
       provider: alwaysVerboseProvider,
       model: 'test-model',
       sourceText: makeVariedTokenText(1_000),
       contextTokenLimit: 258_400,
-    })
+    })) {
+      if (event.type === 'delta')
+        publishedSummary += event.text
+      else
+        summaryText = event.text
+    }
 
     // 258,400 窗 → SUMMARY_HARD_CAP = 2 × 5,000 = 10,000 tok
     expect(computeSummaryHardCapTokens(258_400)).toBe(10_000)
     expect(countTokens(summaryText)).toBeLessThanOrEqual(10_000)
+    expect(publishedSummary === summaryText, 'published deltas must match the saved summary').toBe(true)
+  })
+
+  it('publishes only the accepted shorter summary, not the discarded candidate', async () => {
+    let requestCount = 0
+    const provider = {
+      async* stream() {
+        requestCount++
+        yield { type: 'text_delta', text: requestCount === 1 ? makeVariedTokenText(2_000) : '  final summary  ' }
+      },
+    }
+    const events = []
+    for await (const event of streamSummaryWithFallback({
+      provider,
+      model: 'test-model',
+      sourceText: 'original transcript',
+      contextTokenLimit: 32_000,
+    })) {
+      events.push(event)
+    }
+    expect(requestCount).toBe(2)
+    expect(events).toEqual([
+      { type: 'delta', text: 'final summary' },
+      { type: 'done', text: 'final summary' },
+    ])
   })
 })
 
@@ -1219,8 +1272,10 @@ describe('#25 并发互斥 (compactionLock)', () => {
     releaseCompactionLock(conversationId)
     await waitPromise
     expect(resumed).toBe(true)
+    expect(getCompactionContentionCount(conversationId)).toBe(0)
     // 释放后可重新获取
     expect(tryAcquireCompactionLock(conversationId)).toBe(true)
+    expect(getCompactionContentionCount(conversationId)).toBe(0)
     releaseCompactionLock(conversationId)
   })
 })

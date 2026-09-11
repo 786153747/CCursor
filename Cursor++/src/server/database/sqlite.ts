@@ -6,7 +6,7 @@
  *
  * API 说明:
  * - @vscode/sqlite3 基于 node-sqlite3，是异步回调 API
- * - 本 wrapper 提供 Promise 化的接口（AsyncDatabase / AsyncStatement）
+ * - 本 wrapper 提供 Promise 化的 AsyncDatabase 接口
  * - getAgentDatabase() 保持同步返回已打开的实例
  * - initDatabase() 为异步，必须在 startServer() 时先调用
  */
@@ -124,15 +124,7 @@ export interface RunResult {
   changes: number
 }
 
-export interface AsyncStatement {
-  run: (params?: unknown) => Promise<RunResult>
-  get: <T = unknown>(params?: unknown) => Promise<T | undefined>
-  all: <T = unknown>(params?: unknown) => Promise<T[]>
-  finalize: () => Promise<void>
-}
-
 export interface AsyncDatabase {
-  prepare: (sql: string) => AsyncStatement
   exec: (sql: string) => Promise<void>
   run: (sql: string, params?: unknown) => Promise<RunResult>
   get: <T = unknown>(sql: string, params?: unknown) => Promise<T | undefined>
@@ -143,60 +135,8 @@ export interface AsyncDatabase {
 
 // ---------- wrapper implementation ----------
 
-function wrapStatement(stmt: any): AsyncStatement {
-  return {
-    run(params?: unknown): Promise<RunResult> {
-      return new Promise((resolve, reject) => {
-        const cb = function (this: any, err: Error | null) {
-          if (err)
-            reject(err)
-          else resolve({ lastID: this.lastID as number, changes: this.changes as number })
-        }
-        if (params === undefined)
-          stmt.run(cb)
-        else
-          stmt.run(params, cb)
-      })
-    },
-    get<T = unknown>(params?: unknown): Promise<T | undefined> {
-      return new Promise((resolve, reject) => {
-        const cb = (err: Error | null, row: T | undefined) => {
-          if (err)
-            reject(err)
-          else resolve(row)
-        }
-        if (params === undefined)
-          stmt.get(cb)
-        else
-          stmt.get(params, cb)
-      })
-    },
-    all<T = unknown>(params?: unknown): Promise<T[]> {
-      return new Promise((resolve, reject) => {
-        const cb = (err: Error | null, rows: T[] | undefined) => {
-          if (err)
-            reject(err)
-          else resolve(rows || [])
-        }
-        if (params === undefined)
-          stmt.all(cb)
-        else
-          stmt.all(params, cb)
-      })
-    },
-    finalize(): Promise<void> {
-      return new Promise((resolve, reject) => {
-        stmt.finalize((err: Error | null) => err ? reject(err) : resolve())
-      })
-    },
-  }
-}
-
 function wrapDatabase(rawDb: any): AsyncDatabase {
   const db: AsyncDatabase = {
-    prepare(sql: string): AsyncStatement {
-      return wrapStatement(rawDb.prepare(sql))
-    },
     exec(sql: string): Promise<void> {
       return new Promise((resolve, reject) => {
         rawDb.exec(sql, (err: Error | null) => err ? reject(err) : resolve())
@@ -411,6 +351,26 @@ async function initializeSchema(database: AsyncDatabase): Promise<void> {
       ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0;
     `)
   }
+  if (!checkpointColumns.some(column => column.name === 'terminal_receipt_json')) {
+    await database.exec(`
+      ALTER TABLE conversation_checkpoints
+      ADD COLUMN terminal_receipt_json TEXT NOT NULL DEFAULT '';
+    `)
+  }
+
+  // Recovery snapshots are metadata, not a second blob store. Never prune them
+  // during upgrades: they retain both candidates before a conditional adoption.
+  await database.exec(`
+    CREATE TABLE IF NOT EXISTS conversation_checkpoint_recovery (
+      snapshot_id TEXT PRIMARY KEY NOT NULL,
+      conversation_id TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      checkpoint_rows_json TEXT NOT NULL,
+      preserved_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_checkpoint_recovery_conversation
+      ON conversation_checkpoint_recovery(conversation_id);
+  `)
 }
 
 /**

@@ -9,7 +9,7 @@ import { resetAgentDatabaseForTests } from '../database/sqlite'
 import { encodeBlob } from '../handlers/agent/blob'
 import { rebuildConversationHistory } from '../handlers/agent/historyManager'
 import { BlobRunContext } from '../handlers/agent/runContext'
-import { createEphemeralSession } from '../handlers/agent/session'
+import { createEphemeralSession, pushSessionMessage } from '../handlers/agent/session'
 import { assertValidAnthropicToolUseContract } from '../handlers/llm/anthropicContract'
 import { encodeAnthropicRequestMessages } from '../handlers/llm/conversationCodec'
 import { transformMessages } from '../handlers/llm/transformMessages'
@@ -56,12 +56,6 @@ async function withTempAgentDatabase(run: () => Promise<void>): Promise<void> {
   }
 }
 
-async function exhaust<T>(iterable: AsyncIterable<T>): Promise<void> {
-  for await (const _ of iterable) {
-    // no-op
-  }
-}
-
 function buildLegacyAnthropicHistoryBlobs() {
   const system = encodeBlob({ role: 'system', content: 'sys prompt' })
   const preamble = encodeBlob({ role: 'user', content: '<user_info>env</user_info>' })
@@ -93,7 +87,7 @@ describe('agent orchestrator / history rebuild integration', () => {
     activeRuns.length = 0
   })
 
-  it('rejects an ambiguous empty baseline without restoring or replacing checkpoint history', async () => {
+  it('does not restore or replace saved history when an empty-baseline recovery is declined', async () => {
     await withTempAgentDatabase(async () => {
       const { system, preamble, assistant, legacyUserToolResults } = buildLegacyAnthropicHistoryBlobs()
       await persistConversationCheckpoint({
@@ -110,7 +104,8 @@ describe('agent orchestrator / history rebuild integration', () => {
       const handleRunRequest = await loadHandleRunRequest()
       const session = createEphemeralSession('empty-client-history')
       const previous = await getPersistedConversationCheckpoint('conv-switch')
-      await expect(exhaust(handleRunRequest({
+      let recoveryQuestions = 0
+      for await (const frame of handleRunRequest({
         runRequest: {
           conversationId: 'conv-switch',
           action: {
@@ -122,8 +117,22 @@ describe('agent orchestrator / history rebuild integration', () => {
           modelDetails: { modelId: 'gpt-5.4-medium' },
           conversationState: {},
         },
-      }, session))).rejects.toThrow(/Checkpoint version conflict/)
+      }, session)) {
+        if (frame.message.case === 'interactionQuery') {
+          recoveryQuestions++
+          expect(frame.message.value.query.value).toMatchObject({
+            args: { questions: [expect.objectContaining({ prompt: expect.stringContaining('no prior history') })] },
+          })
+          pushSessionMessage(session, { interactionResponse: {
+            id: frame.message.value.id,
+            askQuestionInteractionResponse: { result: { rejected: { reason: 'Keep the saved history unchanged' } } },
+          } })
+        }
+        expect(frame.message.case).not.toBe('kvServerMessage')
+        expect(frame.message.case).not.toBe('conversationCheckpointUpdate')
+      }
 
+      expect(recoveryQuestions).toBe(1)
       expect(capturedParsed).toHaveLength(0)
       expect(capturedRuntimeRuns).toHaveLength(0)
       expect(await getPersistedConversationCheckpoint('conv-switch')).toEqual(previous)

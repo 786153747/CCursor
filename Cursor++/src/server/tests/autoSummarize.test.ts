@@ -93,12 +93,6 @@ it('#18 触发线六档逐值断言 (新公式)', () => {
   expect(getAutoCompactThreshold(1_000_000)).toBe(960_000)
 })
 
-it('getAutoCompactThreshold ignores maxOutputTokens (签名兼容, 新公式不依赖)', () => {
-  // 新公式只看窗口; maxOutputTokens 保留仅为调用方兼容
-  expect(getAutoCompactThreshold(200000, 64000)).toBe(getAutoCompactThreshold(200000, 8192))
-  expect(getAutoCompactThreshold(200000)).toBe(170000) // 200000 − min(40000, 30000)
-})
-
 // ─── clampTokenDetails tests ───
 
 it('clampTokenDetails clamps to valid range', () => {

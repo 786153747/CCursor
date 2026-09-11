@@ -10,8 +10,6 @@
  * - buildSummaryUserMessage(): 将对话内容填入模板
  */
 
-export const SUMMARY_PROMPT_VERSION = 'v3.0-official';
-
 export const SUMMARY_SYSTEM_PROMPT = `You are an intelligent assistant, tasked with summarizing the following conversation. You MUST follow the instructions given in the <summarization_request> tags and summarize the conversation. This summary will be provided to another AI assistant to continue the task at hand, so you should align the summary with the task in the conversation.`;
 
 const SUMMARY_USER_TEMPLATE = `<conversation_transcript>

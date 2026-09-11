@@ -151,7 +151,7 @@ function stringifyContent(content: LLMMessage['content']): string {
   if (typeof content === 'string')
     return content
   return content
-    .map((block) => {
+    .map((block): string => {
       switch (block.type) {
         case 'text':
         case 'thinking':
@@ -162,6 +162,10 @@ function stringifyContent(content: LLMMessage['content']): string {
           return `[tool call] ${block.name} ${JSON.stringify(block.input)}`
         case 'image':
           return `[image:${block.mimeType}]`
+        default: {
+          const unhandledBlock: never = block
+          throw new TypeError(`Unsupported LLM content block: ${JSON.stringify(unhandledBlock)}`)
+        }
       }
     })
     .filter(Boolean)

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { getCheckpointDatabase } from './sqlite';
 
 export type CheckpointKind = 'committed' | 'draft';
@@ -29,6 +29,7 @@ interface CheckpointRow {
 interface CheckpointWriteRow extends CheckpointRow {
     write_token: string;
     is_deleted: number;
+    terminal_receipt_json: string;
 }
 
 export type CheckpointReferences = Pick<PersistedConversationCheckpoint, 'rootBlobIds' | 'turnBlobIds' | 'summaryArchiveIds'>;
@@ -39,6 +40,7 @@ interface CheckpointVersion {
 }
 
 const checkpointVersion = Symbol('checkpointVersion');
+const checkpointRecoveryRows = Symbol('checkpointRecoveryRows');
 // Provenance for cooperative writers that atomically retire draft on committed writes.
 // This is not authentication: external writers must not forge or reuse these tokens.
 const checkpointWriteTokenPrefix = 'ccursor-cas-v1:';
@@ -48,11 +50,13 @@ export interface CheckpointWriteScope {
     readonly conversationId: string;
     readonly committedCheckpoint: PersistedConversationCheckpoint | null;
     readonly draftCheckpoint: PersistedConversationCheckpoint | null;
-    /** Reject before choosing draft ?? committed; legacy divergent pairs cannot be ordered safely. */
+    /** Legacy pairs require compatibility verification, not a blind draft preference. */
     readonly hasAmbiguousLegacyPair: boolean;
     /** An explicit conversation reset is not authority for a delayed run to recreate it. */
     readonly isDeleted: boolean;
+    readonly terminalReceiptJson: string;
     readonly [checkpointVersion]: CheckpointVersion;
+    readonly [checkpointRecoveryRows]: string;
 }
 
 export class CheckpointConflictError extends Error {
@@ -132,6 +136,11 @@ export async function beginCheckpointWriteScope(
         draftCheckpoint,
         hasAmbiguousLegacyPair,
         isDeleted: committedRow?.is_deleted === 1,
+        // Final acceptance writes both tokens together. Any later draft write or
+        // cleanup invalidates redelivery, including a subsequently retired draft.
+        terminalReceiptJson: !draftCheckpoint && committedCheckpoint && committedRow?.write_token === draftRow?.write_token
+            ? committedRow!.terminal_receipt_json : '',
+        [checkpointRecoveryRows]: JSON.stringify(rows.sort((left, right) => left.kind.localeCompare(right.kind))),
         [checkpointVersion]: {
             committed: committedRow?.write_token ?? null,
             draft: draftRow?.write_token ?? null,
@@ -140,7 +149,7 @@ export async function beginCheckpointWriteScope(
 }
 
 async function writeCheckpointRows(
-    mutation: { checkpoint: PersistedConversationCheckpoint; deleted?: boolean },
+    mutation: { checkpoint: PersistedConversationCheckpoint; deleted?: boolean; terminalReceiptJson?: string },
     signal?: AbortSignal,
     writeScope?: CheckpointWriteScope,
 ): Promise<void> {
@@ -166,6 +175,7 @@ async function writeCheckpointRows(
         $isDeleted: mutation.deleted ? 1 : 0,
         $expectedCommittedToken: scope[checkpointVersion].committed,
         $expectedDraftToken: scope[checkpointVersion].draft,
+        $terminalReceiptJson: mutation.terminalReceiptJson ?? '',
     };
 
     // Dispatch is the cancellation boundary. This single SQLite statement atomically
@@ -196,7 +206,8 @@ async function writeCheckpointRows(
             mode,
             updated_at,
             write_token,
-            is_deleted
+            is_deleted,
+            terminal_receipt_json
         ) SELECT
             $conversationId,
             checkpoint_kinds.kind,
@@ -208,7 +219,9 @@ async function writeCheckpointRows(
             CASE WHEN checkpoint_kinds.is_deleted = 1 THEN '' ELSE $mode END,
             $updatedAt,
             $writeToken,
-            checkpoint_kinds.is_deleted
+            checkpoint_kinds.is_deleted,
+            CASE WHEN checkpoint_kinds.is_deleted = 0 AND checkpoint_kinds.kind = 'committed'
+                 THEN $terminalReceiptJson ELSE '' END
         FROM checkpoint_kinds, current_version
         WHERE current_version.matches
         ON CONFLICT(conversation_id, kind) DO UPDATE SET
@@ -220,7 +233,8 @@ async function writeCheckpointRows(
             mode = excluded.mode,
             updated_at = excluded.updated_at,
             write_token = excluded.write_token,
-            is_deleted = excluded.is_deleted
+            is_deleted = excluded.is_deleted,
+            terminal_receipt_json = excluded.terminal_receipt_json
     `, parameters);
     if (result.changes === 0) throw new CheckpointConflictError(checkpoint.conversationId);
     scope[checkpointVersion][checkpoint.kind] = writeToken;
@@ -236,8 +250,47 @@ export function persistConversationCheckpoint(
     checkpoint: PersistedConversationCheckpoint,
     signal?: AbortSignal,
     writeScope?: CheckpointWriteScope,
+    terminalReceiptJson?: string,
 ): Promise<void> {
-    return writeCheckpointRows({ checkpoint }, signal, writeScope);
+    return writeCheckpointRows({ checkpoint, terminalReceiptJson }, signal, writeScope);
+}
+
+/** Read-only fence after asynchronous validation; it is not a network delivery ACK. */
+export async function assertCheckpointWriteScopeCurrent(scope: CheckpointWriteScope, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
+    const current = await getCheckpointDatabase().get<{ matches: number }>(`
+        SELECT
+            (SELECT write_token FROM conversation_checkpoints WHERE conversation_id = ? AND kind = 'committed') IS ?
+            AND (SELECT write_token FROM conversation_checkpoints WHERE conversation_id = ? AND kind = 'draft') IS ? AS matches
+    `, [scope.conversationId, scope[checkpointVersion].committed, scope.conversationId, scope[checkpointVersion].draft]);
+    signal?.throwIfAborted();
+    if (!current?.matches) throw new CheckpointConflictError(scope.conversationId);
+}
+
+/**
+ * Archive the exact run-start candidates BEFORE adopting a client-selected baseline.
+ * A crash/conflict between these statements leaves an extra recovery snapshot, never
+ * an unbacked overwrite. The adoption still compares the original token pair.
+ */
+export async function adoptConversationCheckpoint(
+    checkpoint: PersistedConversationCheckpoint,
+    scope: CheckpointWriteScope,
+    reason: 'legacy-compatible' | 'user-selected',
+    signal?: AbortSignal,
+): Promise<void> {
+    if (checkpoint.conversationId !== scope.conversationId || checkpoint.kind !== 'committed' || scope.isDeleted)
+        throw new CheckpointConflictError(scope.conversationId);
+    await assertCheckpointWriteScopeCurrent(scope, signal);
+    const rowsJson = scope[checkpointRecoveryRows];
+    const snapshotId = createHash('sha256').update(rowsJson).digest('hex');
+    signal?.throwIfAborted();
+    await getCheckpointDatabase().run(`
+        INSERT INTO conversation_checkpoint_recovery
+            (snapshot_id, conversation_id, reason, checkpoint_rows_json, preserved_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(snapshot_id) DO NOTHING
+    `, [snapshotId, scope.conversationId, reason, rowsJson, Date.now()]);
+    await persistConversationCheckpoint(checkpoint, signal, scope);
 }
 
 /**

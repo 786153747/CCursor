@@ -888,7 +888,6 @@ export function parseRunRequest(msg: Record<string, unknown>): ParsedRunRequest 
     // 所以收到的 string 需要 base64 decode 还原为原始 blobId。
     historyBlobIds: parseBlobReferences(conversationState?.rootPromptMessagesJson),
     historyTurnBlobIds: parseBlobReferences(conversationState?.turns),
-    historyTurns: parseBlobReferences(conversationState?.turns),
     historySummaryArchiveIds: parseBlobReferences(conversationState?.summaryArchives),
     historyTokenDetails: (() => {
       const tokenDetails = conversationState?.tokenDetails as Record<string, unknown> | undefined

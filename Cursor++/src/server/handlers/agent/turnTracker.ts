@@ -1,16 +1,17 @@
 import { create, fromBinary, toBinary } from '@bufbuild/protobuf'
-import type { ToolCall, UserMessage } from '../../gen/agent_v1_pb'
 import {
-  AgentMode,
+  type AgentServerMessage,
   AssistantMessageSchema,
   ConversationStepSchema,
   ConversationTurnStructureSchema,
   SimulatedMsgReason,
   ThinkingMessageSchema,
+  type ToolCall,
+  type UserMessage,
   UserMessageSchema,
 } from '../../gen/agent_v1_pb'
-import type { AgentServerMessage } from '../../gen/agent_v1_pb'
 import type { ParsedRunRequest } from './protocol/types'
+import { resolveAgentMode } from './protocol/agentMode'
 import type { BlobRunContext } from './runContext'
 import { binaryBlobDataFromClientBytes, blobIdFromBytes, blobIdToBytes, encodeBinaryBlob } from './blob'
 import type { RunBlobStore } from './blobStore'
@@ -18,18 +19,6 @@ import { fetchBlobsFromClient, type ClientBlobResult } from './clientBlobFetch'
 import { BlobIntegrityError } from './blobErrors'
 import { logger } from '../../logger'
 import { AgentRunAbortedError } from './wait'
-
-function resolveAgentMode(mode: string): AgentMode {
-  const normalized = mode.replace('AGENT_MODE_', '').toLowerCase()
-  switch (normalized) {
-    case 'agent': return AgentMode.AGENT
-    case 'ask': return AgentMode.ASK
-    case 'plan': return AgentMode.PLAN
-    case 'debug': return AgentMode.DEBUG
-    case 'triage': return AgentMode.TRIAGE
-    default: return AgentMode.AGENT
-  }
-}
 
 export interface EncodedBlob {
   blobId: string

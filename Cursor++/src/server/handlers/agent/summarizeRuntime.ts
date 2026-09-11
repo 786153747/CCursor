@@ -2,19 +2,17 @@ import { randomUUID } from 'crypto';
 import type { AgentServerMessage } from '../../gen/agent_v1_pb';
 import { workspaceUris, type ParsedRunRequest } from './protocol';
 import type { AgentSession } from './session';
-import { heartbeat, checkpoint, summary, summaryCompleted, summaryStarted } from './stream';
+import { heartbeat, checkpoint, summaryCompleted, summaryStarted } from './stream';
 import { clampTokenDetails, computeContextUsagePercent } from './usage';
 import { resolveProviderRuntime } from '../llm';
 import type { BlobRunContext } from './runContext';
 import { loadHistoryEntries, repairHistoryEntries } from './historyManager';
-import { buildSummarySource, createCompactionArtifacts, measureMessagesTokens, planCompaction, retainCompactionArtifacts, streamSummaryWithFallback } from './compactionStrategy';
+import { measureMessagesTokens, planCompaction } from './compactionStrategy';
 import { releaseCompactionLock, tryAcquireCompactionLock } from './compactionLock';
-import { HEARTBEAT_TICK, pumpWithTimedHeartbeats, waitForRunCompactionLockRelease } from './conversationRuntime';
+import { executeCompaction, waitForRunCompactionLockRelease } from './compactionExecution';
 import { executePreCompactHook } from './hookRuntime';
-import { persistConversationCheckpoint } from '../../database/checkpoints';
 import { logger } from '../../logger';
-import { saveCheckpointBlobs } from './clientBlobFetch';
-import { throwIfBlobRunInactive } from './checkpointManager';
+import { saveRunCheckpoint, throwIfBlobRunInactive } from './checkpointManager';
 
 export async function* handleSummarizeAction(
     parsed: ParsedRunRequest,
@@ -107,13 +105,7 @@ async function* handleSummarizeActionLocked(
             rootBlobCount: parsed.historyBlobIds.length,
             summaryArchiveCount: parsed.historySummaryArchiveIds.length,
         }, '[AUTOCOMPACT] checkpoint write');
-        yield* saveCheckpointBlobs(run, [
-            ...parsed.historyBlobIds,
-            ...parsed.historyTurnBlobIds,
-            ...parsed.historySummaryArchiveIds,
-        ]);
-        throwIfBlobRunInactive(run);
-        await persistConversationCheckpoint({
+        yield* saveRunCheckpoint(run, {
             kind: 'committed',
             conversationId: parsed.conversationId,
             rootBlobIds: parsed.historyBlobIds,
@@ -121,8 +113,7 @@ async function* handleSummarizeActionLocked(
             summaryArchiveIds: parsed.historySummaryArchiveIds,
             tokenDetails: currentTokenDetails,
             mode: parsed.mode,
-            updatedAt: Date.now(),
-        }, run.signal, run.requireCheckpointWriteScope());
+        });
 
         throwIfBlobRunInactive(run);
         yield summaryCompleted(hookMessage ?? (compactionPlan.mode === 'disabled'
@@ -147,92 +138,17 @@ async function* handleSummarizeActionLocked(
         return;
     }
 
-    // 摘要源构造 (阶段 4): 总预算 min(0.6×窗口×4, 3.2e6) chars, 超限走 max-min 水位分配
-    const summarySourceText = buildSummarySource(compactionPlan.summarizeEntries, { contextTokenLimit });
-
-    let summaryText = '';
-    const llmStartTime = Date.now();
-    logger.info({
-        conversationId: parsed.conversationId,
-        model: route.model,
-        sourceTextLen: summarySourceText.length,
-        summarizeEntries: compactionPlan.summarizeEntries.length,
-        keepTail: compactionPlan.keepTail.length,
-    }, '[SUMMARIZE] LLM summary starting');
-
-    // 三级兜底 (流式, 与 inline 路径同一实现 — 两路行为一致)。
-    // 心跳定时驱动 (与 inline 路径同修): 思考模型零事件期若心跳饿死,
-    // 客户端 ~93s stall 判死会弃 run 作废在飞行摘要。
-    for await (const summaryEvent of pumpWithTimedHeartbeats(signal => streamSummaryWithFallback({
-        provider: route.provider,
-        signal,
-        model: route.model,
-        sourceText: summarySourceText,
-        contextTokenLimit,
-    }), undefined, run.signal)) {
-        throwIfBlobRunInactive(run);
-        if (summaryEvent === HEARTBEAT_TICK) {
-            yield heartbeat();
-            continue;
-        }
-        if (summaryEvent.type === 'delta') {
-            summaryText += summaryEvent.text;
-            yield summary(summaryEvent.text);
-        }
-        if (summaryEvent.type === 'done')
-            summaryText = summaryEvent.text;
-    }
-    throwIfBlobRunInactive(run);
-
-    logger.info({
-        conversationId: parsed.conversationId,
-        summaryLen: summaryText.length,
-        durationMs: Date.now() - llmStartTime,
-    }, '[SUMMARIZE] LLM summary done');
-
-    const artifacts = createCompactionArtifacts({
-        plan: compactionPlan,
-        summaryText,
-        previousSummaryArchiveIds: parsed.historySummaryArchiveIds,
-    });
-
-    retainCompactionArtifacts(run.blobs, artifacts);
-    yield* saveCheckpointBlobs(run, [
-        ...artifacts.nextRootBlobIds,
-        ...parsed.historyTurnBlobIds,
-        ...artifacts.nextSummaryArchiveIds,
-    ]);
-
-    const compactedUsedTokens = clampTokenDetails(
-        // o200k 实测重置 (与 inline 路径同口径, 两路行为一致由单一实现保证)
-        measureMessagesTokens([
-            ...compactionPlan.leading.map(entry => entry.message),
-            { role: 'assistant', content: `Previous conversation summary:\n${artifacts.summaryText}` },
-            ...compactionPlan.keepTail.map(entry => entry.message),
-        ]),
-        currentTokenDetails.maxTokens,
-    );
-
-    logger.info({
+    const { artifacts, tokenDetails: compactedUsedTokens } = yield* executeCompaction({
+        run,
         conversationId: parsed.conversationId,
         origin: 'client_summarize',
-        kind: 'committed',
-        usedTokens: compactedUsedTokens.usedTokens,
-        maxTokens: compactedUsedTokens.maxTokens,
-        rootBlobCount: artifacts.nextRootBlobIds.length,
-        summaryArchiveCount: artifacts.nextSummaryArchiveIds.length,
-    }, '[AUTOCOMPACT] checkpoint write');
-    throwIfBlobRunInactive(run);
-    await persistConversationCheckpoint({
-        kind: 'committed',
-        conversationId: parsed.conversationId,
-        rootBlobIds: artifacts.nextRootBlobIds,
+        plan: compactionPlan,
+        route,
+        contextTokenLimit,
         turnBlobIds: parsed.historyTurnBlobIds,
-        summaryArchiveIds: artifacts.nextSummaryArchiveIds,
-        tokenDetails: compactedUsedTokens,
+        previousSummaryArchiveIds: parsed.historySummaryArchiveIds,
         mode: parsed.mode,
-        updatedAt: Date.now(),
-    }, run.signal, run.requireCheckpointWriteScope());
+    });
 
     throwIfBlobRunInactive(run);
     yield checkpoint(

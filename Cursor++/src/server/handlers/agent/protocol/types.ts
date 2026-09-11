@@ -355,8 +355,6 @@ export interface ParsedRunRequest {
   historyBlobIds: string[]
   /** turns — ConversationTurnStructure blob IDs */
   historyTurnBlobIds: string[]
-  /** @deprecated 历史兼容别名；新代码使用 historyTurnBlobIds */
-  historyTurns: string[]
   /** summary_archives — 已压缩历史的 archive blob IDs */
   historySummaryArchiveIds: string[]
   historyTokenDetails?: { usedTokens: number, maxTokens: number }

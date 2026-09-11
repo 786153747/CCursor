@@ -55,7 +55,6 @@ describe('turnTracker', () => {
         readPaths: [],
         historyBlobIds: [],
         historyTurnBlobIds: [],
-        historyTurns: [],
         historySummaryArchiveIds: [],
         selectedImages: [],
         prependUserMessages: [],
