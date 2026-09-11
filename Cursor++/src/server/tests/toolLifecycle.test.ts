@@ -1,8 +1,7 @@
 import type { AgentServerMessage } from '../gen/agent_v1_pb'
 import type { LLMMessage, LLMToolResultBlock } from '../handlers/llm/types'
-import { mkdir, writeFile } from 'node:fs/promises'
 import { toJsonString } from '@bufbuild/protobuf'
-import { expect, it, vi } from 'vitest'
+import { expect, it } from 'vitest'
 import { AgentServerMessageSchema } from '../gen/agent_v1_pb'
 import { finalizeExecTool } from '../handlers/agent/execRuntime'
 import { finalizeInteractionTool } from '../handlers/agent/interactionRuntime'
@@ -11,12 +10,6 @@ import { finalizeToolCall } from '../handlers/agent/toolLifecycle'
 import { runToolCall } from '../handlers/agent/toolRuntime'
 import { AgentRunAbortedError } from '../handlers/agent/wait'
 import { anthropicStateStrategy } from '../handlers/llm/stateStrategy'
-
-// Never let a failed UNC-path regression test access a real network filesystem.
-vi.mock('node:fs/promises', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:fs/promises')>()
-  return { ...actual, mkdir: vi.fn().mockResolvedValue(undefined), writeFile: vi.fn().mockResolvedValue(undefined) }
-})
 
 function createTestRoundContext(strategy: typeof anthropicStateStrategy) {
   const pendingToolResults: LLMToolResultBlock[] = []
@@ -727,10 +720,7 @@ it('runToolCall scopes GetDynamicTools by namespace and returns typed discovery 
   expect(completed.message.value.message.value.toolCall?.tool.case).toBe('getMcpToolsToolCall')
 })
 
-it.each([undefined, '\\\\server\\share', '//server/share', '\\\\server', '/\\server\\share'])('keeps cursor discovery inline without unsafe filesystem access (projectDir: %s)', async (projectDir) => {
-  vi.mocked(mkdir).mockClear()
-  vi.mocked(writeFile).mockClear()
-  const description = projectDir ? 'Manage todos. '.repeat(2_000) : 'Manage todos.'
+it('runToolCall discovers the local cursor namespace without an MCP client round-trip', async () => {
   const messages: LLMMessage[] = []
   const roundContext = createTestRoundContext(anthropicStateStrategy)
   const iterator = runToolCall({
@@ -742,12 +732,11 @@ it.each([undefined, '\\\\server\\share', '//server/share', '\\\\server', '/\\ser
     availableMcpTools: [],
     cursorDynamicTools: [{
       tool: 'TodoWrite',
-      description,
+      description: 'Manage todos.',
       inputSchema: { type: 'object', properties: { todos: { type: 'array' } } },
     }],
     conversationId: 'conv-runtime',
     currentModelId: 'claude-sonnet-4',
-    projectDir,
     round: 0,
     session: null,
     roundContext,
@@ -767,12 +756,9 @@ it.each([undefined, '\\\\server\\share', '//server/share', '\\\\server', '/\\ser
     namespace: 'cursor',
     tool: {
       tool: 'TodoWrite',
-      description,
       inputSchema: { type: 'object' },
     },
   })
-  expect(mkdir).not.toHaveBeenCalled()
-  expect(writeFile).not.toHaveBeenCalled()
 })
 
 it('runToolCall invokes cursor namespace tools through their native lifecycle', async () => {

@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { RunBlobStore } from '../handlers/agent/blobStore'
+import { cacheBlob, resetBlobCacheForTests } from '../handlers/agent/blobStore'
 import { ActiveTurnTracker, createCurrentTurnUserMessageBlob, readTurnBaseline } from '../handlers/agent/turnTracker'
 
 describe('turnTracker', () => {
   it('materializes new turns and resumes from cached turn blobs', () => {
-    const store = new RunBlobStore()
+    resetBlobCacheForTests()
 
     const { blob: userBlob, messageId } = createCurrentTurnUserMessageBlob({
       parsed: {
@@ -55,6 +55,7 @@ describe('turnTracker', () => {
         readPaths: [],
         historyBlobIds: [],
         historyTurnBlobIds: [],
+        historyTurns: [],
         historySummaryArchiveIds: [],
         selectedImages: [],
         prependUserMessages: [],
@@ -67,7 +68,7 @@ describe('turnTracker', () => {
       fallbackMessageId: 'fallback-msg',
     })
 
-    store.cacheBlob(userBlob.blobId, userBlob.blobData, userBlob.blobDataRaw)
+    cacheBlob(userBlob.blobId, userBlob.blobData)
 
     const turn = new ActiveTurnTracker(userBlob.blobId, [], messageId, 7)
     const thinking = turn.addThinking('reason')
@@ -75,21 +76,21 @@ describe('turnTracker', () => {
     expect(thinking).toBeTruthy()
     expect(assistant).toBeTruthy()
     if (thinking)
-      store.cacheBlob(thinking.blobId, thinking.blobData, thinking.blobDataRaw)
+      cacheBlob(thinking.blobId, thinking.blobData)
     if (assistant)
-      store.cacheBlob(assistant.blobId, assistant.blobData, assistant.blobDataRaw)
+      cacheBlob(assistant.blobId, assistant.blobData)
 
     const turnBlob = turn.materializeTurnBlob()
-    store.cacheBlob(turnBlob.blobId, turnBlob.blobData, turnBlob.blobDataRaw, turnBlob.dependencies)
+    cacheBlob(turnBlob.blobId, turnBlob.blobData)
 
-    expect(readTurnBaseline(turnBlob.blobId, store)).toEqual({
+    expect(readTurnBaseline(turnBlob.blobId)).toEqual({
       userMessageBlobId: userBlob.blobId,
       stepBlobIds: [thinking?.blobId, assistant?.blobId].filter(Boolean),
       requestId: messageId,
       dynamicToolCount: 7,
     })
 
-    const resumed = ActiveTurnTracker.fromTurnBlobId(turnBlob.blobId, store)
+    const resumed = ActiveTurnTracker.fromTurnBlobId(turnBlob.blobId)
     expect(resumed?.materializeTurnBlob().blobId).toBe(turnBlob.blobId)
   })
 })

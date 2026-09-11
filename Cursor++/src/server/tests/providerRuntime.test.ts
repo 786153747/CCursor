@@ -4,9 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { toJsonString } from '@bufbuild/protobuf'
 import { expect, it } from 'vitest'
+import { persistBlob } from '../database/blobs'
 import { getPersistedConversationCheckpoint, persistConversationCheckpoint } from '../database/checkpoints'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
 import { AgentServerMessageSchema } from '../gen/agent_v1_pb'
+import { cacheBlob, getCachedBlob, resetBlobCacheForTests, warmupBlobsAsync } from '../handlers/agent/blobStore'
 import { checkpoint, kvMessage, summary, summaryCompleted, summaryStarted } from '../handlers/agent/stream'
 import { finalizeToolCall } from '../handlers/agent/toolLifecycle'
 import { addUsage, clampTokenDetails, computeContextUsagePercent, emptyUsageTotals, estimateContextTokens, shouldTriggerCompaction } from '../handlers/agent/usage'
@@ -338,12 +340,14 @@ async function withTempAgentDatabase(run: () => Promise<void>): Promise<void> {
   const prevDbPath = process.env.BYOK_AGENT_DB_PATH
   const tempDir = mkdtempSync(join(tmpdir(), 'cursor-byok-agent-db-'))
   process.env.BYOK_AGENT_DB_PATH = join(tempDir, 'cursor.db')
+  resetBlobCacheForTests()
   await resetAgentDatabaseForTests()
 
   try {
     await run()
   }
   finally {
+    resetBlobCacheForTests()
     await resetAgentDatabaseForTests()
     if (prevDbPath === undefined)
       delete process.env.BYOK_AGENT_DB_PATH
@@ -351,6 +355,25 @@ async function withTempAgentDatabase(run: () => Promise<void>): Promise<void> {
     rmSync(tempDir, { recursive: true, force: true })
   }
 }
+
+it('blob store persists blobs to sqlite and reloads after memory cache reset', async () => {
+  await withTempAgentDatabase(async () => {
+    const blobId = 'blob-sqlite-roundtrip'
+    const blobData = Buffer.from(JSON.stringify({ role: 'user', content: 'hello sqlite' })).toString('base64')
+
+    // cacheBlob 内部对 persistBlob 采用 fire-and-forget; 测试需要确定写入已落盘,
+    // 因此再显式 await 一次 persistBlob (幂等 INSERT OR REPLACE)。
+    cacheBlob(blobId, blobData)
+    await persistBlob(blobId, blobData)
+    expect(getCachedBlob(blobId)).toBe(blobData)
+
+    // 新版 getCachedBlob 是纯内存读取 —— DB 恢复需走 warmupBlobsAsync 显式预热。
+    resetBlobCacheForTests()
+    expect(getCachedBlob(blobId)).toBeUndefined()
+    await warmupBlobsAsync([blobId])
+    expect(getCachedBlob(blobId)).toBe(blobData)
+  })
+})
 
 it('conversation checkpoints persist to sqlite and round-trip summary archives', async () => {
   await withTempAgentDatabase(async () => {

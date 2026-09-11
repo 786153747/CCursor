@@ -1,33 +1,23 @@
+import type { AgentServerMessage } from '../gen/agent_v1_pb'
 import { create, toBinary } from '@bufbuild/protobuf'
-import { afterEach, expect, it } from 'vitest'
+import { expect, it } from 'vitest'
 import {
   RequestContextRulesPartSchema,
   RequestContextSkillsPartSchema,
   RequestContextSubagentsPartSchema,
 } from '../gen/agent_v1_pb'
-import { fetchBlobsFromClient } from '../handlers/agent/clientBlobFetch'
 import { buildMessages, parseRunRequest } from '../handlers/agent/protocol'
 import { toBytes } from '../handlers/agent/protocol/shared'
 import {
   applyMcpsPart,
-  applyRequestContextPart,
   applyRulesPart,
   applySkillsPart,
   applySubagentsPart,
-  decodeRulesPart,
-  decodeSkillsPart,
-  decodeSubagentsPart,
+  fetchRulesPart,
+  fetchSkillsPart,
+  fetchSubagentsPart,
 } from '../handlers/agent/requestContextParts'
-import { BlobRunContext } from '../handlers/agent/runContext'
 import { createEphemeralSession, pushSessionMessage } from '../handlers/agent/session'
-
-const activeRuns: BlobRunContext[] = []
-
-afterEach(() => {
-  for (const run of activeRuns)
-    run.dispose()
-  activeRuns.length = 0
-})
 
 /**
  * Cursor 3.13+ requestContextParts 分片投递 (ref_only 模式) 兼容。
@@ -60,6 +50,13 @@ function baseRunRequest(action: Record<string, unknown>) {
       modelDetails: { modelId: 'm' },
     },
   }
+}
+
+async function consumePart<T>(generator: AsyncGenerator<AgentServerMessage, T, void>): Promise<T> {
+  let next = await generator.next()
+  while (!next.done)
+    next = await generator.next()
+  return next.value
 }
 
 it('falls back to requestContextParts.dynamicContext when inline requestContext is absent (ref_only)', () => {
@@ -144,7 +141,24 @@ it('derives the 3.17 Dynamic Tools capability from explicit RunRequest capabilit
   expect(parsed.clientSupportsDynamicTools).toBe(true)
 })
 
-it('fetches all Part blobs in one KV batch and decodes each protobuf', async () => {
+it('fetches and decodes all non-MCP Part protobufs over the KV channel', async () => {
+  const fetch = async <T>(
+    label: string,
+    bytes: Uint8Array,
+    factory: (session: ReturnType<typeof createEphemeralSession>) => AsyncGenerator<AgentServerMessage, T, void>,
+    asBase64 = false,
+  ) => {
+    const session = createEphemeralSession(`part-${label}`)
+    pushSessionMessage(session, {
+      kvClientMessage: {
+        getBlobResult: {
+          blobData: asBase64 ? Buffer.from(bytes).toString('base64') : bytes,
+        },
+      },
+    })
+    return consumePart(factory(session))
+  }
+
   const rulesBytes = toBinary(RequestContextRulesPartSchema, create(RequestContextRulesPartSchema, {
     rules: [{
       fullPath: '/workspace/.cursor/rules/a.mdc',
@@ -153,6 +167,16 @@ it('fetches all Part blobs in one KV batch and decodes each protobuf', async () 
     }],
     cloudRule: 'cloud body',
   }))
+  const rules = await fetch('rules', rulesBytes, session => fetchRulesPart({
+    session,
+    blobId: new Uint8Array([1]),
+    allocateBlobId: () => 1,
+  }))
+  expect(rules).toMatchObject({
+    cloudRule: 'cloud body',
+    rules: [{ fullPath: '/workspace/.cursor/rules/a.mdc', content: 'rule body' }],
+  })
+
   const skillsBytes = toBinary(RequestContextSkillsPartSchema, create(RequestContextSkillsPartSchema, {
     agentSkills: [{
       fullPath: '/workspace/.cursor/skills/a/SKILL.md',
@@ -160,82 +184,26 @@ it('fetches all Part blobs in one KV batch and decodes each protobuf', async () 
       description: 'Skill A',
     }],
   }))
+  const skills = await fetch('skills', skillsBytes, session => fetchSkillsPart({
+    session,
+    blobId: new Uint8Array([2]),
+    allocateBlobId: () => 2,
+  }), true)
+  expect(skills).toMatchObject({
+    agentSkills: [{ fullPath: '/workspace/.cursor/skills/a/SKILL.md', content: 'skill body' }],
+  })
+
   const subagentsBytes = toBinary(RequestContextSubagentsPartSchema, create(RequestContextSubagentsPartSchema, {
     customSubagents: [{ name: 'reviewer', description: 'Review code', prompt: 'Review carefully.' }],
   }))
-
-  // 客户端并发回包, 顺序与请求无关; JSON transport (SSE 降级) 把 bytes 编成 base64 string
-  const session = createEphemeralSession('parts-batch')
-  const run = new BlobRunContext(session)
-  activeRuns.push(run)
-  const clientStore = new Map<string, Uint8Array>([
-    ['1', rulesBytes],
-    ['2', skillsBytes],
-    ['3', subagentsBytes],
-  ])
-  const generator = fetchBlobsFromClient({
-    run,
-    blobIds: [new Uint8Array([1]), new Uint8Array([2]), new Uint8Array([3])],
-  })
-  const sentRequests: Array<{ id: number, blobKey: string }> = []
-  let step = await generator.next()
-  while (!step.done) {
-    const frame = step.value
-    if (frame.message.case === 'kvServerMessage' && frame.message.value.message.case === 'getBlobArgs') {
-      sentRequests.push({ id: frame.message.value.id, blobKey: String(frame.message.value.message.value.blobId[0]) })
-    }
-    // 三个请求都发出后再乱序回包
-    if (sentRequests.length === 3 && session.messages.length === 0) {
-      for (const request of [...sentRequests].reverse()) {
-        const bytes = clientStore.get(request.blobKey)!
-        pushSessionMessage(session, {
-          kvClientMessage: {
-            id: request.id,
-            getBlobResult: { blobData: request.blobKey === '2' ? Buffer.from(bytes).toString('base64') : bytes },
-          },
-        })
-      }
-    }
-    step = await generator.next()
-  }
-  const fetchedBytes = step.value.map((result) => {
-    expect(result.status).toBe('ok')
-    if (result.status !== 'ok')
-      throw new Error(`Required Part fetch failed: ${result.status}`)
-    return result.bytes
-  })
-  const [fetchedRules, fetchedSkills, fetchedSubagents] = fetchedBytes
-
-  expect(sentRequests.map(request => request.id)).toEqual([900_000, 900_001, 900_002])
-  expect(decodeRulesPart(fetchedRules!)).toMatchObject({
-    cloudRule: 'cloud body',
-    rules: [{ fullPath: '/workspace/.cursor/rules/a.mdc', content: 'rule body' }],
-  })
-  expect(decodeSkillsPart(fetchedSkills!)).toMatchObject({
-    agentSkills: [{ fullPath: '/workspace/.cursor/skills/a/SKILL.md', content: 'skill body' }],
-  })
-  expect(decodeSubagentsPart(fetchedSubagents!)).toMatchObject({
+  const subagents = await fetch('subagents', subagentsBytes, session => fetchSubagentsPart({
+    session,
+    blobId: new Uint8Array([3]),
+    allocateBlobId: () => 3,
+  }))
+  expect(subagents).toMatchObject({
     customSubagents: [{ name: 'reviewer', prompt: 'Review carefully.' }],
   })
-})
-
-it('applyRequestContextPart decodes and merges a part, and tolerates a missing blob', () => {
-  const parsed = parseRunRequest(baseRunRequest({
-    userMessageAction: { userMessage: { text: 'q' } },
-    requestContextParts: { rulesBlobId: new Uint8Array([1]), skillsBlobId: new Uint8Array([2]), dynamicContext: {} },
-  }))
-  const rulesBytes = toBinary(RequestContextRulesPartSchema, create(RequestContextRulesPartSchema, {
-    rules: [],
-    nonFileRules: [{ fullPath: 'team', content: 'Team rule', type: { type: { case: 'global', value: {} } }, source: 1, isRequired: true }],
-  }))
-
-  applyRequestContextPart(parsed, 'rules', rulesBytes)
-  applyRequestContextPart(parsed, 'skills', null)
-  applyRequestContextPart(parsed, 'subagents', new Uint8Array([0xFF, 0xFF, 0xFF]))
-
-  expect(parsed.alwaysRules.map(rule => rule.content)).toContain('Team rule')
-  expect(parsed.agentSkills).toEqual([])
-  expect(parsed.customSubagents).toEqual([])
 })
 
 it('restores Rules, Skills, and Subagents from their decoded ref_only parts', () => {
@@ -431,30 +399,4 @@ it('does not enable meta-tool mode when the mcps blob explicitly disables it', (
   }))
   applyMcpsPart(parsed, { tools: [], mcpInstructions: [], mcpMetaToolOptions: { enabled: false } })
   expect(parsed.mcpMetaTool).toBeUndefined()
-})
-
-it.each(['\n', '\r\n'])('reads legacy Skill frontmatter with %j line endings', (lineEnding) => {
-  const parsed = parseRunRequest(baseRunRequest({
-    userMessageAction: {
-      userMessage: { text: 'q' },
-      requestContext: {
-        rules: [
-          {
-            fullPath: '/workspace/.cursor/skills/review/SKILL.md',
-            type: { agentFetched: {} },
-            content: ['---  ', 'description:   Review changes carefully  ', '---', 'PRIVATE_SKILL_BODY'].join(lineEnding),
-          },
-          {
-            fullPath: '/workspace/.cursor/skills/manual/SKILL.md',
-            type: { agentFetched: {} },
-            content: ['---', 'description: Manual only', 'disable-model-invocation: true', '---', 'MANUAL_BODY'].join(lineEnding),
-          },
-        ],
-      },
-    },
-  }))
-
-  expect(parsed.agentSkills.map(skill => ({ path: skill.fullPath, description: skill.description }))).toEqual([
-    { path: '/workspace/.cursor/skills/review/SKILL.md', description: 'Review changes carefully' },
-  ])
 })

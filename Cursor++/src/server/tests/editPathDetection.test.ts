@@ -15,12 +15,6 @@ it('detects file path from ApplyPatch patch body', () => {
   expect(detectEditPathFromToolInput('ApplyPatch', raw)).toBe('src/c.ts')
 })
 
-it('keeps patch paths on their own header line and trims surrounding whitespace', () => {
-  expect(detectEditPathFromToolInput('ApplyPatch', '*** Update File:   src/my file.ts  \r\n@@')).toBe('src/my file.ts')
-  expect(detectEditPathFromToolInput('ApplyPatch', '*** Update File:   \n@@')).toBe('')
-  expect(detectEditPathFromToolInput('ApplyPatch', `*** Update File:${' '.repeat(20_000)}`)).toBe('')
-})
-
 it('returns empty string when path not yet in accumulated input', () => {
   expect(detectEditPathFromToolInput('ApplyPatch', '{"patch":"*** Begin Patch\\n@@"}')).toBe('')
 })

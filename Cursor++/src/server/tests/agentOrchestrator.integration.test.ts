@@ -1,30 +1,23 @@
-import type { AgentSession } from '../handlers/agent/session'
 import type { LLMMessage } from '../handlers/llm/types'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { getPersistedConversationCheckpoint, persistConversationCheckpoint } from '../database/checkpoints'
+import { persistBlob } from '../database/blobs'
+import { persistConversationCheckpoint } from '../database/checkpoints'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
 import { encodeBlob } from '../handlers/agent/blob'
+import { resetBlobCacheForTests, warmupBlobsAsync } from '../handlers/agent/blobStore'
 import { rebuildConversationHistory } from '../handlers/agent/historyManager'
-import { BlobRunContext } from '../handlers/agent/runContext'
-import { createEphemeralSession, pushSessionMessage } from '../handlers/agent/session'
 import { assertValidAnthropicToolUseContract } from '../handlers/llm/anthropicContract'
 import { encodeAnthropicRequestMessages } from '../handlers/llm/conversationCodec'
 import { transformMessages } from '../handlers/llm/transformMessages'
 
 let capturedParsed: Array<Record<string, unknown>> = []
-const capturedRuntimeRuns: BlobRunContext[] = []
-const activeRuns: BlobRunContext[] = []
 
 vi.mock('../handlers/agent/conversationRuntime', () => ({
-  async* handleConversationRun(parsed: Record<string, unknown>, session: AgentSession | null, run: BlobRunContext) {
-    expect(run).toBeInstanceOf(BlobRunContext)
-    expect(run.session).toBe(session)
-    expect(run.signal.aborted).toBe(false)
+  async* handleConversationRun(parsed: Record<string, unknown>) {
     capturedParsed.push(parsed)
-    capturedRuntimeRuns.push(run)
   },
 }))
 
@@ -41,6 +34,7 @@ async function withTempAgentDatabase(run: () => Promise<void>): Promise<void> {
   const tempDir = mkdtempSync(join(tmpdir(), 'cursor-byok-agent-db-'))
   process.env.BYOK_AGENT_DB_PATH = join(tempDir, 'cursor.db')
   capturedParsed = []
+  resetBlobCacheForTests()
   await resetAgentDatabaseForTests()
 
   try {
@@ -48,11 +42,24 @@ async function withTempAgentDatabase(run: () => Promise<void>): Promise<void> {
   }
   finally {
     capturedParsed = []
+    resetBlobCacheForTests()
     await resetAgentDatabaseForTests()
     if (prevDbPath === undefined)
       delete process.env.BYOK_AGENT_DB_PATH
     else process.env.BYOK_AGENT_DB_PATH = prevDbPath
     rmSync(tempDir, { recursive: true, force: true })
+  }
+}
+
+async function exhaust<T>(iterable: AsyncIterable<T>): Promise<void> {
+  for await (const _ of iterable) {
+    // no-op
+  }
+}
+
+function noopFrames() {
+  return function* () {
+    // no-op
   }
 }
 
@@ -81,15 +88,15 @@ function buildLegacyAnthropicHistoryBlobs() {
 describe('agent orchestrator / history rebuild integration', () => {
   afterEach(() => {
     capturedParsed = []
-    capturedRuntimeRuns.length = 0
-    for (const run of activeRuns)
-      run.dispose()
-    activeRuns.length = 0
   })
 
-  it('does not restore or replace saved history when an empty-baseline recovery is declined', async () => {
+  it('trusts empty client conversationState and does not restore sqlite checkpoint history', async () => {
     await withTempAgentDatabase(async () => {
       const { system, preamble, assistant, legacyUserToolResults } = buildLegacyAnthropicHistoryBlobs()
+      for (const blob of [system, preamble, assistant, legacyUserToolResults]) {
+        await persistBlob(blob.blobId, blob.blobData)
+      }
+
       await persistConversationCheckpoint({
         kind: 'committed',
         conversationId: 'conv-switch',
@@ -102,10 +109,7 @@ describe('agent orchestrator / history rebuild integration', () => {
       })
 
       const handleRunRequest = await loadHandleRunRequest()
-      const session = createEphemeralSession('empty-client-history')
-      const previous = await getPersistedConversationCheckpoint('conv-switch')
-      let recoveryQuestions = 0
-      for await (const frame of handleRunRequest({
+      await exhaust(handleRunRequest({
         runRequest: {
           conversationId: 'conv-switch',
           action: {
@@ -117,26 +121,13 @@ describe('agent orchestrator / history rebuild integration', () => {
           modelDetails: { modelId: 'gpt-5.4-medium' },
           conversationState: {},
         },
-      }, session)) {
-        if (frame.message.case === 'interactionQuery') {
-          recoveryQuestions++
-          expect(frame.message.value.query.value).toMatchObject({
-            args: { questions: [expect.objectContaining({ prompt: expect.stringContaining('no prior history') })] },
-          })
-          pushSessionMessage(session, { interactionResponse: {
-            id: frame.message.value.id,
-            askQuestionInteractionResponse: { result: { rejected: { reason: 'Keep the saved history unchanged' } } },
-          } })
-        }
-        expect(frame.message.case).not.toBe('kvServerMessage')
-        expect(frame.message.case).not.toBe('conversationCheckpointUpdate')
-      }
+      }))
 
-      expect(recoveryQuestions).toBe(1)
-      expect(capturedParsed).toHaveLength(0)
-      expect(capturedRuntimeRuns).toHaveLength(0)
-      expect(await getPersistedConversationCheckpoint('conv-switch')).toEqual(previous)
-      expect(session.listeners.size).toBe(0)
+      expect(capturedParsed).toHaveLength(1)
+      expect(capturedParsed[0]?.historyBlobIds).toEqual([])
+      expect(capturedParsed[0]?.historyTurnBlobIds).toEqual([])
+      expect(capturedParsed[0]?.historySummaryArchiveIds).toEqual([])
+      expect(capturedParsed[0]?.historyTokenDetails).toBeUndefined()
     })
   })
 
@@ -145,10 +136,11 @@ describe('agent orchestrator / history rebuild integration', () => {
       const oldSystem = encodeBlob({ role: 'system', content: 'OpenAI system prompt mentions ApplyPatch and ReadFile' })
       const oldPreamble = encodeBlob({ role: 'user', content: '<user_info>old provider preamble with ReadFile</user_info>' })
       const historyUser = encodeBlob({ role: 'user', content: 'history user' })
-      const run = new BlobRunContext(createEphemeralSession('provider-scaffold'))
-      activeRuns.push(run)
-      for (const blob of [oldSystem, oldPreamble, historyUser])
-        run.blobs.cacheBlob(blob.blobId, blob.blobData)
+      for (const blob of [oldSystem, oldPreamble, historyUser]) {
+        await persistBlob(blob.blobId, blob.blobData)
+      }
+
+      await warmupBlobsAsync([oldSystem.blobId, oldPreamble.blobId, historyUser.blobId])
 
       const iterator = rebuildConversationHistory({
         historyBlobIds: [oldSystem.blobId, oldPreamble.blobId, historyUser.blobId],
@@ -158,14 +150,13 @@ describe('agent orchestrator / history rebuild integration', () => {
         currentUserMessage: { role: 'user', content: '继续' },
         systemContent: 'Anthropic system prompt uses Read and must not mention ApplyPatch',
         preambleUserContent: '<user_info>new provider preamble with Read</user_info>',
-        sendSystemScaffoldBlob: () => {},
-        sendOrderedBlob: () => {},
-        run,
+        sendSystemScaffoldBlob: noopFrames(),
+        sendOrderedBlob: noopFrames(),
       })
 
       let result: { messages: LLMMessage[], insertedPrependUserTexts: string[] } | undefined
       for (;;) {
-        const next = await iterator.next()
+        const next = iterator.next()
         if (next.done) {
           result = next.value
           break
@@ -182,10 +173,11 @@ describe('agent orchestrator / history rebuild integration', () => {
   it('rebuilt legacy anthropic history is repaired to canonical form and can continue across anthropic/openai/gemini', async () => {
     await withTempAgentDatabase(async () => {
       const { system, preamble, assistant, legacyUserToolResults } = buildLegacyAnthropicHistoryBlobs()
-      const run = new BlobRunContext(createEphemeralSession('legacy-history'))
-      activeRuns.push(run)
-      for (const blob of [system, preamble, assistant, legacyUserToolResults])
-        run.blobs.cacheBlob(blob.blobId, blob.blobData)
+      for (const blob of [system, preamble, assistant, legacyUserToolResults]) {
+        await persistBlob(blob.blobId, blob.blobData)
+      }
+
+      await warmupBlobsAsync([system.blobId, preamble.blobId, assistant.blobId, legacyUserToolResults.blobId])
 
       const iterator = rebuildConversationHistory({
         historyBlobIds: [system.blobId, preamble.blobId, assistant.blobId, legacyUserToolResults.blobId],
@@ -195,14 +187,13 @@ describe('agent orchestrator / history rebuild integration', () => {
         currentUserMessage: { role: 'user', content: '继续' },
         systemContent: 'sys prompt',
         preambleUserContent: '<user_info>env</user_info>',
-        sendSystemScaffoldBlob: () => {},
-        sendOrderedBlob: () => {},
-        run,
+        sendSystemScaffoldBlob: noopFrames(),
+        sendOrderedBlob: noopFrames(),
       })
 
       let result: { messages: LLMMessage[], insertedPrependUserTexts: string[] } | undefined
       for (;;) {
-        const next = await iterator.next()
+        const next = iterator.next()
         if (next.done) {
           result = next.value
           break
