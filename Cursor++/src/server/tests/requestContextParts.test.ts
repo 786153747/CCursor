@@ -1,4 +1,3 @@
-import type { AgentServerMessage } from '../gen/agent_v1_pb'
 import { create, toBinary } from '@bufbuild/protobuf'
 import { expect, it } from 'vitest'
 import {
@@ -10,14 +9,14 @@ import { buildMessages, parseRunRequest } from '../handlers/agent/protocol'
 import { toBytes } from '../handlers/agent/protocol/shared'
 import {
   applyMcpsPart,
+  applyRequestContextPart,
   applyRulesPart,
   applySkillsPart,
   applySubagentsPart,
-  fetchRulesPart,
-  fetchSkillsPart,
-  fetchSubagentsPart,
+  decodeRulesPart,
+  decodeSkillsPart,
+  decodeSubagentsPart,
 } from '../handlers/agent/requestContextParts'
-import { createEphemeralSession, pushSessionMessage } from '../handlers/agent/session'
 
 /**
  * Cursor 3.13+ requestContextParts 分片投递 (ref_only 模式) 兼容。
@@ -50,13 +49,6 @@ function baseRunRequest(action: Record<string, unknown>) {
       modelDetails: { modelId: 'm' },
     },
   }
-}
-
-async function consumePart<T>(generator: AsyncGenerator<AgentServerMessage, T, void>): Promise<T> {
-  let next = await generator.next()
-  while (!next.done)
-    next = await generator.next()
-  return next.value
 }
 
 it('falls back to requestContextParts.dynamicContext when inline requestContext is absent (ref_only)', () => {
@@ -141,24 +133,9 @@ it('derives the 3.17 Dynamic Tools capability from explicit RunRequest capabilit
   expect(parsed.clientSupportsDynamicTools).toBe(true)
 })
 
-it('fetches and decodes all non-MCP Part protobufs over the KV channel', async () => {
-  const fetch = async <T>(
-    label: string,
-    bytes: Uint8Array,
-    factory: (session: ReturnType<typeof createEphemeralSession>) => AsyncGenerator<AgentServerMessage, T, void>,
-    asBase64 = false,
-  ) => {
-    const session = createEphemeralSession(`part-${label}`)
-    pushSessionMessage(session, {
-      kvClientMessage: {
-        getBlobResult: {
-          blobData: asBase64 ? Buffer.from(bytes).toString('base64') : bytes,
-        },
-      },
-    })
-    return consumePart(factory(session))
-  }
-
+it('decodes all non-MCP Part protobufs and applies them onto the parsed request', () => {
+  // blob 取回已收敛到 clientBlobFetch (见该模块与 agentOrchestrator 集成测试),
+  // 本处只覆盖 decode + apply 这一层自己的契约。
   const rulesBytes = toBinary(RequestContextRulesPartSchema, create(RequestContextRulesPartSchema, {
     rules: [{
       fullPath: '/workspace/.cursor/rules/a.mdc',
@@ -167,12 +144,7 @@ it('fetches and decodes all non-MCP Part protobufs over the KV channel', async (
     }],
     cloudRule: 'cloud body',
   }))
-  const rules = await fetch('rules', rulesBytes, session => fetchRulesPart({
-    session,
-    blobId: new Uint8Array([1]),
-    allocateBlobId: () => 1,
-  }))
-  expect(rules).toMatchObject({
+  expect(decodeRulesPart(rulesBytes)).toMatchObject({
     cloudRule: 'cloud body',
     rules: [{ fullPath: '/workspace/.cursor/rules/a.mdc', content: 'rule body' }],
   })
@@ -184,26 +156,37 @@ it('fetches and decodes all non-MCP Part protobufs over the KV channel', async (
       description: 'Skill A',
     }],
   }))
-  const skills = await fetch('skills', skillsBytes, session => fetchSkillsPart({
-    session,
-    blobId: new Uint8Array([2]),
-    allocateBlobId: () => 2,
-  }), true)
-  expect(skills).toMatchObject({
+  expect(decodeSkillsPart(skillsBytes)).toMatchObject({
     agentSkills: [{ fullPath: '/workspace/.cursor/skills/a/SKILL.md', content: 'skill body' }],
   })
 
   const subagentsBytes = toBinary(RequestContextSubagentsPartSchema, create(RequestContextSubagentsPartSchema, {
     customSubagents: [{ name: 'reviewer', description: 'Review code', prompt: 'Review carefully.' }],
   }))
-  const subagents = await fetch('subagents', subagentsBytes, session => fetchSubagentsPart({
-    session,
-    blobId: new Uint8Array([3]),
-    allocateBlobId: () => 3,
-  }))
-  expect(subagents).toMatchObject({
+  expect(decodeSubagentsPart(subagentsBytes)).toMatchObject({
     customSubagents: [{ name: 'reviewer', prompt: 'Review carefully.' }],
   })
+
+  // 走 apply 入口: 解码结果必须落到 parsed 上, 并回报解码成功
+  const parsed = parseRunRequest(baseRunRequest({
+    userMessageAction: { userMessage: { text: 'q' } },
+    requestContextParts: {
+      rulesBlobId: new Uint8Array([1]),
+      skillsBlobId: new Uint8Array([2]),
+      subagentsBlobId: new Uint8Array([3]),
+      dynamicContext: {},
+    },
+  }))
+  expect(applyRequestContextPart(parsed, 'rules', rulesBytes)).toBe(true)
+  expect(applyRequestContextPart(parsed, 'skills', skillsBytes)).toBe(true)
+  expect(applyRequestContextPart(parsed, 'subagents', subagentsBytes)).toBe(true)
+  expect(parsed.cloudRule).toBe('cloud body')
+  expect(parsed.projectRules.map(rule => rule.content)).toContain('rule body')
+  expect(parsed.agentSkills).toMatchObject([{ content: expect.stringContaining('skill body') }])
+  expect(parsed.customSubagents).toMatchObject([{ name: 'reviewer' }])
+
+  // blob 缺席时不抛错, 只回报失败 —— required / catalog-only 由 run 边界决定
+  expect(applyRequestContextPart(parsed, 'rules', null)).toBe(false)
 })
 
 it('restores Rules, Skills, and Subagents from their decoded ref_only parts', () => {

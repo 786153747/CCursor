@@ -4,11 +4,11 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { toJsonString } from '@bufbuild/protobuf'
 import { expect, it } from 'vitest'
-import { persistBlob } from '../database/blobs'
 import { getPersistedConversationCheckpoint, persistConversationCheckpoint } from '../database/checkpoints'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
 import { AgentServerMessageSchema } from '../gen/agent_v1_pb'
-import { cacheBlob, getCachedBlob, resetBlobCacheForTests, warmupBlobsAsync } from '../handlers/agent/blobStore'
+import { BlobIntegrityError } from '../handlers/agent/blobErrors'
+import { BlobInactiveError, RunBlobStore } from '../handlers/agent/blobStore'
 import { checkpoint, kvMessage, summary, summaryCompleted, summaryStarted } from '../handlers/agent/stream'
 import { finalizeToolCall } from '../handlers/agent/toolLifecycle'
 import { addUsage, clampTokenDetails, computeContextUsagePercent, emptyUsageTotals, estimateContextTokens, shouldTriggerCompaction } from '../handlers/agent/usage'
@@ -340,39 +340,44 @@ async function withTempAgentDatabase(run: () => Promise<void>): Promise<void> {
   const prevDbPath = process.env.BYOK_AGENT_DB_PATH
   const tempDir = mkdtempSync(join(tmpdir(), 'cursor-byok-agent-db-'))
   process.env.BYOK_AGENT_DB_PATH = join(tempDir, 'cursor.db')
-  resetBlobCacheForTests()
   await resetAgentDatabaseForTests()
 
   try {
     await run()
   }
   finally {
-    resetBlobCacheForTests()
     await resetAgentDatabaseForTests()
     if (prevDbPath === undefined)
       delete process.env.BYOK_AGENT_DB_PATH
     else process.env.BYOK_AGENT_DB_PATH = prevDbPath
-    rmSync(tempDir, { recursive: true, force: true })
+    try {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+    catch {
+      // Windows 上 sqlite 句柄可能延迟释放, 临时目录清理是尽力而为
+    }
   }
 }
 
-it('blob store persists blobs to sqlite and reloads after memory cache reset', async () => {
-  await withTempAgentDatabase(async () => {
-    const blobId = 'blob-sqlite-roundtrip'
-    const blobData = Buffer.from(JSON.stringify({ role: 'user', content: 'hello sqlite' })).toString('base64')
+it('run blob store retains blobs in memory only, rejects content conflicts, and closes on dispose', () => {
+  const store = new RunBlobStore()
+  const blobId = 'blob-run-retained'
+  const blobData = Buffer.from(JSON.stringify({ role: 'user', content: 'hello run' })).toString('base64')
 
-    // cacheBlob 内部对 persistBlob 采用 fire-and-forget; 测试需要确定写入已落盘,
-    // 因此再显式 await 一次 persistBlob (幂等 INSERT OR REPLACE)。
-    cacheBlob(blobId, blobData)
-    await persistBlob(blobId, blobData)
-    expect(getCachedBlob(blobId)).toBe(blobData)
+  store.cacheBlob(blobId, blobData)
+  expect(store.getCachedBlob(blobId)).toBe(blobData)
 
-    // 新版 getCachedBlob 是纯内存读取 —— DB 恢复需走 warmupBlobsAsync 显式预热。
-    resetBlobCacheForTests()
-    expect(getCachedBlob(blobId)).toBeUndefined()
-    await warmupBlobsAsync([blobId])
-    expect(getCachedBlob(blobId)).toBe(blobData)
-  })
+  // 运行期工作集不允许同 id 覆盖成不同内容 —— 换内容会让 checkpoint 引用失真
+  expect(() => store.cacheBlob(blobId, `${blobData}-mutated`)).toThrow(BlobIntegrityError)
+  expect(store.getCachedBlob(blobId)).toBe(blobData)
+
+  // 重复写入相同内容必须幂等 (重编码同一轮会再次落到同一 id)
+  expect(() => store.cacheBlob(blobId, blobData)).not.toThrow()
+
+  // 运行结束 (dispose) 后工作集清空且不再接受写入
+  store.dispose()
+  expect(store.getCachedBlob(blobId)).toBeUndefined()
+  expect(() => store.cacheBlob('blob-after-dispose', blobData)).toThrow(BlobInactiveError)
 })
 
 it('conversation checkpoints persist to sqlite and round-trip summary archives', async () => {

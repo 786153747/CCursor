@@ -6,17 +6,20 @@ import { join } from 'node:path'
 import { afterEach, beforeEach, expect, it } from 'vitest'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
 import { encodeBlob } from '../handlers/agent/blob'
-import { cacheBlob, resetBlobCacheForTests } from '../handlers/agent/blobStore'
+import { BlobIntegrityError } from '../handlers/agent/blobErrors'
+import { RunBlobStore } from '../handlers/agent/blobStore'
 import { createCompactionArtifacts, estimateMessagesTokens, formatMessageForSummary, planCompaction } from '../handlers/agent/compactionStrategy'
 import { hydrateHistoryEntries, isSummaryBlobMessage } from '../handlers/agent/historyManager'
 import { clampTokenDetails, computeContextUsagePercent, getAutoCompactThreshold, shouldTriggerCompaction } from '../handlers/agent/usage'
 
 // ─── helpers ───
 
+let store: RunBlobStore
+
 function makeBlobEntry(role: string, content: string, extra?: Record<string, unknown>): { blobId: string, raw: Record<string, unknown>, message: LLMMessage } {
   const raw: Record<string, unknown> = { role, content, ...extra }
   const blob = encodeBlob(raw)
-  cacheBlob(blob.blobId, blob.blobData)
+  store.cacheBlob(blob.blobId, blob.blobData)
   return {
     blobId: blob.blobId,
     raw,
@@ -50,12 +53,11 @@ beforeEach(async () => {
   tmpDbPath = join(tmpdir(), `.tmp-auto-summarize-${Date.now()}-${Math.random().toString(36).slice(2)}.db`)
   process.env.BYOK_AGENT_DB_PATH = tmpDbPath
   await resetAgentDatabaseForTests()
-  resetBlobCacheForTests()
+  store = new RunBlobStore()
 })
 
 afterEach(async () => {
   await resetAgentDatabaseForTests()
-  resetBlobCacheForTests()
   delete process.env.BYOK_AGENT_DB_PATH
   for (const suffix of ['', '-wal', '-shm']) {
     try {
@@ -78,20 +80,23 @@ it('shouldTriggerCompaction returns true at/above threshold', () => {
   expect(shouldTriggerCompaction(100000, 100000, 85)).toBe(true)
 })
 
-it('shouldTriggerCompaction default uses absolute buffer threshold', () => {
-  // 绝对 buffer 模式 (对齐 Claude Code):
-  //   threshold = maxTokens - min(maxOutputTokens, 20K outputReserve) - 20K buffer
-  // 默认 maxOutputTokens=8192 → 100K 模型 threshold = 100000 - 8192 - 20000 = 71808
-  expect(getAutoCompactThreshold(100000)).toBe(71808)
-  expect(shouldTriggerCompaction(71807, 100000)).toBe(false)
-  expect(shouldTriggerCompaction(71808, 100000)).toBe(true)
+it('shouldTriggerCompaction default uses the window-relative trigger reserve', () => {
+  // 第二阶段公式: threshold = 窗口 − min(40K, 15% × 窗口)
+  // 100K 模型 → 100000 − min(40000, 15000) = 85000
+  expect(getAutoCompactThreshold(100000)).toBe(85000)
+  expect(shouldTriggerCompaction(84999, 100000)).toBe(false)
+  expect(shouldTriggerCompaction(85000, 100000)).toBe(true)
 })
 
-it('getAutoCompactThreshold caps output reserve at 20K', () => {
-  // maxOutputTokens 超过 20K 时按 20K 计 — 200K 模型 threshold=160K (~80%, 基准)
-  expect(getAutoCompactThreshold(200000, 64000)).toBe(160000)
-  // 1M 模型 threshold=960K (~96%)
-  expect(getAutoCompactThreshold(1000000, 32000)).toBe(960000)
+it('getAutoCompactThreshold caps the trigger reserve at 40K', () => {
+  // 小窗口按 15% 比例: 32K→27,200 / 64K→54,400 / 96K→81,600 / 128K→108,800
+  expect(getAutoCompactThreshold(32000)).toBe(27200)
+  expect(getAutoCompactThreshold(64000)).toBe(54400)
+  expect(getAutoCompactThreshold(96000)).toBe(81600)
+  expect(getAutoCompactThreshold(128000)).toBe(108800)
+  // reserve 触顶 40K: 300K→260,000 / 1M→960,000
+  expect(getAutoCompactThreshold(300000)).toBe(260000)
+  expect(getAutoCompactThreshold(1000000)).toBe(960000)
 })
 
 // ─── clampTokenDetails tests ───
@@ -124,45 +129,53 @@ it('computeContextUsagePercent computes correctly', () => {
 
 // ─── planCompaction tests ───
 
-it('planCompaction preserves system and preamble in leading', () => {
+it('planCompaction preserves system and preamble in leading and leaves an in-budget body untouched', () => {
   const entries = makeHistoryEntries(10, { withSystem: true, withPreamble: true })
   const plan = planCompaction(entries)
 
   expect(plan.leading.length).toBe(2)
   expect(plan.leading[0].message.role).toBe('system')
   expect((plan.leading[1].message.content as string).includes('<user_info>')).toBe(true)
-  expect(plan.summarizeEntries.length > 0).toBeTruthy()
-  expect(plan.keepTail.length > 0).toBeTruthy()
+  // 默认 258.4K 窗口下这段对话远低于 keepTail 预算 → 无需压缩, 全部留在尾窗
+  expect(plan.mode).toBe('budget')
+  expect(plan.summarizeEntries.length).toBe(0)
+  expect(plan.keepTail.length).toBe(10)
 })
 
 it('planCompaction keeps system+preamble in leading, compacts body', () => {
   // With system + preamble + 1 body entry:
   // leading = [system, preamble], body = [1 entry]
-  // body.length=1 <= MEDIUM(2), keepTailCount=0, summarizeCount=1
-  // So even a single body entry gets marked for summarize
+  // 单条 body 无论预算多少都不值得动刀 — 留在尾窗, 摘要侧为空
   const entries = makeHistoryEntries(1, { withSystem: true, withPreamble: true })
   const plan = planCompaction(entries)
 
   expect(plan.leading.length).toBe(2) // system + preamble
-  expect(plan.summarizeEntries.length + plan.keepTail.length).toBe(1)
+  expect(plan.summarizeEntries.length).toBe(0)
+  expect(plan.keepTail.length).toBe(1)
 })
 
 it('planCompaction splits medium conversations correctly', () => {
   const entries = makeHistoryEntries(6, { withSystem: true })
-  // body = 6 entries (excl system), body.length > MEDIUM_THRESHOLD(2)
-  const plan = planCompaction(entries)
+  // 预算收紧到 100 token 才需要动刀: 默认窗口下整个 body 都在 keepTail 预算内
+  const plan = planCompaction(entries, { budgetOverride: 100 })
 
   expect(plan.leading.length).toBe(1) // system
   expect(plan.summarizeEntries.length > 0).toBeTruthy()
   expect(plan.keepTail.length >= 2).toBeTruthy()
-  expect(plan.summarizeEntries.length + plan.keepTail.length).toBe(6)
+  // 切分不能丢条目 —— 锚点会同时留在摘要源与尾窗, 所以只校验覆盖而不是总数
+  const coveredBlobIds = new Set([...plan.summarizeEntries, ...plan.keepTail].map(entry => entry.blobId))
+  for (const entry of entries.slice(1))
+    expect(coveredBlobIds.has(entry.blobId)).toBe(true)
+  // 尾窗不能从 assistant/tool 中间开始 — 锚点保证首条是真实 user 指令
+  expect(plan.keepTail[0]?.message.role).toBe('user')
 })
 
 // ─── createCompactionArtifacts tests ───
 
 it('createCompactionArtifacts produces valid summary blob and archive', () => {
   const entries = makeHistoryEntries(10, { withSystem: true, withPreamble: true })
-  const plan = planCompaction(entries)
+  const plan = planCompaction(entries, { budgetOverride: 600 })
+  expect(plan.summarizeEntries.length > 0, '需要摘要源才能产出 archive').toBeTruthy()
 
   const artifacts = createCompactionArtifacts({
     plan,
@@ -189,7 +202,7 @@ it('createCompactionArtifacts produces valid summary blob and archive', () => {
 
 it('createCompactionArtifacts preserves previous summary archive IDs', () => {
   const entries = makeHistoryEntries(10, { withSystem: true })
-  const plan = planCompaction(entries)
+  const plan = planCompaction(entries, { budgetOverride: 600 })
 
   const artifacts = createCompactionArtifacts({
     plan,
@@ -208,20 +221,18 @@ it('hydrateHistoryEntries recovers cached blobs', () => {
   const entries = makeHistoryEntries(4)
   const blobIds = entries.map(e => e.blobId)
 
-  const hydrated = hydrateHistoryEntries(blobIds)
+  const hydrated = hydrateHistoryEntries(blobIds, store)
 
   expect(hydrated.length).toBe(4)
   expect(hydrated[0].message.role).toBe('user')
   expect(hydrated[1].message.role).toBe('assistant')
 })
 
-it('hydrateHistoryEntries skips missing blobs', () => {
+it('hydrateHistoryEntries rejects missing blobs instead of silently dropping them', () => {
   const entries = makeHistoryEntries(2)
   const blobIds = [entries[0].blobId, 'nonexistent-blob-id', entries[1].blobId]
 
-  const hydrated = hydrateHistoryEntries(blobIds)
-
-  expect(hydrated.length).toBe(2)
+  expect(() => hydrateHistoryEntries(blobIds, store)).toThrow(BlobIntegrityError)
 })
 
 // ─── isSummaryBlobMessage tests ───
@@ -280,7 +291,7 @@ it('end-to-end: compaction reduces blob count and token estimate', () => {
   const originalBlobIds = entries.map(e => e.blobId)
   const originalTokenEstimate = estimateMessagesTokens(entries.map(e => e.message))
 
-  const plan = planCompaction(entries)
+  const plan = planCompaction(entries, { budgetOverride: 900 })
   expect(plan.summarizeEntries.length > 0, 'should have entries to summarize').toBeTruthy()
 
   const artifacts = createCompactionArtifacts({
@@ -298,8 +309,12 @@ it('end-to-end: compaction reduces blob count and token estimate', () => {
   expect(artifacts.nextRootBlobIds.length < originalBlobIds.length, `expected fewer blobs: ${artifacts.nextRootBlobIds.length} < ${originalBlobIds.length}`).toBeTruthy()
   expect(compactedTokenEstimate < originalTokenEstimate, `expected fewer tokens: ${compactedTokenEstimate} < ${originalTokenEstimate}`).toBeTruthy()
 
+  // 压缩产物由调用方负责留存 (生产路径是 run.blobs.cacheBlob), 否则无法回读
+  for (const blob of artifacts.blobs)
+    store.cacheBlob(blob.blobId, blob.blobData, blob.blobDataRaw, blob.dependencies)
+
   // Verify compacted blobs can be hydrated
-  const hydrated = hydrateHistoryEntries(artifacts.nextRootBlobIds)
+  const hydrated = hydrateHistoryEntries(artifacts.nextRootBlobIds, store)
   expect(hydrated.length > 0, 'compacted blobs should be hydratable').toBeTruthy()
 
   // Summary blob should be among them

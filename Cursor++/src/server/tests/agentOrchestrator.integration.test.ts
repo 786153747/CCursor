@@ -1,14 +1,12 @@
-import type { LLMMessage } from '../handlers/llm/types'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { persistBlob } from '../database/blobs'
-import { persistConversationCheckpoint } from '../database/checkpoints'
+import { getPersistedConversationCheckpoint, persistConversationCheckpoint } from '../database/checkpoints'
 import { resetAgentDatabaseForTests } from '../database/sqlite'
 import { encodeBlob } from '../handlers/agent/blob'
-import { resetBlobCacheForTests, warmupBlobsAsync } from '../handlers/agent/blobStore'
 import { rebuildConversationHistory } from '../handlers/agent/historyManager'
+import { BlobRunContext } from '../handlers/agent/runContext'
 import { assertValidAnthropicToolUseContract } from '../handlers/llm/anthropicContract'
 import { encodeAnthropicRequestMessages } from '../handlers/llm/conversationCodec'
 import { transformMessages } from '../handlers/llm/transformMessages'
@@ -34,7 +32,6 @@ async function withTempAgentDatabase(run: () => Promise<void>): Promise<void> {
   const tempDir = mkdtempSync(join(tmpdir(), 'cursor-byok-agent-db-'))
   process.env.BYOK_AGENT_DB_PATH = join(tempDir, 'cursor.db')
   capturedParsed = []
-  resetBlobCacheForTests()
   await resetAgentDatabaseForTests()
 
   try {
@@ -42,12 +39,16 @@ async function withTempAgentDatabase(run: () => Promise<void>): Promise<void> {
   }
   finally {
     capturedParsed = []
-    resetBlobCacheForTests()
     await resetAgentDatabaseForTests()
     if (prevDbPath === undefined)
       delete process.env.BYOK_AGENT_DB_PATH
     else process.env.BYOK_AGENT_DB_PATH = prevDbPath
-    rmSync(tempDir, { recursive: true, force: true })
+    try {
+      rmSync(tempDir, { recursive: true, force: true })
+    }
+    catch {
+      // Windows 上 sqlite 句柄可能延迟释放, 临时目录清理是尽力而为
+    }
   }
 }
 
@@ -55,6 +56,22 @@ async function exhaust<T>(iterable: AsyncIterable<T>): Promise<void> {
   for await (const _ of iterable) {
     // no-op
   }
+}
+
+/** 跑完生成器并取回它的 return 值 (rebuildConversationHistory 的结果在 return 侧) */
+async function drain<T>(generator: AsyncGenerator<unknown, T, void>): Promise<T> {
+  let next = await generator.next()
+  while (!next.done)
+    next = await generator.next()
+  return next.value
+}
+
+/** 本轮工作集: blob 只活在 run 内存里, 不再落 sqlite (PR #23 起服务端不持有副本) */
+function createTestRun(conversationId: string, blobs: Array<{ blobId: string, blobData: string }>): BlobRunContext {
+  const run = new BlobRunContext(null, { conversationId })
+  for (const blob of blobs)
+    run.blobs.cacheBlob(blob.blobId, blob.blobData)
+  return run
 }
 
 function noopFrames() {
@@ -90,12 +107,9 @@ describe('agent orchestrator / history rebuild integration', () => {
     capturedParsed = []
   })
 
-  it('trusts empty client conversationState and does not restore sqlite checkpoint history', async () => {
+  it('rejects a session-less run whose empty client state conflicts with a committed checkpoint', async () => {
     await withTempAgentDatabase(async () => {
       const { system, preamble, assistant, legacyUserToolResults } = buildLegacyAnthropicHistoryBlobs()
-      for (const blob of [system, preamble, assistant, legacyUserToolResults]) {
-        await persistBlob(blob.blobId, blob.blobData)
-      }
 
       await persistConversationCheckpoint({
         kind: 'committed',
@@ -109,7 +123,10 @@ describe('agent orchestrator / history rebuild integration', () => {
       })
 
       const handleRunRequest = await loadHandleRunRequest()
-      await exhaust(handleRunRequest({
+      // 客户端提交空 history 但会话已有 committed checkpoint: 这会静默丢掉上下文,
+      // 所以运行必须被拒 (有 session 时先弹交互确认, 这里没有 session → 直接冲突错误),
+      // 而不是带着空历史继续。checkpoint 本身保留, 供恢复使用。
+      await expect(exhaust(handleRunRequest({
         runRequest: {
           conversationId: 'conv-switch',
           action: {
@@ -121,13 +138,13 @@ describe('agent orchestrator / history rebuild integration', () => {
           modelDetails: { modelId: 'gpt-5.4-medium' },
           conversationState: {},
         },
-      }))
+      }))).rejects.toThrow(/Checkpoint version conflict/)
 
-      expect(capturedParsed).toHaveLength(1)
-      expect(capturedParsed[0]?.historyBlobIds).toEqual([])
-      expect(capturedParsed[0]?.historyTurnBlobIds).toEqual([])
-      expect(capturedParsed[0]?.historySummaryArchiveIds).toEqual([])
-      expect(capturedParsed[0]?.historyTokenDetails).toBeUndefined()
+      expect(capturedParsed).toHaveLength(0)
+      expect(await getPersistedConversationCheckpoint('conv-switch')).toMatchObject({
+        kind: 'committed',
+        summaryArchiveIds: ['archive-1'],
+      })
     })
   })
 
@@ -136,13 +153,10 @@ describe('agent orchestrator / history rebuild integration', () => {
       const oldSystem = encodeBlob({ role: 'system', content: 'OpenAI system prompt mentions ApplyPatch and ReadFile' })
       const oldPreamble = encodeBlob({ role: 'user', content: '<user_info>old provider preamble with ReadFile</user_info>' })
       const historyUser = encodeBlob({ role: 'user', content: 'history user' })
-      for (const blob of [oldSystem, oldPreamble, historyUser]) {
-        await persistBlob(blob.blobId, blob.blobData)
-      }
+      const run = createTestRun('conv-scaffold', [oldSystem, oldPreamble, historyUser])
 
-      await warmupBlobsAsync([oldSystem.blobId, oldPreamble.blobId, historyUser.blobId])
-
-      const iterator = rebuildConversationHistory({
+      const result = await drain(rebuildConversationHistory({
+        run,
         historyBlobIds: [oldSystem.blobId, oldPreamble.blobId, historyUser.blobId],
         prependUserMessages: [],
         systemMessage: { role: 'system', content: 'Anthropic system prompt uses Read and must not mention ApplyPatch' },
@@ -152,34 +166,22 @@ describe('agent orchestrator / history rebuild integration', () => {
         preambleUserContent: '<user_info>new provider preamble with Read</user_info>',
         sendSystemScaffoldBlob: noopFrames(),
         sendOrderedBlob: noopFrames(),
-      })
+      }))
 
-      let result: { messages: LLMMessage[], insertedPrependUserTexts: string[] } | undefined
-      for (;;) {
-        const next = iterator.next()
-        if (next.done) {
-          result = next.value
-          break
-        }
-      }
-
-      expect(result?.messages[0]).toEqual({ role: 'system', content: 'Anthropic system prompt uses Read and must not mention ApplyPatch' })
-      expect(result?.messages[1]).toEqual({ role: 'user', content: '<user_info>new provider preamble with Read</user_info>' })
-      expect(result?.messages[2]).toEqual({ role: 'user', content: 'history user' })
-      expect(result?.messages[3]).toEqual({ role: 'user', content: '继续' })
+      expect(result.messages[0]).toEqual({ role: 'system', content: 'Anthropic system prompt uses Read and must not mention ApplyPatch' })
+      expect(result.messages[1]).toEqual({ role: 'user', content: '<user_info>new provider preamble with Read</user_info>' })
+      expect(result.messages[2]).toEqual({ role: 'user', content: 'history user' })
+      expect(result.messages[3]).toEqual({ role: 'user', content: '继续' })
     })
   })
 
   it('rebuilt legacy anthropic history is repaired to canonical form and can continue across anthropic/openai/gemini', async () => {
     await withTempAgentDatabase(async () => {
       const { system, preamble, assistant, legacyUserToolResults } = buildLegacyAnthropicHistoryBlobs()
-      for (const blob of [system, preamble, assistant, legacyUserToolResults]) {
-        await persistBlob(blob.blobId, blob.blobData)
-      }
+      const run = createTestRun('conv-legacy', [system, preamble, assistant, legacyUserToolResults])
 
-      await warmupBlobsAsync([system.blobId, preamble.blobId, assistant.blobId, legacyUserToolResults.blobId])
-
-      const iterator = rebuildConversationHistory({
+      const result = await drain(rebuildConversationHistory({
+        run,
         historyBlobIds: [system.blobId, preamble.blobId, assistant.blobId, legacyUserToolResults.blobId],
         prependUserMessages: [],
         systemMessage: { role: 'system', content: 'sys prompt' },
@@ -189,20 +191,10 @@ describe('agent orchestrator / history rebuild integration', () => {
         preambleUserContent: '<user_info>env</user_info>',
         sendSystemScaffoldBlob: noopFrames(),
         sendOrderedBlob: noopFrames(),
-      })
+      }))
 
-      let result: { messages: LLMMessage[], insertedPrependUserTexts: string[] } | undefined
-      for (;;) {
-        const next = iterator.next()
-        if (next.done) {
-          result = next.value
-          break
-        }
-      }
-
-      expect(result).toBeDefined()
-      expect(result?.insertedPrependUserTexts).toEqual([])
-      expect(result?.messages).toEqual([
+      expect(result.insertedPrependUserTexts).toEqual([])
+      expect(result.messages).toEqual([
         { role: 'system', content: 'sys prompt' },
         { role: 'user', content: '<user_info>env</user_info>' },
         {
@@ -219,14 +211,14 @@ describe('agent orchestrator / history rebuild integration', () => {
         { role: 'user', content: '继续' },
       ])
 
-      const anthropicCompiled = transformMessages(result!.messages, 'anthropic')
+      const anthropicCompiled = transformMessages(result.messages, 'anthropic')
       const anthropicEncoded = encodeAnthropicRequestMessages(anthropicCompiled)
       expect(() => assertValidAnthropicToolUseContract(anthropicEncoded.messages)).not.toThrow()
 
-      const openAICompiled = transformMessages(result!.messages, 'openai-chat')
+      const openAICompiled = transformMessages(result.messages, 'openai-chat')
       expect(openAICompiled.filter(message => message.role === 'tool').map(message => message.toolCallId)).toEqual(['call_A', 'call_B'])
 
-      const geminiCompiled = transformMessages(result!.messages, 'gemini')
+      const geminiCompiled = transformMessages(result.messages, 'gemini')
       expect(geminiCompiled.filter(message => message.role === 'tool').map(message => message.toolCallId)).toEqual(['call_A', 'call_B'])
     })
   })

@@ -196,6 +196,11 @@ it('buildMessages produces official-style system and structured user content', (
                 type: { global: {} },
               },
               {
+                // source=2 (CURSOR_RULE_SOURCE_USER): 用户级规则走 <user_rules> 分支
+                content: 'Prefer concise answers',
+                source: 2,
+              },
+              {
                 content: 'Use pnpm',
                 fullPath: '/workspace/app/.cursor/rules/build.md',
                 type: { fileGlobbed: { glob: '**/*' } },

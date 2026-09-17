@@ -47,22 +47,38 @@ function toEntries(messages: LLMMessage[]): HistoryEntry[] {
   return messages.map((message, index) => makeEntry(index, message))
 }
 
-it('diagnostic: summarize-path planCompaction can still split legacy anthropic assistant/tool_result boundary before repair', () => {
-  const entries = buildLegacyCompactionEntries()
-  const plan = planCompaction(entries)
+/** 取"携带工具结果"的那条消息指向的 toolCallId (repair 前藏在 user 里, 后为 role=tool) */
+function toolResultToolCallId(message: LLMMessage): string | undefined {
+  if (message.role === 'tool')
+    return message.toolCallId
+  if (typeof message.content === 'string')
+    return undefined
+  const block = message.content.find((item): item is Extract<LLMContentBlock, { type: 'tool_result' }> => item.type === 'tool_result')
+  return block?.toolUseId
+}
 
-  expect(plan.leading.map(entry => entry.message.role)).toEqual(['system', 'user'])
-  expect(plan.summarizeEntries.at(-1)?.message.role).toBe('assistant')
-  expect(hasToolUse(plan.summarizeEntries.at(-1)!.message)).toBe(true)
-  expect(plan.keepTail[0]?.message.role).toBe('user')
-  expect(Array.isArray(plan.keepTail[0]?.message.content)).toBe(true)
-  expect(((plan.keepTail[0]?.message.content as LLMContentBlock[])[0] as Extract<LLMContentBlock, { type: 'tool_result' }>).type).toBe('tool_result')
+it('diagnostic: planCompaction keeps an assistant tool_use and its result message on the same side of the cut', () => {
+  // 两种形态都要成立:
+  //   legacy = tool_result 藏在 role='user' 的消息里 (官方旧 anthropic 回放形态)
+  //   repaired = repairConversationHistory 规范化后的 role='tool'
+  // 切点一旦落在这一对中间, 摘要侧会拿到没有结果的 tool_use, 尾窗会拿到孤儿 tool_result。
+  const legacy = buildLegacyCompactionEntries()
+  const repaired = toEntries(repairConversationHistory(legacy.map(entry => entry.message)))
+
+  for (const entries of [legacy, repaired]) {
+    const plan = planCompaction(entries, { budgetOverride: 30 })
+
+    expect(plan.leading.map(entry => entry.message.role)).toEqual(['system', 'user'])
+    const toolUseIndex = plan.keepTail.findIndex(entry => hasToolUse(entry.message))
+    expect(toolUseIndex).toBeGreaterThanOrEqual(0)
+    expect(toolResultToolCallId(plan.keepTail[toolUseIndex + 1]!.message)).toBe('call_A')
+  }
 })
 
 it('after repairConversationHistory canonicalizes legacy anthropic tool results, planCompaction no longer splits the assistant/tool boundary', () => {
   const repairedMessages = repairConversationHistory(buildLegacyCompactionEntries().map(entry => entry.message))
   const repairedEntries = toEntries(repairedMessages)
-  const plan = planCompaction(repairedEntries)
+  const plan = planCompaction(repairedEntries, { budgetOverride: 30 })
 
   expect(plan.leading.map(entry => entry.message.role)).toEqual(['system', 'user'])
   expect(plan.summarizeEntries.some(entry => hasToolUse(entry.message))).toBe(false)
@@ -74,7 +90,7 @@ it('after repairConversationHistory canonicalizes legacy anthropic tool results,
 })
 
 it('runtime helper repairHistoryEntries materializes canonicalized entries before compaction planning', () => {
-  const plan = planCompaction(repairHistoryEntries(buildLegacyCompactionEntries()))
+  const plan = planCompaction(repairHistoryEntries(buildLegacyCompactionEntries()), { budgetOverride: 35 })
 
   expect(plan.keepTail[1]?.message.role).toBe('assistant')
   expect(hasToolUse(plan.keepTail[1]!.message)).toBe(true)

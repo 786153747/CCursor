@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { cacheBlob, resetBlobCacheForTests } from '../handlers/agent/blobStore'
+import { RunBlobStore } from '../handlers/agent/blobStore'
 import { collectExtraContextBlobIds, parseRunRequest, resolveExtraContextBlobs } from '../handlers/agent/protocol'
 
 function minimalRun(extraEntries: Array<Record<string, unknown>>): Record<string, unknown> {
@@ -22,9 +22,9 @@ function minimalRun(extraEntries: Array<Record<string, unknown>>): Record<string
 
 describe('resolveExtraContextBlobs — Step 4', () => {
   it('replaces blobId entries with their base64-decoded text content when cached', () => {
-    resetBlobCacheForTests()
+    const store = new RunBlobStore()
     const text = 'inline extra context fetched from blob store'
-    cacheBlob('blob-A', Buffer.from(text, 'utf-8').toString('base64'))
+    store.cacheBlob('blob-A', Buffer.from(text, 'utf-8').toString('base64'))
 
     const parsed = parseRunRequest(minimalRun([
       { dataOrBlobId: { case: 'blobId', value: 'blob-A' } },
@@ -32,7 +32,7 @@ describe('resolveExtraContextBlobs — Step 4', () => {
     ]))
     expect(collectExtraContextBlobIds(parsed)).toEqual(['blob-A'])
 
-    const { resolved, missed } = resolveExtraContextBlobs(parsed)
+    const { resolved, missed } = resolveExtraContextBlobs(parsed, store)
     expect(resolved).toBe(1)
     expect(missed).toBe(0)
     expect(parsed.extraContextEntries[0]).toEqual({ data: text })
@@ -40,11 +40,11 @@ describe('resolveExtraContextBlobs — Step 4', () => {
   })
 
   it('keeps blobId pending when the blob is not in the cache', () => {
-    resetBlobCacheForTests()
+    const store = new RunBlobStore()
     const parsed = parseRunRequest(minimalRun([
       { dataOrBlobId: { case: 'blobId', value: 'missing-blob' } },
     ]))
-    const { resolved, missed } = resolveExtraContextBlobs(parsed)
+    const { resolved, missed } = resolveExtraContextBlobs(parsed, store)
     expect(resolved).toBe(0)
     expect(missed).toBe(1)
     expect(parsed.extraContextEntries[0].blobId).toBe('missing-blob')
