@@ -59,6 +59,7 @@ function withFallback(loaded: Partial<ProvidersConfig> | null): ProvidersConfig 
     $schemaVersion: loaded.$schemaVersion ?? DEFAULT_PROVIDERS.$schemaVersion,
     visionModelId: typeof loaded.visionModelId === 'string' ? loaded.visionModelId : '',
     providers: loaded.providers.map(p => ({
+      ...p,
       id: p.id,
       name: p.name ?? p.id,
       type: p.type,
@@ -145,6 +146,12 @@ export function flattenModels(): ResolvedProviderModel[] {
     }
   }
   return out
+}
+
+/** 按 providerId 取 provider 定义 — usage 统计等模块用于回填 provider 名称/类型 */
+export function getProvider(providerId: string): ProviderEntry | null {
+  const config = cache ?? loadProviders()
+  return config.providers.find(p => p.id === providerId) ?? null
 }
 
 /** 测试用: 直接注入 in-memory providers, 跳过磁盘读写 */

@@ -11,6 +11,7 @@ import { WebToolsButton, WebToolsDialog } from './search-section'
 import { Server } from './server'
 import { styles } from './styles'
 import { ToastContainer } from './toast'
+import { Usage } from './usage'
 import { VisionRouting } from './vision-routing'
 
 function Layout({ webviewJs, codiconUri }: { webviewJs: string, codiconUri?: string }) {
@@ -43,6 +44,18 @@ function Layout({ webviewJs, codiconUri }: { webviewJs: string, codiconUri?: str
 
         <h3>Vision Routing (Image Fallback)</h3>
         <VisionRouting />
+
+        <h3
+          style="cursor:pointer;user-select:none"
+          x-on:click="$store.app.toggleUsageOpen()"
+        >
+          <span>Usage</span>
+          <span style="float:right;font-size:0.85em;font-weight:500;color:var(--vscode-descriptionForeground)">
+            <span {...{ 'x-text': '$store.app.usage?.todayCostFormatted || \'\'' }}></span>
+            <span style="margin-left:6px" {...{ 'x-text': '$store.app.usageOpen ? \'▾\' : \'▸\'' }}></span>
+          </span>
+        </h3>
+        <Usage />
 
         <h3>
           <span>Providers</span>

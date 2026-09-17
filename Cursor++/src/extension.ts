@@ -12,10 +12,13 @@ import { isLikelyWindowsMsvcMissing, preflightSupermarkdown, setSupermarkdownNat
 import { resetProviderInstanceCache } from './server/handlers/llm/providerRuntime'
 import { initLogger } from './server/logger'
 import { getRoutesFilePath } from './server/routes'
+import { ensureUsageSettingsFile, onUsageSettingsChange, startUsageSettingsWatcher, stopUsageSettingsWatcher } from './server/usage/settings'
+import { pruneOldUsageLogs } from './server/usage/store'
 import { renderDashboardPageHtml } from './ui/dashboard/pageChrome'
 import { PanelProvider } from './ui/panel-provider'
 import { getState, onStateChange, probeByokServer, refreshState, requestByokServerTakeover, setFileLogState } from './ui/state'
 import { openUsageDashboard } from './ui/usage-dashboard'
+import { getUsageSuffix, getUsageTooltipLine, initUsageStatusBar, refreshUsageStatusBar } from './ui/usage-statusbar'
 import { startUpdateCheck, stopUpdateCheck } from './update-check'
 import { EXTENSION_VERSION, isNewerVersion } from './version'
 
@@ -547,18 +550,24 @@ function renderStatusBar() {
     ? 'BYOK ON — using local providers.json'
     : 'BYOK OFF — passing through to official Cursor'
 
-  // tooltip: server/byok 语义保持不变, 追加今日摘要 (有数据才显示) + Dashboard 链接。
-  // 链接始终可见 (入口可发现性), 仅摘要行依赖数据 — 摘要拉取失败/未就绪时只隐藏摘要。
+  // tooltip: server/byok 语义保持不变, 再追加两套用量信息 + Dashboard 链接。
+  //   - usage-statusbar 的周期摘要行 (成本口径, 跟随 statusBarScope/currency)
+  //   - 今日 token/请求数摘要 (取自 /byok/usage-stats?range=today)
+  // 链接始终可见 (入口可发现性), 两行摘要各自缺数据时只隐藏自己。
+  // 必须用 MarkdownString + isTrusted 才能激活 command: 链接, supportThemeIcons 启用 $(graph)。
   const tooltip = new vscode.MarkdownString(undefined, true)
   tooltip.isTrusted = true
   tooltip.appendMarkdown(`${serverTip}\n\n${byokTip}`)
-  tooltip.appendMarkdown(`\n\n---`)
+  const usageTooltipLine = getUsageTooltipLine()
+  if (usageTooltipLine)
+    tooltip.appendMarkdown(`\n\n${usageTooltipLine}`)
   if (todayUsageSummary)
     tooltip.appendMarkdown(`\n\n今日: **${formatTokenCountForTooltip(todayUsageSummary.totalTokens)}** tokens · **${todayUsageSummary.requests}** requests`)
+  tooltip.appendMarkdown(`\n\n---`)
   tooltip.appendMarkdown(`\n\n$(graph) [Open Usage Dashboard](command:cursor2plus.openUsageDashboard)`)
   tooltip.appendMarkdown(`\n\n---\n\nClick: toggle BYOK Mode`)
 
-  statusBarItem.text = `${serverIcon} BYOK ${byokGlyph}`
+  statusBarItem.text = `${serverIcon} BYOK ${byokGlyph}${getUsageSuffix()}`
   statusBarItem.tooltip = tooltip
   statusBarItem.backgroundColor = s.byokMode
     ? undefined
@@ -725,12 +734,20 @@ export async function activate(context: vscode.ExtensionContext) {
 
   // 状态栏 (BYOK Mode 切换按钮)
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100)
+  statusBarItem.name = 'Cursor++: BYOK'
   statusBarItem.command = 'cursor2plus.toggleByok'
   statusBarItem.show()
   context.subscriptions.push(statusBarItem)
 
-  // 状态变化 → 刷新状态栏
-  context.subscriptions.push(onStateChange(() => renderStatusBar()))
+  // 用量后缀挂在 BYOK 状态栏项上 (今日费用, 点击项仍是 BYOK 开关)
+  initUsageStatusBar(renderStatusBar)
+
+  // 状态变化 → 刷新状态栏; server 就绪时同步刷新今日费用后缀
+  context.subscriptions.push(onStateChange(() => {
+    renderStatusBar()
+    if (getState().server === 'local')
+      refreshUsageStatusBar()
+  }))
 
   // 侧边栏面板
   const panelProvider = new PanelProvider(context)
@@ -765,6 +782,10 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('cursor2plus.openSettings', () => {
       vscode.commands.executeCommand('cursor2plus.panel.focus')
     }),
+    vscode.commands.registerCommand('cursor2plus.openUsage', () => {
+      void vscode.commands.executeCommand('cursor2plus.panel.focus')
+      panelProvider.revealUsage()
+    }),
     vscode.commands.registerCommand('cursor2plus.toggleFileLog', () => toggleFileLog(context)),
     vscode.commands.registerCommand('cursor2plus.openLogFile', () => openLogFile()),
     vscode.commands.registerCommand('cursor2plus.openUsageDashboard', () => openUsageDashboard(context)),
@@ -773,10 +794,14 @@ export async function activate(context: vscode.ExtensionContext) {
   // 确保配置文件存在 —— 即使 server 未启动,面板也能读写
   await ensureRoutesFile()
   await ensureProvidersFile()
+  ensureUsageSettingsFile()
+  // 清理超过保留期的用量明细, 防止 usage_logs 无限膨胀
+  void pruneOldUsageLogs()
 
   // 文件监听: 其他实例修改配置时自动同步状态 + UI
   startRoutesWatcher()
   startProvidersWatcher()
+  startUsageSettingsWatcher()
   const disposeRoutesWatch = onRoutesChange(async () => {
     await refreshState()
     renderStatusBar()
@@ -787,7 +812,11 @@ export async function activate(context: vscode.ExtensionContext) {
     await refreshState()
     bumpRefreshSignal()
   })
-  context.subscriptions.push({ dispose: disposeRoutesWatch }, { dispose: disposeProvidersWatch })
+  const disposeUsageWatch = onUsageSettingsChange(async () => {
+    await refreshState()
+    refreshUsageStatusBar()
+  })
+  context.subscriptions.push({ dispose: disposeRoutesWatch }, { dispose: disposeProvidersWatch }, { dispose: disposeUsageWatch })
 
   // 初始化状态
   await refreshState()
@@ -848,6 +877,7 @@ export async function deactivate() {
   closeLogFileStream()
   stopRoutesWatcher()
   stopProvidersWatcher()
+  stopUsageSettingsWatcher()
   await stopServer()
   if (outputChannel)
     outputChannel.dispose()

@@ -15,6 +15,10 @@ Format follows [Keep a Changelog](http://keepachangelog.com/).
   both image input and Agent mode
 - Text-only fallback sanitization: historical image bytes are replaced with a text
   placeholder when returning to the main model, while the vision model analysis remains
+- BYOK usage dashboard: four-bucket token accounting, per-model prices, CNY/USD display,
+  and provider/model filters in the Cursor++ sidebar. Tool rounds and auto-summarize are recorded.
+  Unchecking every provider shows zero instead of falling back to all; rechecking a provider
+  includes all of its models. Costs use live model prices, not the cached provider snapshot.
 
 ### Fixed
 
