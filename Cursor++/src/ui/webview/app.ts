@@ -80,7 +80,6 @@ export function initApp(Alpine: AlpineType) {
     remoteModels: {} as Record<string, { loading: boolean, models?: any[], error?: string }>,
     saveSnapshots: {} as Record<string, { targetIds: string[], snapshots: Record<string, any> }>,
     savingProviders: {} as Record<string, boolean>,
-    visionModelSaving: false,
 
     // ── Web Tools Config ──
     webToolsOpen: false,
@@ -138,13 +137,6 @@ export function initApp(Alpine: AlpineType) {
       this.toast('Web tools config saved', 'info')
     },
 
-    saveVisionModel(modelId: string) {
-      if (this.visionModelSaving)
-        return
-      this.visionModelSaving = true
-      this.post('saveVisionModel', { modelId })
-    },
-
     // ── Toast ──
     toasts: [] as Array<{ id: number, text: string, level: string }>,
     _toastId: 0,
@@ -181,33 +173,6 @@ export function initApp(Alpine: AlpineType) {
           out.push(draft)
       }
       return out
-    },
-
-    get visionCapableModels(): Array<{ id: string, label: string }> {
-      const models: Array<{ id: string, label: string }> = []
-      for (const provider of this.state?.providers || []) {
-        for (const model of provider.models || []) {
-          if (model.supportsImages === false || model.supportsAgent === false)
-            continue
-          models.push({
-            id: model.id,
-            label: `${model.displayName || model.apiModel || model.id} · ${provider.name || provider.id}`,
-          })
-        }
-      }
-      return models
-    },
-
-    get visionModelLabel(): string {
-      const selectedId = this.state?.visionModelId || ''
-      if (!selectedId)
-        return 'Not configured'
-      return this.visionCapableModels.find((model: { id: string, label: string }) => model.id === selectedId)?.label || `Missing: ${selectedId}`
-    },
-
-    get visionModelInvalid(): boolean {
-      const selectedId = this.state?.visionModelId || ''
-      return !!selectedId && !this.visionCapableModels.some((model: { id: string, label: string }) => model.id === selectedId)
     },
 
     get cacheHitLabel(): string {
@@ -1117,16 +1082,6 @@ export function initApp(Alpine: AlpineType) {
       }
       if (requestId)
         delete s.saveSnapshots[requestId]
-    }
-    else if (msg?.type === 'visionModelSaved') {
-      s.visionModelSaving = false
-      if (msg.state)
-        s.state = msg.state
-      s.toast(msg.text || 'Vision model saved.', 'info')
-    }
-    else if (msg?.type === 'visionModelSaveFailed') {
-      s.visionModelSaving = false
-      s.toast(`Save vision model failed: ${msg.error || 'unknown error'}`, 'error', 6000)
     }
     else if (msg?.type === 'remoteModelsResult') {
       const pid = msg.pid as string
