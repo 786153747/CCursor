@@ -18,15 +18,18 @@ const priced: ModelPricing = {
 }
 
 describe('usage calculator', () => {
-  it('treats openai and gemini input as cache-inclusive', () => {
+  it('treats anthropic input as cache-inclusive (normalized to full prompt)', () => {
     expect(CACHE_INCLUSIVE_PROVIDER_TYPES.has('openai-chat')).toBe(true)
     expect(CACHE_INCLUSIVE_PROVIDER_TYPES.has('openai-responses')).toBe(true)
     expect(CACHE_INCLUSIVE_PROVIDER_TYPES.has('gemini')).toBe(true)
-    expect(isCacheInclusiveProvider('anthropic')).toBe(false)
+    // provider 层把 anthropic 的 input_tokens 归一成完整 prompt 规模后,
+    // 这里必须同样按 inclusive 处理, 否则缓存 token 会被全价重复计费、
+    // 命中率分母也会翻倍 (上限 50%)。
+    expect(isCacheInclusiveProvider('anthropic')).toBe(true)
   })
 
-  it('does not subtract cache from anthropic fresh input', () => {
-    expect(getFreshInputTokens('anthropic', 1000, 400, 100)).toBe(1000)
+  it('subtracts cache read and write from anthropic full-prompt input', () => {
+    expect(getFreshInputTokens('anthropic', 1000, 400, 100)).toBe(500)
   })
 
   it('subtracts cache read and write from openai-style input', () => {
@@ -34,18 +37,20 @@ describe('usage calculator', () => {
     expect(getFreshInputTokens('gemini', 100, 200, 0)).toBe(0)
   })
 
-  it('prices anthropic four buckets without double-counting cache', () => {
+  it('prices anthropic four buckets from the normalized full-prompt input', () => {
     const result = calculateUsageCost({
       providerType: 'anthropic',
       usage: {
-        inputTokens: 1_000_000,
+        // 归一化后的完整 prompt: 1M fresh + 2M cache read + 1M cache write
+        inputTokens: 4_000_000,
         outputTokens: 1_000_000,
         cacheReadTokens: 2_000_000,
         cacheWriteTokens: 1_000_000,
       },
       pricing: priced,
     })
-    // 1M*3 + 1M*15 + 2M*0.3 + 1M*3.75 = 3+15+0.6+3.75 = 22.35
+    // fresh 1M*3 + 1M*15 + 2M*0.3 + 1M*3.75 = 3+15+0.6+3.75 = 22.35
+    expect(result.freshInputTokens).toBe(1_000_000)
     expect(result.totalMicros).toBe(22_350_000n)
     expect(result.unpriced).toBe(false)
     expect(formatCost(result.totalMicros, 'CNY')).toBe('¥22.350000')

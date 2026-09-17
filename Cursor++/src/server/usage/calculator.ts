@@ -2,6 +2,11 @@ import type { ProviderType } from '../data/defaults'
 import type { CostBreakdown, ModelPricing, NormalizedUsage, UsageCurrency } from './types'
 
 export const CACHE_INCLUSIVE_PROVIDER_TYPES: ReadonlySet<ProviderType> = new Set([
+  // anthropic 的原始 input_tokens 不含 cache_read/cache_creation, 但 provider 层
+  // (handlers/llm/anthropic.ts) 会归一成"完整 prompt 规模"再落库 (auto-compaction
+  // 依赖该口径)。这里必须跟着按 inclusive 处理: 否则 fresh = 整个 prompt,
+  // 既把缓存命中 token 按全价计费, 又让命中率分母凭空翻倍 (上限 50%)。
+  'anthropic',
   'openai-chat',
   'openai-responses',
   'gemini',

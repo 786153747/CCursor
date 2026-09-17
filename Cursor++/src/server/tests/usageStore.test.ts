@@ -278,6 +278,31 @@ describe('usage store', () => {
     expect(usd.totalCostMicros).toBe(0n)
   })
 
+  it('computes cache hit rate against the full prompt for normalized anthropic usage', async () => {
+    // provider 层已把 anthropic 的 input_tokens 归一成"完整 prompt"(含 cache_read),
+    // 命中率分母不能再叠加一次 cache_read —— 否则上限恒为 50%。
+    await recordUsageLog(log({
+      requestId: 'cache-hit',
+      providerType: 'anthropic',
+      inputTokens: 1_000_000,
+      cacheReadTokens: 800_000,
+      outputTokens: 0,
+      totalCostMicros: 1_000n,
+      createdAt: Date.now(),
+    }))
+
+    const dashboard = await queryUsageDashboard({
+      $schemaVersion: 1,
+      currency: 'CNY',
+      range: 'today',
+      selectedProviderIds: [],
+      selectedModelKeys: [],
+    })
+
+    expect(dashboard.summary.freshInputTokens).toBe(200_000)
+    expect(dashboard.summary.cacheHitRate).toBeCloseTo(0.8, 5)
+  })
+
   it('prunes usage logs older than the retention window', async () => {
     const now = Date.now()
     await recordUsageLog(log({ requestId: 'old', totalCostMicros: 1_000n, createdAt: now - 91 * 24 * 60 * 60 * 1000 }))
