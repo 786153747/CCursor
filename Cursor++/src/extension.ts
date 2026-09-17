@@ -10,7 +10,7 @@ import { ensureProvidersFile, onProvidersChange, startProvidersWatcher, stopProv
 import { ensureRoutesFile, onRoutesChange, startRoutesWatcher, stopRoutesWatcher, toggleByokMode } from './server/config/routesStore'
 import { isLikelyWindowsMsvcMissing, preflightSupermarkdown, setSupermarkdownNativeErrorNotifier } from './server/handlers/agent/supermarkdown'
 import { resetProviderInstanceCache } from './server/handlers/llm/providerRuntime'
-import { initLogger } from './server/logger'
+import { formatLocalTimestamp, initLogger } from './server/logger'
 import { getRoutesFilePath } from './server/routes'
 import { ensureUsageSettingsFile, onUsageSettingsChange, startUsageSettingsWatcher, stopUsageSettingsWatcher } from './server/usage/settings'
 import { pruneOldUsageLogs } from './server/usage/store'
@@ -86,8 +86,7 @@ function closeLogFileStream(): void {
 }
 
 function formatFileLogLine(entry: SseLogEntry): string {
-  const ts = new Date().toISOString()
-  return `${ts} [${entry.level}] ${entry.msg}\n`
+  return `${formatLocalTimestamp()} [${entry.level}] ${entry.msg}\n`
 }
 
 /** 单一写入入口 — 所有 log 都走这里, 保证 Output Channel 和文件同步 */

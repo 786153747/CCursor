@@ -59,12 +59,25 @@ function getOrphanStream(windowId: number): WritableType {
 }
 
 function writeOrphanLog(windowId: number, entry: LogEntry): void {
-  const ts = new Date().toISOString()
+  const ts = formatLocalTimestamp()
   const line = `${ts} [${entry.level.toUpperCase()}] ${entry.msg}\n`
   try {
     getOrphanStream(windowId).write(line)
   }
   catch {}
+}
+
+/**
+ * 本地时区时间戳 'YYYY-MM-DD HH:mm:ss.SSS'。
+ *
+ * 日志是给本机用户对着自己的钟读的, 所以按本地时区渲染而不是 UTC —
+ * 原先的 toISOString() 在 UTC+8 下会比用户的钟早 8 小时, 极易误判时序。
+ * 毫秒保留, 便于对照事件先后顺序。
+ */
+export function formatLocalTimestamp(date: Date = new Date()): string {
+  const pad = (value: number, width = 2) => String(value).padStart(width, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+    + `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}`
 }
 
 /** 请求上下文 — 通过 AsyncLocalStorage 贯穿整条处理链 */
