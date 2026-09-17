@@ -18,6 +18,25 @@
 import { copyFileSync, existsSync, readdirSync, renameSync, unlinkSync } from 'fs';
 import { basename, dirname, join } from 'path';
 
+/**
+ * Replace `to` with `from`. Windows cannot rename onto an existing dest
+ * (EPERM/EEXIST/EACCES); POSIX rename also fails across devices (EXDEV).
+ */
+function replaceFile(from, to) {
+  try {
+    renameSync(from, to);
+  } catch (err) {
+    const windowsClash = process.platform === 'win32'
+      && (err.code === 'EPERM' || err.code === 'EEXIST' || err.code === 'EACCES');
+    if (err.code === 'EXDEV' || windowsClash) {
+      copyFileSync(from, to);
+      unlinkSync(from);
+      return;
+    }
+    throw err;
+  }
+}
+
 const PREFIX = 'backup-byok';
 
 function backupNamePattern(base, tag) {
@@ -59,7 +78,7 @@ export function restoreBackup(filePath, tag, log) {
 
   // 同 tag 下多份时取最早的一份(最接近原始),其他冗余份删除
   const primary = backups[0];
-  renameSync(join(dir, primary), filePath);
+  replaceFile(join(dir, primary), filePath);
   for (let i = 1; i < backups.length; i++) {
     try {
       unlinkSync(join(dir, backups[i]));

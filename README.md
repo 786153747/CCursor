@@ -66,7 +66,7 @@ Cursor IDE
   ├─ always-local-patch (extension host)
   │   └─ rewrite http/https.request + hot-reload from routes.json
   │
-  └─ Cursor++ Extension (BYOK Server @ 127.0.0.1:9960)
+  └─ Cursor++ Extension (BYOK Server @ 127.0.0.1:39831)
       ├─ Fastify + ConnectRPC (27 services)
       ├─ LLM: Anthropic / OpenAI / Gemini SDK
       ├─ Agent: multi-round tool-calling orchestrator
@@ -140,7 +140,7 @@ Requires **Cursor IDE** + **Node.js >= 18**.
 
 ## Issues & Feedback
 
-This repository is for **issue tracking and documentation only** — source code is not published.
+Source lives in this repository: `Cursor++/` (VS Code extension + BYOK server) and `installer/` (`npx @cometix/ccursor`).
 
 - [Submit an Issue](https://github.com/CometixSpace/CCursor/issues)
 - [LinuxDO Discussion](https://linux.do/t/topic/1926833)

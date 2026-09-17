@@ -1,11 +1,35 @@
 /**
  * 原子文件读写工具
  *
- * write 走 tmp + rename, 同文件系统下 POSIX 保证原子性。
- * 进程内并发调用通过简单的 Promise 链做串行化, 避免 read-modify-write 竞争。
+ * write 走 tmp + replaceFile。同卷 POSIX 上 rename 原子替换；Windows 不能
+ * rename 覆盖已有文件，改为 copy + unlink。进程内并发通过 Promise 链串行化。
  */
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+
+/**
+ * Replace `to` with `from`.
+ *
+ * `renameSync` is atomic on POSIX when both paths are on the same volume, but
+ * Windows raises EPERM/EEXIST/EACCES if `to` already exists. Cross-device
+ * moves raise EXDEV on every platform. Fall back to copy + unlink there.
+ */
+export function replaceFile(from: string, to: string): void {
+  try {
+    renameSync(from, to)
+  }
+  catch (err) {
+    const code = (err as NodeJS.ErrnoException).code
+    const windowsClash = process.platform === 'win32'
+      && (code === 'EPERM' || code === 'EEXIST' || code === 'EACCES')
+    if (code === 'EXDEV' || windowsClash) {
+      copyFileSync(from, to)
+      unlinkSync(from)
+      return
+    }
+    throw err
+  }
+}
 
 export function readJsonOrNull<T>(path: string): T | null {
   try {
@@ -28,7 +52,7 @@ export function writeJsonAtomic(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true })
   const tmp = `${path}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, 'utf-8')
-  renameSync(tmp, path)
+  replaceFile(tmp, path)
 }
 
 /**

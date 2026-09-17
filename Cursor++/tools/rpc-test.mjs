@@ -12,7 +12,7 @@
  *   node tools/rpc-test.mjs aiserver.v1.AiService/AvailableDocs --body '{"getAll":true}'
  *   node tools/rpc-test.mjs aiserver.v1.AiService/ServerTime
  *   node tools/rpc-test.mjs agent.v1.AgentService/GetUsableModels
- *   node tools/rpc-test.mjs aiserver.v1.AiService/AvailableModels --host http://127.0.0.1:9960
+ *   node tools/rpc-test.mjs aiserver.v1.AiService/AvailableModels --host http://127.0.0.1:39831
  *
  * Options:
  *   --host <url>       目标 host (默认 https://api2.cursor.sh)
