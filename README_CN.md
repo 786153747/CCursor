@@ -72,8 +72,8 @@ npx @cometix/ccursor status
 - **Vision Model Routing** — Image-bearing rounds automatically use a configured multimodal model when the main model cannot read images<br/>
   **看图模型路由** — 主模型不支持图片时，含图片的轮次自动使用指定多模态模型，纯文字轮次自动切回主模型
 
-- **22 Agent Tools** — Shell, Read, Grep, Glob, Edit, Write, Task, MCP, etc.<br/>
-  **22 个 Agent 工具** — Shell、Read、Grep、Glob、Edit、Write、Task、MCP 等
+- **26 Agent Tools** — Shell, Read, Grep, Glob, Edit, Write, Task, MCP, etc.<br/>
+  **26 个 Agent 工具** — Shell、Read、Grep、Glob、Edit、Write、Task、MCP 等
 
 - **Hub Integration** — Device authorization via LinuxDO Connect  
   **Hub 集成** — 通过 LinuxDO Connect 设备授权
@@ -177,9 +177,9 @@ Requires **Cursor IDE** + **Node.js >= 18**.
 
 ## Issues & Feedback / 问题与反馈
 
-Source lives in this repository: `Cursor++/` (VS Code extension + BYOK server) and `installer/` (`npx @cometix/ccursor`).
+Source code for the extension (`Cursor++/`) and the installer (`installer/`) lives in this repository, licensed under AGPL-3.0-or-later.
 
-源码在本仓库：`Cursor++/`（扩展 + BYOK 服务）和 `installer/`（`npx @cometix/ccursor`）。
+扩展 (`Cursor++/`) 与安装器 (`installer/`) 的源代码均在本仓库中，采用 AGPL-3.0-or-later 许可证。
 
 - [Submit an Issue](https://github.com/CometixSpace/CCursor/issues)
 - [LinuxDO Discussion](https://linux.do/t/topic/1926833)

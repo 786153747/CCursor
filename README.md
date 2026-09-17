@@ -51,7 +51,7 @@ npx @cometix/ccursor status
 - **Per-Window Logging** — Each window gets its own log stream, colored output in LogOutputChannel
 - **Hot-Reload** — Config changes take effect without restarting Cursor
 - **Vision Model Routing** — When the main model cannot read images, image-bearing rounds automatically use a configured multimodal model and text-only rounds return to the main model
-- **22 Agent Tools** — Shell, Read, Grep, Glob, Edit, Write, Task, MCP, etc.
+- **26 Agent Tools** — Shell, Read, Grep, Glob, Edit, Write, Task, MCP, etc.
 - **Hub Integration** — Device authorization via LinuxDO Connect
 
 ---
@@ -152,7 +152,7 @@ Requires **Cursor IDE** + **Node.js >= 18**.
 
 ## Issues & Feedback
 
-Source lives in this repository: `Cursor++/` (VS Code extension + BYOK server) and `installer/` (`npx @cometix/ccursor`).
+Source code for the extension (`Cursor++/`) and the installer (`installer/`) lives in this repository, licensed under AGPL-3.0-or-later.
 
 - [Submit an Issue](https://github.com/CometixSpace/CCursor/issues)
 - [LinuxDO Discussion](https://linux.do/t/topic/1926833)
