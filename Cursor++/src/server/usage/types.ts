@@ -167,6 +167,18 @@ export interface UsageDailyStat {
   totalCostFormatted: string
 }
 
+/**
+ * 本次范围内货币与当前显示货币不同、因而未计入总账的历史记录。
+ *
+ * 行里存的是"写入当时的货币", 而当时生效的 costMultiplier 并没有一并落库,
+ * 所以无法可靠换算。这里只如实报告被排除了多少, 不让旧账静默消失。
+ */
+export interface UsageExcludedByCurrency {
+  requestCount: number
+  /** 本次范围内出现过的其它货币 (理论上可不止一种) */
+  currencies: string[]
+}
+
 export interface UsageDashboard {
   settings: UsageSettings
   todayCostFormatted: string
@@ -175,6 +187,7 @@ export interface UsageDashboard {
   models: UsageModelStat[]
   daily: UsageDailyStat[]
   recent: UsageRecentItem[]
+  excludedByCurrency: UsageExcludedByCurrency
 }
 
 export function normalizeUsage(usage?: LLMUsage): NormalizedUsage {

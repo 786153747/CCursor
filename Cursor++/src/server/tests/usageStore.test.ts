@@ -303,6 +303,37 @@ describe('usage store', () => {
     expect(dashboard.summary.cacheHitRate).toBeCloseTo(0.8, 5)
   })
 
+  it('reports records excluded by the currency filter instead of hiding them', async () => {
+    // 行里存的是"写入当时的货币", 查询按当前货币过滤且不做换算 —— 所以被排除的旧账
+    // 必须显式报告出来, 否则切一次货币历史就像凭空消失。
+    const now = Date.now()
+    await recordUsageLog(log({ requestId: 'cny-1', totalCostMicros: 1_000n, createdAt: now }))
+    await recordUsageLog(log({ requestId: 'usd-1', currency: 'USD', totalCostMicros: 2_000n, createdAt: now }))
+    await recordUsageLog(log({ requestId: 'usd-2', currency: 'USD', totalCostMicros: 3_000n, createdAt: now }))
+
+    const cny = await queryUsageDashboard({
+      $schemaVersion: 1,
+      currency: 'CNY',
+      range: 'today',
+      selectedProviderIds: [],
+      selectedModelKeys: [],
+    })
+    expect(cny.summary.requestCount).toBe(1)
+    expect(cny.summary.totalCostMicros).toBe(1_000n)
+    expect(cny.excludedByCurrency).toEqual({ requestCount: 2, currencies: ['USD'] })
+
+    const usd = await queryUsageDashboard({
+      $schemaVersion: 1,
+      currency: 'USD',
+      range: 'today',
+      selectedProviderIds: [],
+      selectedModelKeys: [],
+    })
+    expect(usd.summary.requestCount).toBe(2)
+    expect(usd.summary.totalCostMicros).toBe(5_000n)
+    expect(usd.excludedByCurrency).toEqual({ requestCount: 1, currencies: ['CNY'] })
+  })
+
   it('prunes usage logs older than the retention window', async () => {
     const now = Date.now()
     await recordUsageLog(log({ requestId: 'old', totalCostMicros: 1_000n, createdAt: now - 91 * 24 * 60 * 60 * 1000 }))

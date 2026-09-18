@@ -295,6 +295,20 @@ export function initApp(Alpine: AlpineType) {
       return `${Math.round(percent * 10) / 10}%`
     },
 
+    /**
+     * 被货币过滤掉的历史记录提示 (旧账不换算, 只如实提示存在)。
+     *
+     * 全空的情况由 usage.tsx 的 'No records' 提示覆盖, 这里只处理"有记录但旧账被排除"
+     * 这一半 —— 否则切货币后旧账会静默消失且毫无痕迹。
+     */
+    get usageCurrencyNotice(): string {
+      const excluded = this.usage?.excludedByCurrency
+      if (!excluded?.requestCount || !this.usage?.summary?.requestCount)
+        return ''
+      const currencies = (excluded.currencies || []).join(', ')
+      return `${excluded.requestCount} record(s) in ${currencies} excluded — bills keep the currency used at request time.`
+    },
+
     get usageRangeLabel(): string {
       const labels: Record<string, string> = {
         'today': 'Today',

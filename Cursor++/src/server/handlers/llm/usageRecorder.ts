@@ -6,6 +6,8 @@
  *   - 不捕获流本身的错误 (上游 agent 循环依赖原始错误做重试/中断)
  *   - 遇到 done 事件时 fire-and-forget 落库用量 (recordModelUsage 内部
  *     全量 try/catch + .catch 兜底, DB 故障对流零影响)
+ *   - 流以错误/中断收尾时同样落一条零 token 的采样, 与 usage_logs 侧
+ *     (usage/instrument.ts) 的 error 行一一对应; 否则两个面板的 Requests 会差一个失败数
  *
  * 唯一埋点: resolveProviderRuntime() — 覆盖 agent 主循环 / 压缩摘要 / 子代理全部调用路径。
  */
@@ -22,17 +24,27 @@ export interface UsageRecordingMeta {
     apiModel: string;
 }
 
+/** 失败/中断采样: 只占请求数, token 与成本均为 0 (与 usage_logs 的 error 行同构) */
+const FAILED_REQUEST_USAGE = { inputTokens: 0, outputTokens: 0 };
+
 export function withUsageRecording(inner: LLMProvider, meta: UsageRecordingMeta): LLMProvider {
     return {
         name: inner.name,
         stream(request: LLMStreamRequest): AsyncIterable<LLMStreamEvent> {
             async function* recordEvents(signal: AbortSignal): AsyncIterable<LLMStreamEvent> {
-                for await (const event of inner.stream({ ...request, signal })) {
-                    if (event.type === 'done') {
-                        // fire-and-forget: 不 await、不抛错 — 用量统计绝不阻塞/干扰 LLM 流
-                        void recordModelUsage({ ...meta, usage: event.usage }).catch(() => {});
+                try {
+                    for await (const event of inner.stream({ ...request, signal })) {
+                        if (event.type === 'done') {
+                            // fire-and-forget: 不 await、不抛错 — 用量统计绝不阻塞/干扰 LLM 流
+                            void recordModelUsage({ ...meta, usage: event.usage }).catch(() => {});
+                        }
+                        yield event;
                     }
-                    yield event;
+                }
+                catch (error) {
+                    void recordModelUsage({ ...meta, usage: FAILED_REQUEST_USAGE }).catch(() => {});
+                    // 原始错误原样上抛 — 采集层不得改变重试/中断语义
+                    throw error;
                 }
             }
             // Keep creation lazy, but abort before a pending generator queues return/throw.

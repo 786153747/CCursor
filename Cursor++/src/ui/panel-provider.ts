@@ -300,6 +300,7 @@ export class PanelProvider implements vscode.WebviewViewProvider {
             providers: [],
             models: [],
             recent: [],
+            excludedByCurrency: { requestCount: 0, currencies: [] },
           },
         })
         return

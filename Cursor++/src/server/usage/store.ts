@@ -115,6 +115,15 @@ export async function queryUsageDashboard(settings: UsageSettings): Promise<Usag
     `SELECT * FROM usage_logs WHERE created_at >= ? AND currency = ? ORDER BY created_at DESC`,
     [start, settings.currency],
   )
+  // 同一范围内被货币过滤掉的历史: 只统计条数与货币种类, 不试图换算金额 —— 那时生效的
+  // costMultiplier 没有随行落库, 换算出来只会是错数字。用途是让 UI 能提示"旧账还在"。
+  const otherCurrencyRows = await getAgentDatabase().all<{ currency: string, n: number }>(
+    `SELECT currency, COUNT(*) AS n FROM usage_logs
+      WHERE created_at >= ? AND currency <> ?
+      GROUP BY currency
+      ORDER BY n DESC`,
+    [start, settings.currency],
+  )
   const todayRows = rows.filter(row => row.created_at >= todayStart)
   const filtered = rows.filter(row => matchesUsageFilter(settings, row))
   const todayFiltered = todayRows.filter(row => matchesUsageFilter(settings, row))
@@ -127,6 +136,10 @@ export async function queryUsageDashboard(settings: UsageSettings): Promise<Usag
     models: buildModelStats(rows, settings),
     daily: buildDailyStats(filtered, start, now, settings.currency),
     recent: filtered.slice(0, 30).map(toRecentItem(settings.currency)),
+    excludedByCurrency: {
+      requestCount: otherCurrencyRows.reduce((sum, row) => sum + row.n, 0),
+      currencies: otherCurrencyRows.map(row => row.currency),
+    },
   }
 }
 
@@ -368,5 +381,6 @@ export function serializeUsageDashboard(dashboard: UsageDashboard) {
       totalCostMicros: day.totalCostMicros.toString(),
     })),
     recent: dashboard.recent,
+    excludedByCurrency: dashboard.excludedByCurrency,
   }
 }

@@ -82,6 +82,10 @@ export function Usage() {
         No records for this currency and range. Bills are stored with the currency used at request time — try the other currency.
       </div>
 
+      <div class="usage-hint" x-show="$store.app.usageCurrencyNotice">
+        <span x-text="$store.app.usageCurrencyNotice"></span>
+      </div>
+
       <div class="usage-section-title">Providers</div>
       <div class="usage-hint">Click a name to expand its models. Unchecked providers stay recorded but are excluded from totals.</div>
       <template x-for="p in $store.app.usageProvidersVisible" x-bind:key="p.id">
