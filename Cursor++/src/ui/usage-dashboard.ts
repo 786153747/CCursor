@@ -40,7 +40,7 @@ export function openUsageDashboard(context: vscode.ExtensionContext): void {
 
   const panel = vscode.window.createWebviewPanel(
     'cursor2plus.usageDashboard',
-    'Cursor++ Usage',
+    'Cursor++ 用量面板',
     vscode.ViewColumn.Active,
     { enableScripts: true, retainContextWhenHidden: true },
   )

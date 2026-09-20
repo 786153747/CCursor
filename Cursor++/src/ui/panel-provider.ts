@@ -165,8 +165,6 @@ export class PanelProvider implements vscode.WebviewViewProvider {
           try {
             const { updateUsageSettings } = await import('../server/usage/settings')
             await updateUsageSettings((draft) => {
-              if (msg.currency === 'USD' || msg.currency === 'CNY')
-                draft.currency = msg.currency
               if (msg.range === 'today' || msg.range === '7d' || msg.range === '14d' || msg.range === '30d' || msg.range === 'month')
                 draft.range = msg.range
               if (msg.statusBarScope === 'today' || msg.statusBarScope === 'month')
@@ -289,18 +287,17 @@ export class PanelProvider implements vscode.WebviewViewProvider {
       const { queryUsageDashboard, serializeUsageDashboard } = await import('../server/usage/store')
       if (!isAgentDatabaseReady()) {
         const settings = loadUsageSettings()
-        const zeroCost = formatCost(0n, settings.currency)
+        const zeroCost = formatCost(0n)
         this.view.webview.postMessage({
           type: 'usage',
           reveal,
           usage: {
             settings,
-            todayCostFormatted: zeroCost,
+            todayRealTokens: 0,
             summary: { requestCount: 0, realTotalTokens: 0, cacheHitRate: 0, unpricedCount: 0, totalCostFormatted: zeroCost },
             providers: [],
             models: [],
             recent: [],
-            excludedByCurrency: { requestCount: 0, currencies: [] },
           },
         })
         return

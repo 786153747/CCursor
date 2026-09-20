@@ -1,14 +1,13 @@
 /**
- * Usage status-bar suffix — period cost appended to the BYOK item.
+ * Usage status-bar suffix — 周期成本后缀, 追加在 BYOK 状态栏项后面。
  *
- * Lives inside the existing BYOK status-bar item (no separate entry):
- *   `✓ BYOK ◉ ¥14`
- * The statistics window follows `usage-settings.json` `statusBarScope`
- * ('month' by default — resets on the 1st, or 'today' — resets at midnight).
- * The precise cost stays available via the item tooltip. Refreshed on every
- * usage record and on currency/scope change; data comes from a single SQL
- * aggregate. A failed query (agent DB not initialized yet) schedules retries
- * so the suffix appears without waiting for a request.
+ * 复用现有 BYOK 状态栏项, 不新开条目:
+ *   `✓ BYOK ◉ $14`
+ * 统计窗口跟随 `usage-settings.json` 的 `statusBarScope`
+ * (缺省 'month' — 每月 1 日重置; 'today' — 每日零点重置)。
+ * 金额统一 USD, 精确值在 tooltip 里。每次用量落库及 scope 切换后刷新,
+ * 数据来自单条 SQL 聚合。查询失败 (agent DB 未初始化) 会安排重试,
+ * 让后缀不需要等到下一次请求才出现。
  */
 import type { UsageBarScope } from '../server/usage/types'
 import { onUsageRecorded } from '../server/usage/events'
@@ -24,10 +23,6 @@ let usageTooltipLine = ''
 let retryCount = 0
 let retryTimer: ReturnType<typeof setTimeout> | null = null
 
-function currencySymbol(currency: 'CNY' | 'USD'): string {
-  return currency === 'CNY' ? '\u00A5' : '$'
-}
-
 function scheduleRetry() {
   if (retryTimer || retryCount >= RETRY_MAX)
     return
@@ -42,10 +37,10 @@ async function recompute() {
   try {
     const settings = loadUsageSettings()
     const scope: UsageBarScope = settings.statusBarScope === 'today' ? 'today' : 'month'
-    const summary = await queryUsageSummary(scope, settings.currency)
-    usageSuffix = ` ${currencySymbol(settings.currency)}${Math.round(Number(summary.totalCostMicros) / 1e6)}`
-    const scopeLabel = scope === 'month' ? 'This month' : 'Today'
-    usageTooltipLine = `${scopeLabel}: ${summary.totalCostFormatted} · ${summary.requestCount} requests · ${summary.okCount} ok (${settings.currency})`
+    const summary = await queryUsageSummary(scope)
+    usageSuffix = ` $${Math.round(Number(summary.totalCostMicros) / 1e6)}`
+    const scopeLabel = scope === 'month' ? '本月' : '今日'
+    usageTooltipLine = `${scopeLabel}: ${summary.totalCostFormatted} · ${summary.requestCount} 次请求 · ${summary.okCount} 次成功`
     retryCount = 0
   }
   catch {
@@ -67,7 +62,7 @@ export function initUsageStatusBar(rerender: () => void): void {
   void recompute()
 }
 
-/** Suffix for statusBarItem.text, e.g. ` ¥14`. Empty while data is unavailable. */
+/** Suffix for statusBarItem.text, e.g. ` $14`. Empty while data is unavailable. */
 export function getUsageSuffix(): string {
   return usageSuffix
 }
@@ -77,7 +72,7 @@ export function getUsageTooltipLine(): string {
   return usageTooltipLine
 }
 
-/** Recompute suffix (e.g. after a scope/currency switch) and refresh the bar. */
+/** Recompute suffix (e.g. after a scope switch) and refresh the bar. */
 export function refreshUsageStatusBar(): void {
   retryCount = 0
   void recompute()

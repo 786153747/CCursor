@@ -1,5 +1,5 @@
 import type { ProviderType } from '../data/defaults'
-import type { CostBreakdown, ModelPricing, NormalizedUsage, UsageCurrency } from './types'
+import type { CostBreakdown, ModelPricing, NormalizedUsage } from './types'
 
 export const CACHE_INCLUSIVE_PROVIDER_TYPES: ReadonlySet<ProviderType> = new Set([
   // anthropic 的原始 input_tokens 不含 cache_read/cache_creation, 但 provider 层
@@ -70,13 +70,13 @@ export function isUnpricedUsage(result: Pick<CostBreakdown, 'unpriced'>): boolea
   return result.unpriced
 }
 
-export function formatCost(micros: bigint, currency: UsageCurrency): string {
-  const sign = currency === 'USD' ? '$' : '¥'
+/** 金额格式化 — 统一 USD ($), 保留 6 位小数 (micro 精度)。 */
+export function formatCost(micros: bigint): string {
   const negative = micros < 0n
   const absolute = negative ? -micros : micros
   const whole = absolute / MICROS_PER_UNIT
   const fraction = (absolute % MICROS_PER_UNIT).toString().padStart(6, '0')
-  return `${negative ? '-' : ''}${sign}${whole.toString()}.${fraction}`
+  return `${negative ? '-' : ''}$${whole.toString()}.${fraction}`
 }
 
 function tokensToMicros(tokens: number, pricePerMillion: string): bigint {

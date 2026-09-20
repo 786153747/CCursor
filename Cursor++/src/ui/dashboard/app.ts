@@ -42,10 +42,10 @@ interface UsageDataMessage {
 }
 
 const RANGE_OPTIONS: Array<{ range: UsageRange, label: string }> = [
-  { range: 'today', label: 'Today' },
-  { range: '7d', label: 'Last 7 days' },
-  { range: '30d', label: 'Last 30 days' },
-  { range: 'all', label: 'All time' },
+  { range: 'today', label: '今日' },
+  { range: '7d', label: '近 7 天' },
+  { range: '30d', label: '近 30 天' },
+  { range: 'all', label: '全部' },
 ]
 
 const REFRESH_INTERVAL_MS = 30_000
@@ -79,7 +79,7 @@ function createWebviewTransport(api: { postMessage: (msg: unknown) => void }): U
     if (message.ok && Array.isArray(message.rows))
       pending.resolve(message.rows)
     else
-      pending.reject(new Error(message.error || 'Failed to load usage stats'))
+      pending.reject(new Error(message.error || '用量数据加载失败'))
   })
 
   return {
@@ -106,7 +106,7 @@ function createBrowserTransport(): UsageTransport {
         throw new Error(`HTTP ${response.status}`)
       const payload = await response.json() as { ok?: boolean, rows?: UsageStatsRow[] }
       if (!payload || payload.ok !== true || !Array.isArray(payload.rows))
-        throw new Error('Malformed usage stats response')
+        throw new Error('用量统计响应格式异常')
       return payload.rows
     },
   }
@@ -143,7 +143,7 @@ function describeRangeWindow(): string {
   if (currentRange === '30d')
     return `${toLocalDayString(addLocalDays(new Date(), -29))} – ${todayDay}`
   const earliestDay = usageRows.length > 0 ? usageRows[0].day : null
-  return earliestDay ? `${earliestDay} – ${todayDay}` : 'all time'
+  return earliestDay ? `${earliestDay} – ${todayDay}` : '全部时间'
 }
 
 // ── 主题配色 — 从 --vscode-charts-* 变量读取, 取不到回退固定色 ──
@@ -366,7 +366,7 @@ function renderToolbar(): HTMLElement {
   }
   const rangeWindowCaption = createElement('span', undefined, describeRangeWindow())
   rangeWindowCaption.style.cssText = 'font-size:11px;color:var(--vscode-descriptionForeground);margin-left:4px;'
-  const refreshButton = createElement('button', 'refresh-btn', isLoading ? 'Refreshing…' : '⟳ Refresh')
+  const refreshButton = createElement('button', 'refresh-btn', isLoading ? '刷新中…' : '⟳ 刷新')
   refreshButton.disabled = isLoading
   refreshButton.addEventListener('click', () => void load(currentRange))
   toolbar.appendChild(pills)
@@ -380,16 +380,16 @@ function renderEmptyState(): HTMLElement {
   const title = createElement('div', 'title')
   const hint = createElement('div')
   if (isLoading) {
-    title.textContent = 'Loading usage…'
-    hint.textContent = 'Fetching stats from the BYOK server.'
+    title.textContent = '正在加载用量…'
+    hint.textContent = '正在从 BYOK 服务器获取统计数据。'
   }
   else if (loadError) {
-    title.textContent = 'Failed to load usage stats'
+    title.textContent = '用量数据加载失败'
     hint.textContent = loadError
   }
   else {
-    title.textContent = 'No usage recorded yet'
-    hint.textContent = 'Token usage appears here after your first BYOK request.'
+    title.textContent = '暂无用量记录'
+    hint.textContent = '完成第一次 BYOK 请求后，这里会显示 token 用量。'
   }
   container.appendChild(title)
   container.appendChild(hint)
@@ -406,11 +406,11 @@ function renderSummaryCards(): HTMLElement {
 
   const grid = createElement('div', 'summary-grid')
   const cards: Array<{ label: string, value: string }> = [
-    { label: `Total Tokens (${activeRangeLabel()})`, value: formatTokenCount(totals.totalTokens) },
-    { label: 'Input (incl. cache)', value: formatTokenCount(totals.inputTokens) },
-    { label: 'Output', value: formatTokenCount(totals.outputTokens) },
+    { label: `${activeRangeLabel()} · 总 Tokens`, value: formatTokenCount(totals.totalTokens) },
+    { label: '输入 Tokens（含缓存）', value: formatTokenCount(totals.inputTokens) },
+    { label: '输出 Tokens', value: formatTokenCount(totals.outputTokens) },
     {
-      label: 'Cache Hit Rate',
+      label: '缓存率',
       value: totals.inputTokens > 0
         ? formatPercent(totals.cacheReadTokens / totals.inputTokens)
         : '—',
@@ -512,7 +512,7 @@ function buildHourlyRadarChartConfig(palette: ThemePalette): ChartConfiguration<
     data: {
       labels,
       datasets: [{
-        label: 'Tokens by hour',
+        label: '按小时 Tokens',
         data: hourTotals,
         borderColor: palette.series[0],
         backgroundColor: `${palette.series[0]}33`,
@@ -553,10 +553,10 @@ function buildChartSection(titleText: string): { section: HTMLElement, canvas: H
 
 function renderDetailTable(modelAggregates: ModelAggregate[]): HTMLElement {
   const section = createElement('div', 'section')
-  section.appendChild(createElement('div', 'section-title', 'Per-Model Details'))
+  section.appendChild(createElement('div', 'section-title', '按模型明细'))
   const table = createElement('table', 'usage-table')
   const headerRow = createElement('tr')
-  for (const headerText of ['Provider', 'Model', 'Requests', 'Input', 'Output', 'Cache Read', 'Cache Write', 'Hit Rate'])
+  for (const headerText of ['提供商', '模型', '请求数', '输入', '输出', '缓存读取', '缓存写入', '缓存率'])
     headerRow.appendChild(createElement('th', undefined, headerText))
   const tableHead = createElement('thead')
   tableHead.appendChild(headerRow)
@@ -606,13 +606,13 @@ function render(): void {
 
   // section 标题带当前范围 — 切范围时所有区块的作用域可感知
   const rangeLabel = activeRangeLabel()
-  const trendGranularity = currentRange === 'today' ? 'hourly' : 'daily'
-  const trendSection = buildChartSection(`Token Usage Trend by Model — ${rangeLabel}, ${trendGranularity}`)
+  const trendGranularityLabel = currentRange === 'today' ? '按小时' : '按天'
+  const trendSection = buildChartSection(`Token 用量趋势（按模型）— ${rangeLabel} · ${trendGranularityLabel}`)
   app.appendChild(trendSection.section)
 
   const splitContainer = createElement('div', 'chart-split')
-  const shareSection = buildChartSection(`Model Share — ${rangeLabel}`)
-  const radarSection = buildChartSection(`Activity by Hour (0–23) — ${rangeLabel}`)
+  const shareSection = buildChartSection(`模型用量占比 — ${rangeLabel}`)
+  const radarSection = buildChartSection(`按小时活跃度（0–23）— ${rangeLabel}`)
   splitContainer.appendChild(shareSection.section)
   splitContainer.appendChild(radarSection.section)
   app.appendChild(splitContainer)

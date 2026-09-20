@@ -1,5 +1,5 @@
 import type { UsageSettingsConfig } from '../data/defaults'
-import type { UsageCurrency, UsageRangePreset, UsageSettings } from './types'
+import type { UsageRangePreset, UsageSettings } from './types'
 import { existsSync, unwatchFile, watchFile } from 'node:fs'
 import { readJsonOrNull, withSerial, writeJsonAtomic } from '../config/atomic'
 import { getUsageSettingsFilePath } from '../config/paths'
@@ -13,14 +13,12 @@ function clone<T>(value: T): T {
 let cache: UsageSettings | null = null
 
 function withFallback(loaded: Partial<UsageSettingsConfig> | null): UsageSettings {
-  const currency: UsageCurrency = loaded?.currency === 'USD' ? 'USD' : 'CNY'
   const range: UsageRangePreset = loaded?.range === '7d' || loaded?.range === '14d' || loaded?.range === '30d' || loaded?.range === 'month'
     ? loaded.range
     : 'today'
   const statusBarScope: 'today' | 'month' = loaded?.statusBarScope === 'today' ? 'today' : 'month'
   return {
     $schemaVersion: 1,
-    currency,
     range,
     statusBarScope,
     filterCustomized: loaded?.filterCustomized === true,

@@ -88,7 +88,6 @@ export function initApp(Alpine: AlpineType) {
     usage: null as any,
     usageOpen: false,
     usageRange: 'today',
-    usageCurrency: 'CNY',
     usageProviderExpanded: {} as Record<string, boolean>,
     usageShowAllProviders: false,
     usageRecentLimit: 3,
@@ -196,7 +195,6 @@ export function initApp(Alpine: AlpineType) {
       const selectedProviderIds = (this.usage?.providers || []).filter((p: any) => p.selected).map((p: any) => p.id)
       const selectedModelKeys = (this.usage?.models || []).filter((m: any) => m.selected).map((m: any) => m.key)
       this.post('saveUsageSettings', {
-        currency: this.usageCurrency,
         range: this.usageRange,
         statusBarScope: this.usage?.settings?.statusBarScope === 'today' ? 'today' : 'month',
         filterCustomized: options?.customizeFilter ? true : this.usage?.settings?.filterCustomized,
@@ -211,7 +209,6 @@ export function initApp(Alpine: AlpineType) {
       if (this.usage?.settings)
         this.usage.settings.statusBarScope = next
       this.post('saveUsageSettings', {
-        currency: this.usageCurrency,
         range: this.usageRange,
         statusBarScope: next,
         filterCustomized: this.usage?.settings?.filterCustomized,
@@ -221,7 +218,7 @@ export function initApp(Alpine: AlpineType) {
     },
 
     get usageBarScopeLabel(): string {
-      return this.usage?.settings?.statusBarScope === 'today' ? 'Bar: Today' : 'Bar: Month'
+      return this.usage?.settings?.statusBarScope === 'today' ? '状态栏: 今日' : '状态栏: 本月'
     },
 
     toggleUsageProvider(id: string, checked: boolean) {
@@ -260,7 +257,7 @@ export function initApp(Alpine: AlpineType) {
       const all = this.usage?.providers || []
       if (this.usageShowAllProviders)
         return all
-      return all.filter((p: any) => p.totalCostMicros !== '0')
+      return all.filter((p: any) => (p.requestCount ?? 0) > 0)
     },
 
     get usageProvidersHiddenCount(): number {
@@ -269,14 +266,14 @@ export function initApp(Alpine: AlpineType) {
 
     get usageHiddenProvidersLabel(): string {
       if (this.usageShowAllProviders)
-        return 'Show fewer providers'
-      return `Show ${this.usageProvidersHiddenCount} providers with no usage`
+        return '收起未使用的提供商'
+      return `展开 ${this.usageProvidersHiddenCount} 个未使用的提供商`
     },
 
     get usageRecentToggleLabel(): string {
       if (this.usageRecentLimit >= 30)
-        return 'Show less'
-      return `Show all (${this.usage?.recent?.length ?? 0})`
+        return '收起'
+      return `展开全部 (${this.usage?.recent?.length ?? 0})`
     },
 
     get usageRecentList(): any[] {
@@ -295,46 +292,33 @@ export function initApp(Alpine: AlpineType) {
       return `${Math.round(percent * 10) / 10}%`
     },
 
-    /**
-     * 被货币过滤掉的历史记录提示 (旧账不换算, 只如实提示存在)。
-     *
-     * 全空的情况由 usage.tsx 的 'No records' 提示覆盖, 这里只处理"有记录但旧账被排除"
-     * 这一半 —— 否则切货币后旧账会静默消失且毫无痕迹。
-     */
-    get usageCurrencyNotice(): string {
-      const excluded = this.usage?.excludedByCurrency
-      if (!excluded?.requestCount || !this.usage?.summary?.requestCount)
-        return ''
-      const currencies = (excluded.currencies || []).join(', ')
-      return `${excluded.requestCount} record(s) in ${currencies} excluded — bills keep the currency used at request time.`
-    },
-
     get usageRangeLabel(): string {
       const labels: Record<string, string> = {
-        'today': 'Today',
-        '7d': 'Last 7 days',
-        '14d': 'Last 14 days',
-        '30d': 'Last 30 days',
+        'today': '今日',
+        '7d': '近 7 天',
+        '14d': '近 14 天',
+        '30d': '近 30 天',
+        'month': '本月',
       }
-      return labels[this.usageRange] || 'Today'
+      return labels[this.usageRange] || '今日'
     },
 
-    /** Per-day cost bars: precomputed heights + tooltip text for the template. */
+    /** 每日 token 柱状条: 预先算好高度百分比与 tooltip 文案 (token 优先视角)。 */
     get usageDailyBars(): any[] {
       const daily = this.usage?.daily || []
-      let maxMicros = 0n
+      let maxTokens = 0
       for (const day of daily) {
-        const cost = BigInt(day.totalCostMicros || '0')
-        if (cost > maxMicros)
-          maxMicros = cost
+        const tokens = day.realTotalTokens || 0
+        if (tokens > maxTokens)
+          maxTokens = tokens
       }
       return daily.map((day: any) => {
-        const cost = BigInt(day.totalCostMicros || '0')
-        const heightPercent = maxMicros > 0n ? Number((cost * 100n) / maxMicros) : 0
+        const tokens = day.realTotalTokens || 0
+        const heightPercent = maxTokens > 0 ? (tokens / maxTokens) * 100 : 0
         return {
           date: day.date,
           heightPercent: Math.max(day.requestCount > 0 && heightPercent === 0 ? 4 : heightPercent, 0),
-          title: `${day.date} · ${day.requestCount} req · ${this.formatUsageCost(day.totalCostFormatted)}`,
+          title: `${day.date} · ${day.requestCount} 次请求 · ${this.formatUsageTokens(tokens)} Tokens · ${this.formatUsageCost(day.totalCostFormatted)}`,
         }
       })
     },
@@ -1122,11 +1106,10 @@ export function initApp(Alpine: AlpineType) {
         s.usageOpen = true
       if (msg.usage?.settings) {
         s.usageRange = msg.usage.settings.range || 'today'
-        s.usageCurrency = msg.usage.settings.currency || 'CNY'
       }
       for (const provider of msg.usage?.providers || []) {
         if (!(provider.id in s.usageProviderExpanded))
-          s.usageProviderExpanded[provider.id] = provider.totalCostMicros !== '0'
+          s.usageProviderExpanded[provider.id] = (provider.requestCount ?? 0) > 0
       }
     }
   })

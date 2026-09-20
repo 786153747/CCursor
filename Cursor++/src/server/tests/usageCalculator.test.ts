@@ -53,7 +53,7 @@ describe('usage calculator', () => {
     expect(result.freshInputTokens).toBe(1_000_000)
     expect(result.totalMicros).toBe(22_350_000n)
     expect(result.unpriced).toBe(false)
-    expect(formatCost(result.totalMicros, 'CNY')).toBe('¥22.350000')
+    expect(formatCost(result.totalMicros)).toBe('$22.350000')
   })
 
   it('prices openai input after removing cached tokens', () => {
@@ -102,6 +102,6 @@ describe('usage calculator', () => {
   })
 
   it('formats usd with a dollar sign', () => {
-    expect(formatCost(1_500_000n, 'USD')).toBe('$1.500000')
+    expect(formatCost(1_500_000n)).toBe('$1.500000')
   })
 })

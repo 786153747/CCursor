@@ -312,7 +312,7 @@ async function initializeSchema(database: AsyncDatabase): Promise<void> {
       cache_read_cost_micros TEXT NOT NULL DEFAULT '0',
       cache_creation_cost_micros TEXT NOT NULL DEFAULT '0',
       total_cost_micros TEXT NOT NULL DEFAULT '0',
-      currency TEXT NOT NULL DEFAULT 'CNY',
+      currency TEXT NOT NULL DEFAULT 'USD',
       unpriced INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL DEFAULT 'ok',
       error_message TEXT,

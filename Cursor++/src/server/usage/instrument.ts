@@ -5,7 +5,6 @@ import { getProvider } from '../config/providersStore'
 import { logger } from '../logger'
 import { calculateUsageCost } from './calculator'
 import { notifyUsageRecorded } from './events'
-import { loadUsageSettings } from './settings'
 import { recordUsageLog } from './store'
 import { normalizeUsage, pricingFromModel } from './types'
 
@@ -103,7 +102,6 @@ export function instrumentProviderEntry(provider: LLMProvider, entry: ProviderEn
       }
     },
     async record({ context, usage, durationMs, conversationId, stopReason }) {
-      const settings = loadUsageSettings()
       const normalized = normalizeUsage(usage)
       const cost = calculateUsageCost({
         providerType: context.providerType,
@@ -128,7 +126,8 @@ export function instrumentProviderEntry(provider: LLMProvider, entry: ProviderEn
         cacheReadCostMicros: cost.cacheReadMicros,
         cacheCreationCostMicros: cost.cacheCreationMicros,
         totalCostMicros: stopReason === 'error' ? 0n : cost.totalMicros,
-        currency: settings.currency,
+        // 记账货币固定 USD — 与显示口径一致, 不再提供货币切换。
+        currency: 'USD',
         unpriced: stopReason === 'error' ? 0 : (cost.unpriced ? 1 : 0),
         status: stopReason === 'error' ? 'error' : 'ok',
         errorMessage: stopReason === 'error' ? 'stream failed' : undefined,

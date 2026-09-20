@@ -45,9 +45,9 @@ function Layout({ webviewJs, codiconUri }: { webviewJs: string, codiconUri?: str
           style="cursor:pointer;user-select:none"
           x-on:click="$store.app.toggleUsageOpen()"
         >
-          <span>Usage</span>
+          <span>用量</span>
           <span style="float:right;font-size:0.85em;font-weight:500;color:var(--vscode-descriptionForeground)">
-            <span {...{ 'x-text': '$store.app.usage?.todayCostFormatted || \'\'' }}></span>
+            <span {...{ 'x-text': '$store.app.usage ? (\'今日 \' + $store.app.formatUsageTokens($store.app.usage?.todayRealTokens ?? 0) + \' Tokens\') : \'\'' }}></span>
             <span style="margin-left:6px" {...{ 'x-text': '$store.app.usageOpen ? \'▾\' : \'▸\'' }}></span>
           </span>
         </h3>

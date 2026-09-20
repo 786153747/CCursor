@@ -1,6 +1,5 @@
 import type {
   UsageBarScope,
-  UsageCurrency,
   UsageDailyStat,
   UsageDashboard,
   UsageHeroSummary,
@@ -17,6 +16,16 @@ import { getAgentDatabase } from '../database/sqlite'
 import { logger } from '../logger'
 import { formatCost, getFreshInputTokens } from './calculator'
 import { modelUsageKey } from './types'
+
+/**
+ * 单行"真实总量" token — 与 summary.realTotalTokens 同口径:
+ * fresh input + output + cache write + cache read。
+ * provider 层已把 anthropic 等归一成完整 prompt 规模, 这里不再区分类型。
+ */
+function rowRealTotalTokens(row: UsageLogRow): number {
+  return getFreshInputTokens(row.provider_type, row.input_tokens, row.cache_read_tokens, row.cache_write_tokens)
+    + row.output_tokens + row.cache_write_tokens + row.cache_read_tokens
+}
 
 function startOfLocalDay(now = Date.now()): number {
   const date = new Date(now)
@@ -112,34 +121,23 @@ export async function queryUsageDashboard(settings: UsageSettings): Promise<Usag
   const start = rangeStart(settings.range, now)
   const todayStart = startOfLocalDay(now)
   const rows = await getAgentDatabase().all<UsageLogRow>(
-    `SELECT * FROM usage_logs WHERE created_at >= ? AND currency = ? ORDER BY created_at DESC`,
-    [start, settings.currency],
+    `SELECT * FROM usage_logs WHERE created_at >= ? ORDER BY created_at DESC`,
+    [start],
   )
-  // 同一范围内被货币过滤掉的历史: 只统计条数与货币种类, 不试图换算金额 —— 那时生效的
-  // costMultiplier 没有随行落库, 换算出来只会是错数字。用途是让 UI 能提示"旧账还在"。
-  const otherCurrencyRows = await getAgentDatabase().all<{ currency: string, n: number }>(
-    `SELECT currency, COUNT(*) AS n FROM usage_logs
-      WHERE created_at >= ? AND currency <> ?
-      GROUP BY currency
-      ORDER BY n DESC`,
-    [start, settings.currency],
-  )
+  // 不再按货币过滤: token 口径与货币无关, 统一统计所有历史行;
+  // 金额也直接按 USD 累计 (行里的旧货币字符串只保留在库里, 不再参与查询)。
   const todayRows = rows.filter(row => row.created_at >= todayStart)
   const filtered = rows.filter(row => matchesUsageFilter(settings, row))
   const todayFiltered = todayRows.filter(row => matchesUsageFilter(settings, row))
 
   return {
     settings,
-    todayCostFormatted: formatCost(sumMicros(todayFiltered), settings.currency),
-    summary: summarize(filtered, settings.currency),
+    todayRealTokens: todayFiltered.reduce((sum, row) => sum + rowRealTotalTokens(row), 0),
+    summary: summarize(filtered),
     providers: buildProviderStats(rows, settings),
     models: buildModelStats(rows, settings),
-    daily: buildDailyStats(filtered, start, now, settings.currency),
-    recent: filtered.slice(0, 30).map(toRecentItem(settings.currency)),
-    excludedByCurrency: {
-      requestCount: otherCurrencyRows.reduce((sum, row) => sum + row.n, 0),
-      currencies: otherCurrencyRows.map(row => row.currency),
-    },
+    daily: buildDailyStats(filtered, start, now),
+    recent: filtered.slice(0, 30).map(toRecentItem),
   }
 }
 
@@ -147,7 +145,7 @@ export async function queryUsageDashboard(settings: UsageSettings): Promise<Usag
  * Group view-filtered rows by local calendar day, filling days without usage
  * with zero-cost buckets so the trend bars stay aligned with the time axis.
  */
-function buildDailyStats(rows: UsageLogRow[], rangeStartMs: number, nowMs: number, currency: UsageCurrency): UsageDailyStat[] {
+function buildDailyStats(rows: UsageLogRow[], rangeStartMs: number, nowMs: number): UsageDailyStat[] {
   const byDay = new Map<string, UsageDailyStat>()
   for (const row of rows) {
     const date = formatDayStamp(row.created_at)
@@ -157,15 +155,14 @@ function buildDailyStats(rows: UsageLogRow[], rangeStartMs: number, nowMs: numbe
       okCount: 0,
       realTotalTokens: 0,
       totalCostMicros: 0n,
-      totalCostFormatted: formatCost(0n, currency),
+      totalCostFormatted: formatCost(0n),
     }
     current.requestCount += 1
     if (row.status === 'ok')
       current.okCount += 1
-    current.realTotalTokens += getFreshInputTokens(row.provider_type, row.input_tokens, row.cache_read_tokens, row.cache_write_tokens)
-      + row.output_tokens + row.cache_write_tokens + row.cache_read_tokens
+    current.realTotalTokens += rowRealTotalTokens(row)
     current.totalCostMicros += BigInt(row.total_cost_micros || '0')
-    current.totalCostFormatted = formatCost(current.totalCostMicros, currency)
+    current.totalCostFormatted = formatCost(current.totalCostMicros)
     byDay.set(date, current)
   }
 
@@ -179,7 +176,7 @@ function buildDailyStats(rows: UsageLogRow[], rangeStartMs: number, nowMs: numbe
       okCount: 0,
       realTotalTokens: 0,
       totalCostMicros: 0n,
-      totalCostFormatted: formatCost(0n, currency),
+      totalCostFormatted: formatCost(0n),
     })
     cursor.setDate(cursor.getDate() + 1)
   }
@@ -193,7 +190,7 @@ function formatDayStamp(timestamp: number): string {
   return `${month}-${day}`
 }
 
-function summarize(rows: UsageLogRow[], currency: UsageCurrency): UsageHeroSummary {
+function summarize(rows: UsageLogRow[]): UsageHeroSummary {
   let inputTokens = 0
   let outputTokens = 0
   let cacheReadTokens = 0
@@ -219,7 +216,7 @@ function summarize(rows: UsageLogRow[], currency: UsageCurrency): UsageHeroSumma
     requestCount: rows.length,
     okCount,
     totalCostMicros,
-    totalCostFormatted: formatCost(totalCostMicros, currency),
+    totalCostFormatted: formatCost(totalCostMicros),
     inputTokens,
     outputTokens,
     cacheReadTokens,
@@ -241,8 +238,9 @@ function buildProviderStats(rows: UsageLogRow[], settings: UsageSettings): Usage
       type: provider.type,
       selected: isProviderSelected(settings, provider.id),
       requestCount: 0,
+      realTotalTokens: 0,
       totalCostMicros: 0n,
-      totalCostFormatted: formatCost(0n, settings.currency),
+      totalCostFormatted: formatCost(0n),
     })
   }
   for (const row of rows) {
@@ -252,12 +250,14 @@ function buildProviderStats(rows: UsageLogRow[], settings: UsageSettings): Usage
       type: row.provider_type,
       selected: isProviderSelected(settings, row.provider_id),
       requestCount: 0,
+      realTotalTokens: 0,
       totalCostMicros: 0n,
-      totalCostFormatted: formatCost(0n, settings.currency),
+      totalCostFormatted: formatCost(0n),
     }
     current.requestCount += 1
+    current.realTotalTokens += rowRealTotalTokens(row)
     current.totalCostMicros += BigInt(row.total_cost_micros || '0')
-    current.totalCostFormatted = formatCost(current.totalCostMicros, settings.currency)
+    current.totalCostFormatted = formatCost(current.totalCostMicros)
     byId.set(row.provider_id, current)
   }
   return [...byId.values()].sort((a, b) => Number(b.totalCostMicros - a.totalCostMicros) || a.name.localeCompare(b.name))
@@ -277,8 +277,9 @@ function buildModelStats(rows: UsageLogRow[], settings: UsageSettings): UsageMod
         displayName: model.displayName || model.apiModel,
         selected: isModelSelected(settings, provider.id, model.id),
         requestCount: 0,
+        realTotalTokens: 0,
         totalCostMicros: 0n,
-        totalCostFormatted: formatCost(0n, settings.currency),
+        totalCostFormatted: formatCost(0n),
       })
     }
   }
@@ -294,24 +295,26 @@ function buildModelStats(rows: UsageLogRow[], settings: UsageSettings): UsageMod
       displayName: row.display_name,
       selected: isModelSelected(settings, row.provider_id, row.model_id),
       requestCount: 0,
+      realTotalTokens: 0,
       totalCostMicros: 0n,
-      totalCostFormatted: formatCost(0n, settings.currency),
+      totalCostFormatted: formatCost(0n),
     }
     current.requestCount += 1
+    current.realTotalTokens += rowRealTotalTokens(row)
     current.totalCostMicros += BigInt(row.total_cost_micros || '0')
-    current.totalCostFormatted = formatCost(current.totalCostMicros, settings.currency)
+    current.totalCostFormatted = formatCost(current.totalCostMicros)
     byKey.set(key, current)
   }
   return [...byKey.values()].sort((a, b) => Number(b.totalCostMicros - a.totalCostMicros) || a.displayName.localeCompare(b.displayName))
 }
 
-function toRecentItem(currency: UsageCurrency) {
-  return (row: UsageLogRow): UsageRecentItem => ({
+function toRecentItem(row: UsageLogRow): UsageRecentItem {
+  return {
     requestId: row.request_id,
     providerName: row.provider_name,
     displayName: row.display_name,
     status: row.status,
-    totalCostFormatted: formatCost(BigInt(row.total_cost_micros || '0'), currency),
+    totalCostFormatted: formatCost(BigInt(row.total_cost_micros || '0')),
     unpriced: row.unpriced === 1,
     inputTokens: row.input_tokens,
     outputTokens: row.output_tokens,
@@ -319,22 +322,18 @@ function toRecentItem(currency: UsageCurrency) {
     cacheWriteTokens: row.cache_write_tokens,
     durationMs: row.duration_ms,
     createdAt: row.created_at,
-  })
-}
-
-function sumMicros(rows: UsageLogRow[]): bigint {
-  return rows.reduce((sum, row) => sum + BigInt(row.total_cost_micros || '0'), 0n)
+  }
 }
 
 /** Lightweight aggregate for the status bar over the scope window (single SQL, no rows pulled). */
-export async function queryUsageSummary(scope: UsageBarScope, currency: UsageCurrency): Promise<{ requestCount: number, okCount: number, totalCostMicros: bigint, totalCostFormatted: string }> {
+export async function queryUsageSummary(scope: UsageBarScope): Promise<{ requestCount: number, okCount: number, totalCostMicros: bigint, totalCostFormatted: string }> {
   const start = scope === 'month' ? startOfLocalMonth() : startOfLocalDay()
   const rows = await getAgentDatabase().all<{ n: number, ok: number, cost: string | null }>(
     `SELECT COUNT(*) AS n,
             SUM(CASE WHEN status = 'ok' THEN 1 ELSE 0 END) AS ok,
             SUM(CAST(total_cost_micros AS INTEGER)) AS cost
-     FROM usage_logs WHERE created_at >= ? AND currency = ?`,
-    [start, currency],
+     FROM usage_logs WHERE created_at >= ?`,
+    [start],
   )
   const row = rows[0]
   const totalCostMicros = BigInt(row?.cost ?? 0)
@@ -342,7 +341,7 @@ export async function queryUsageSummary(scope: UsageBarScope, currency: UsageCur
     requestCount: row?.n ?? 0,
     okCount: row?.ok ?? 0,
     totalCostMicros,
-    totalCostFormatted: formatCost(totalCostMicros, currency),
+    totalCostFormatted: formatCost(totalCostMicros),
   }
 }
 
@@ -363,7 +362,7 @@ export async function pruneOldUsageLogs(maxAgeDays = 90): Promise<void> {
 export function serializeUsageDashboard(dashboard: UsageDashboard) {
   return {
     settings: dashboard.settings,
-    todayCostFormatted: dashboard.todayCostFormatted,
+    todayRealTokens: dashboard.todayRealTokens,
     summary: {
       ...dashboard.summary,
       totalCostMicros: dashboard.summary.totalCostMicros.toString(),
@@ -381,6 +380,5 @@ export function serializeUsageDashboard(dashboard: UsageDashboard) {
       totalCostMicros: day.totalCostMicros.toString(),
     })),
     recent: dashboard.recent,
-    excludedByCurrency: dashboard.excludedByCurrency,
   }
 }

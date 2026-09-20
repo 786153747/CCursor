@@ -561,9 +561,9 @@ function renderStatusBar() {
   if (usageTooltipLine)
     tooltip.appendMarkdown(`\n\n${usageTooltipLine}`)
   if (todayUsageSummary)
-    tooltip.appendMarkdown(`\n\n今日: **${formatTokenCountForTooltip(todayUsageSummary.totalTokens)}** tokens · **${todayUsageSummary.requests}** requests`)
+    tooltip.appendMarkdown(`\n\n今日: **${formatTokenCountForTooltip(todayUsageSummary.totalTokens)}** Tokens · **${todayUsageSummary.requests}** 次请求`)
   tooltip.appendMarkdown(`\n\n---`)
-  tooltip.appendMarkdown(`\n\n$(graph) [Open Usage Dashboard](command:cursor2plus.openUsageDashboard)`)
+  tooltip.appendMarkdown(`\n\n$(graph) [打开用量面板](command:cursor2plus.openUsageDashboard)`)
   tooltip.appendMarkdown(`\n\n---\n\nClick: toggle BYOK Mode`)
 
   statusBarItem.text = `${serverIcon} BYOK ${byokGlyph}${getUsageSuffix()}`

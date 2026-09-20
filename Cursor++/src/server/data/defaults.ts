@@ -175,13 +175,13 @@ export interface ProviderModel {
    * 判定统一走 isModelDefaultOn(), 不要在调用点自己写 ?? / !== false。
    */
   defaultOn?: boolean
-  /** 输入单价，当前货币 / 百万 token */
+  /** 输入单价，USD / 百万 token */
   inputCostPerMillion?: string
-  /** 输出单价，当前货币 / 百万 token */
+  /** 输出单价，USD / 百万 token */
   outputCostPerMillion?: string
-  /** 缓存命中单价，当前货币 / 百万 token */
+  /** 缓存命中单价，USD / 百万 token */
   cacheReadCostPerMillion?: string
-  /** 缓存写入单价，当前货币 / 百万 token */
+  /** 缓存写入单价，USD / 百万 token */
   cacheCreationCostPerMillion?: string
   /** 成本乘数，默认 1 */
   costMultiplier?: string
@@ -292,7 +292,6 @@ export const DEFAULT_PROVIDERS: ProvidersConfig = {
 
 export interface UsageSettingsConfig {
   $schemaVersion: number
-  currency: 'CNY' | 'USD'
   range: 'today' | '7d' | '14d' | '30d' | 'month'
   filterCustomized?: boolean
   selectedProviderIds: string[]
@@ -302,7 +301,6 @@ export interface UsageSettingsConfig {
 
 export const DEFAULT_USAGE_SETTINGS: UsageSettingsConfig = {
   $schemaVersion: 1,
-  currency: 'CNY',
   range: 'today',
   filterCustomized: false,
   selectedProviderIds: [],

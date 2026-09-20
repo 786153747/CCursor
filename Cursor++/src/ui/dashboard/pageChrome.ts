@@ -137,11 +137,11 @@ export function renderDashboardPageHtml(options: DashboardPageOptions): string {
   const themeDefaults = options.includeBrowserThemeDefaults ? BROWSER_THEME_DARK_DEFAULTS : ''
 
   return `<!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy}">
-<title>Cursor++ Usage</title>
+<title>Cursor++ 用量面板</title>
 <style>
 ${themeDefaults}${PAGE_CSS}</style>
 </head>

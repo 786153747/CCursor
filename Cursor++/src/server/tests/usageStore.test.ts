@@ -44,7 +44,7 @@ function log(partial: Partial<UsageLogRecord>): UsageLogRecord {
     cacheReadCostMicros: partial.cacheReadCostMicros ?? 0n,
     cacheCreationCostMicros: partial.cacheCreationCostMicros ?? 0n,
     totalCostMicros: partial.totalCostMicros ?? 6_000n,
-    currency: partial.currency ?? 'CNY',
+    currency: partial.currency ?? 'USD',
     unpriced: partial.unpriced ?? 0,
     status: partial.status ?? 'ok',
     errorMessage: partial.errorMessage,
@@ -84,7 +84,6 @@ describe('usage store', () => {
 
     const dashboard = await queryUsageDashboard({
       $schemaVersion: 1,
-      currency: 'CNY',
       range: 'today',
       filterCustomized: true,
       selectedProviderIds: ['provider-alpha'],
@@ -93,7 +92,7 @@ describe('usage store', () => {
 
     expect(dashboard.summary.requestCount).toBe(1)
     expect(dashboard.summary.totalCostMicros).toBe(10_000n)
-    expect(dashboard.summary.totalCostFormatted).toBe('¥0.010000')
+    expect(dashboard.summary.totalCostFormatted).toBe('$0.010000')
     expect(dashboard.recent).toHaveLength(1)
     expect(dashboard.recent[0].displayName).toBe('flash')
     expect(dashboard.providers.find(p => p.id === 'provider-alpha')?.selected).toBe(true)
@@ -106,7 +105,6 @@ describe('usage store', () => {
     await recordUsageLog(log({ requestId: 'b', providerId: 'p2', providerName: 'p2', modelId: 'm2', totalCostMicros: 2_000n }))
     const dashboard = await queryUsageDashboard({
       $schemaVersion: 1,
-      currency: 'CNY',
       range: 'today',
       selectedProviderIds: [],
       selectedModelKeys: [],
@@ -132,7 +130,6 @@ describe('usage store', () => {
 
     const dashboard = await queryUsageDashboard({
       $schemaVersion: 1,
-      currency: 'CNY',
       range: 'today',
       filterCustomized: true,
       selectedProviderIds: [],
@@ -171,7 +168,6 @@ describe('usage store', () => {
 
     const dashboard = await queryUsageDashboard({
       $schemaVersion: 1,
-      currency: 'CNY',
       range: 'today',
       filterCustomized: true,
       selectedProviderIds: ['provider-alpha'],
@@ -205,7 +201,6 @@ describe('usage store', () => {
 
     const dashboard = await queryUsageDashboard({
       $schemaVersion: 1,
-      currency: 'CNY',
       range: '7d',
       selectedProviderIds: [],
       selectedModelKeys: [],
@@ -244,7 +239,6 @@ describe('usage store', () => {
 
     const dashboard = await queryUsageDashboard({
       $schemaVersion: 1,
-      currency: 'CNY',
       range: 'today',
       filterCustomized: true,
       selectedProviderIds: ['provider-alpha'],
@@ -256,26 +250,22 @@ describe('usage store', () => {
     expect(dashboard.daily[0].totalCostMicros).toBe(10_000n)
   })
 
-  it('summarizes per scope (today/month) and currency for the status bar', async () => {
+  it('summarizes per scope (today/month) for the status bar', async () => {
     const now = Date.now()
     const lastMonth = now - 45 * 24 * 60 * 60 * 1000
     await recordUsageLog(log({ requestId: 'a', totalCostMicros: 10_000n, createdAt: now }))
     await recordUsageLog(log({ requestId: 'b', status: 'error', totalCostMicros: 2_500n, createdAt: now }))
     await recordUsageLog(log({ requestId: 'old', totalCostMicros: 99_000n, createdAt: lastMonth }))
 
-    const today = await queryUsageSummary('today' as UsageBarScope, 'CNY')
+    const today = await queryUsageSummary('today' as UsageBarScope)
     expect(today.requestCount).toBe(2)
     expect(today.okCount).toBe(1)
     expect(today.totalCostMicros).toBe(12_500n)
-    expect(today.totalCostFormatted).toBe('¥0.012500')
+    expect(today.totalCostFormatted).toBe('$0.012500')
 
-    const month = await queryUsageSummary('month' as UsageBarScope, 'CNY')
+    const month = await queryUsageSummary('month' as UsageBarScope)
     expect(month.requestCount).toBe(2)
     expect(month.totalCostMicros).toBe(12_500n)
-
-    const usd = await queryUsageSummary('today' as UsageBarScope, 'USD')
-    expect(usd.requestCount).toBe(0)
-    expect(usd.totalCostMicros).toBe(0n)
   })
 
   it('computes cache hit rate against the full prompt for normalized anthropic usage', async () => {
@@ -293,7 +283,6 @@ describe('usage store', () => {
 
     const dashboard = await queryUsageDashboard({
       $schemaVersion: 1,
-      currency: 'CNY',
       range: 'today',
       selectedProviderIds: [],
       selectedModelKeys: [],
@@ -303,35 +292,29 @@ describe('usage store', () => {
     expect(dashboard.summary.cacheHitRate).toBeCloseTo(0.8, 5)
   })
 
-  it('reports records excluded by the currency filter instead of hiding them', async () => {
-    // 行里存的是"写入当时的货币", 查询按当前货币过滤且不做换算 —— 所以被排除的旧账
-    // 必须显式报告出来, 否则切一次货币历史就像凭空消失。
+  it('aggregates rows regardless of legacy currency tags', async () => {
+    // 只保留 USD 展示后不再按货币过滤: token 口径与货币无关,
+    // 历史行里残留的旧货币字符串 (如 'CNY') 不再把记录从统计中排除。
     const now = Date.now()
-    await recordUsageLog(log({ requestId: 'cny-1', totalCostMicros: 1_000n, createdAt: now }))
-    await recordUsageLog(log({ requestId: 'usd-1', currency: 'USD', totalCostMicros: 2_000n, createdAt: now }))
-    await recordUsageLog(log({ requestId: 'usd-2', currency: 'USD', totalCostMicros: 3_000n, createdAt: now }))
+    await recordUsageLog(log({
+      requestId: 'legacy-1',
+      // 模拟旧版本落库的 CNY 行 — DB 列仍是 TEXT, 统计侧不再区分
+      currency: 'CNY' as never,
+      totalCostMicros: 1_000n,
+      createdAt: now,
+    }))
+    await recordUsageLog(log({ requestId: 'usd-1', totalCostMicros: 2_000n, createdAt: now }))
+    await recordUsageLog(log({ requestId: 'usd-2', totalCostMicros: 3_000n, createdAt: now }))
 
-    const cny = await queryUsageDashboard({
+    const dashboard = await queryUsageDashboard({
       $schemaVersion: 1,
-      currency: 'CNY',
       range: 'today',
       selectedProviderIds: [],
       selectedModelKeys: [],
     })
-    expect(cny.summary.requestCount).toBe(1)
-    expect(cny.summary.totalCostMicros).toBe(1_000n)
-    expect(cny.excludedByCurrency).toEqual({ requestCount: 2, currencies: ['USD'] })
-
-    const usd = await queryUsageDashboard({
-      $schemaVersion: 1,
-      currency: 'USD',
-      range: 'today',
-      selectedProviderIds: [],
-      selectedModelKeys: [],
-    })
-    expect(usd.summary.requestCount).toBe(2)
-    expect(usd.summary.totalCostMicros).toBe(5_000n)
-    expect(usd.excludedByCurrency).toEqual({ requestCount: 1, currencies: ['CNY'] })
+    expect(dashboard.summary.requestCount).toBe(3)
+    expect(dashboard.summary.totalCostMicros).toBe(6_000n)
+    expect(dashboard.summary.totalCostFormatted).toBe('$0.006000')
   })
 
   it('prunes usage logs older than the retention window', async () => {
@@ -343,7 +326,6 @@ describe('usage store', () => {
 
     const dashboard = await queryUsageDashboard({
       $schemaVersion: 1,
-      currency: 'CNY',
       range: '30d',
       selectedProviderIds: [],
       selectedModelKeys: [],

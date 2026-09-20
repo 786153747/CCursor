@@ -40,7 +40,7 @@
       },
       {
         "command": "cursor2plus.openUsage",
-        "title": "Cursor++: Open Usage Panel"
+        "title": "Cursor++: 打开用量面板"
       },
       {
         "command": "cursor2plus.toggleFileLog",
@@ -52,7 +52,7 @@
       },
       {
         "command": "cursor2plus.openUsageDashboard",
-        "title": "Cursor++: Open Usage Dashboard"
+        "title": "Cursor++: 打开用量仪表盘"
       }
     ],
     "configuration": {

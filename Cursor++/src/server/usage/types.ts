@@ -1,7 +1,12 @@
 import type { ProviderType } from '../data/defaults'
 import type { LLMUsage } from '../handlers/llm/types'
 
-export type UsageCurrency = 'CNY' | 'USD'
+/**
+ * 记账货币 — 只保留 USD。金额统一按美元展示, 不再提供货币切换。
+ * 历史行里可能残留旧货币字符串 ('CNY' 等), 统计时不再区分,
+ * token 口径与货币无关, 金额按 USD 直接累计。
+ */
+export type UsageCurrency = 'USD'
 
 export type UsageRangePreset = 'today' | '7d' | '14d' | '30d' | 'month'
 
@@ -37,7 +42,6 @@ export interface CostBreakdown {
 
 export interface UsageSettings {
   $schemaVersion: number
-  currency: UsageCurrency
   range: UsageRangePreset
   /**
    * False + empty arrays = all providers/models.
@@ -125,6 +129,8 @@ export interface UsageProviderStat {
   type: string
   selected: boolean
   requestCount: number
+  /** 与 summary 同口径: fresh input + output + cache write + cache read */
+  realTotalTokens: number
   totalCostMicros: bigint
   totalCostFormatted: string
 }
@@ -137,6 +143,8 @@ export interface UsageModelStat {
   displayName: string
   selected: boolean
   requestCount: number
+  /** 与 summary 同口径: fresh input + output + cache write + cache read */
+  realTotalTokens: number
   totalCostMicros: bigint
   totalCostFormatted: string
 }
@@ -167,27 +175,15 @@ export interface UsageDailyStat {
   totalCostFormatted: string
 }
 
-/**
- * 本次范围内货币与当前显示货币不同、因而未计入总账的历史记录。
- *
- * 行里存的是"写入当时的货币", 而当时生效的 costMultiplier 并没有一并落库,
- * 所以无法可靠换算。这里只如实报告被排除了多少, 不让旧账静默消失。
- */
-export interface UsageExcludedByCurrency {
-  requestCount: number
-  /** 本次范围内出现过的其它货币 (理论上可不止一种) */
-  currencies: string[]
-}
-
 export interface UsageDashboard {
   settings: UsageSettings
-  todayCostFormatted: string
+  /** 今日口径的总 token (与 summary.realTotalTokens 同口径) */
+  todayRealTokens: number
   summary: UsageHeroSummary
   providers: UsageProviderStat[]
   models: UsageModelStat[]
   daily: UsageDailyStat[]
   recent: UsageRecentItem[]
-  excludedByCurrency: UsageExcludedByCurrency
 }
 
 export function normalizeUsage(usage?: LLMUsage): NormalizedUsage {

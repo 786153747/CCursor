@@ -303,7 +303,7 @@ export function ModelCard() {
               x-effect="if(document.activeElement !== $el) $el.value = m.inputCostPerMillion ?? ''"
               x-on:input="$store.app.updateModelField(p.id, m.id, 'inputCostPerMillion', $event.target.value || undefined)"
               placeholder="0"
-              title="Price per million input tokens in the selected currency"
+              title="每百万输入 token 的单价 (USD)"
             />
           </div>
           <div class="field">
@@ -313,7 +313,7 @@ export function ModelCard() {
               x-effect="if(document.activeElement !== $el) $el.value = m.outputCostPerMillion ?? ''"
               x-on:input="$store.app.updateModelField(p.id, m.id, 'outputCostPerMillion', $event.target.value || undefined)"
               placeholder="0"
-              title="Price per million output tokens in the selected currency"
+              title="每百万输出 token 的单价 (USD)"
             />
           </div>
         </div>
